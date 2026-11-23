@@ -70,6 +70,160 @@ fn badge_reserve(count: u32) -> f32 {
     }
 }
 
+// ---- right-click context menu -------------------------------------------------------
+
+struct ContextMenuItem {
+    label: &'static str,
+    enabled: bool,
+    action: Option<Action>,
+    divider_after: bool,
+}
+
+fn show_context_menu(
+    resp: &egui::Response,
+    t: &Theme,
+    items: &[ContextMenuItem],
+    actions: &mut Vec<Action>,
+) {
+    let mut picked: Option<Action> = None;
+    egui::Popup::context_menu(resp).width(196.0).show(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        for item in items {
+            let (rect, r) = ui.allocate_exact_size(
+                Vec2::new(ui.available_width(), 28.0),
+                if item.enabled {
+                    Sense::click()
+                } else {
+                    Sense::hover()
+                },
+            );
+            if item.enabled && r.hovered() {
+                ui.painter()
+                    .rect_filled(rect, CornerRadius::same(4), t.hover);
+            }
+            let fg = if !item.enabled {
+                t.muted.gamma_multiply(0.45)
+            } else if r.hovered() {
+                t.strong
+            } else {
+                t.text
+            };
+            ui.painter().text(
+                Pos2::new(rect.left() + 10.0, rect.center().y),
+                Align2::LEFT_CENTER,
+                item.label,
+                prop(13.5),
+                fg,
+            );
+            if item.enabled {
+                let r = r.on_hover_cursor(egui::CursorIcon::PointingHand);
+                if r.clicked() {
+                    picked = item.action.clone();
+                }
+            }
+            if item.divider_after {
+                let (sep, _) =
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 6.0), Sense::hover());
+                ui.painter().line_segment(
+                    [
+                        Pos2::new(sep.left() + 6.0, sep.center().y),
+                        Pos2::new(sep.right() - 6.0, sep.center().y),
+                    ],
+                    Stroke::new(1.0, t.divider),
+                );
+            }
+        }
+    });
+    if let Some(a) = picked {
+        actions.push(a);
+        egui::Popup::close_all(&resp.ctx);
+    }
+}
+
+fn guild_context_items(guild_id: Snowflake, can_mark_read: bool) -> [ContextMenuItem; 2] {
+    [
+        ContextMenuItem {
+            label: "Mark Server as Read",
+            enabled: can_mark_read,
+            action: can_mark_read.then_some(Action::MarkGuildRead(guild_id)),
+            divider_after: true,
+        },
+        ContextMenuItem {
+            label: "Copy Server ID",
+            enabled: true,
+            action: Some(Action::Copy(guild_id.to_string())),
+            divider_after: false,
+        },
+    ]
+}
+
+fn channel_context_items(channel_id: Snowflake, can_mark_read: bool) -> [ContextMenuItem; 2] {
+    [
+        ContextMenuItem {
+            label: "Mark as Read",
+            enabled: can_mark_read,
+            action: can_mark_read.then_some(Action::MarkChannelRead(channel_id)),
+            divider_after: true,
+        },
+        ContextMenuItem {
+            label: "Copy ID",
+            enabled: true,
+            action: Some(Action::Copy(channel_id.to_string())),
+            divider_after: false,
+        },
+    ]
+}
+
+fn thread_context_items(
+    thread_id: Snowflake,
+    can_mark_read: bool,
+    is_archived: bool,
+    is_locked: bool,
+) -> [ContextMenuItem; 4] {
+    [
+        ContextMenuItem {
+            label: "Mark as Read",
+            enabled: can_mark_read,
+            action: can_mark_read.then_some(Action::MarkChannelRead(thread_id)),
+            divider_after: true,
+        },
+        ContextMenuItem {
+            label: if is_archived {
+                "Unarchive Thread"
+            } else {
+                "Archive Thread"
+            },
+            enabled: true,
+            action: Some(Action::UpdateThread {
+                thread_id,
+                archived: Some(!is_archived),
+                locked: None,
+            }),
+            divider_after: false,
+        },
+        ContextMenuItem {
+            label: if is_locked {
+                "Unlock Thread"
+            } else {
+                "Lock Thread"
+            },
+            enabled: true,
+            action: Some(Action::UpdateThread {
+                thread_id,
+                archived: None,
+                locked: Some(!is_locked),
+            }),
+            divider_after: true,
+        },
+        ContextMenuItem {
+            label: "Copy ID",
+            enabled: true,
+            action: Some(Action::Copy(thread_id.to_string())),
+            divider_after: false,
+        },
+    ]
+}
+
 // ---- guild rail ---------------------------------------------------------------------
 
 pub fn rail(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
@@ -143,7 +297,8 @@ pub fn rail(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
                         }
                         let sel = app.view.guild == Some(guild.id);
                         let mentions = app.store.guild_mention_count(guild.id);
-                        let unread = !sel && (app.guild_unread(guild.id) || mentions > 0);
+                        let has_unread = app.guild_unread(guild.id) || mentions > 0;
+                        let unread = !sel && has_unread;
                         let label = initials(&guild.name, 3);
                         let resp = rail_item(
                             ui,
@@ -158,6 +313,8 @@ pub fn rail(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
                         if resp.clicked() {
                             actions.push(Action::SelectGuild(guild.id));
                         }
+                        let items = guild_context_items(guild.id, has_unread);
+                        show_context_menu(&resp, t, &items, actions);
                         ui.add_space(8.0);
                     }
                 });
@@ -401,14 +558,7 @@ fn channel_row(ui: &mut Ui, app: &NixApp, ch: &Channel, actions: &mut Vec<Action
     let is_forum = ch.kind == ChannelKind::Forum;
     let selected = app.view.channel == Some(ch.id);
     let row_w = ui.available_width();
-    let (outer, resp) = ui.allocate_exact_size(
-        Vec2::new(row_w, 32.0),
-        if openable {
-            Sense::click()
-        } else {
-            Sense::hover()
-        },
-    );
+    let (outer, resp) = ui.allocate_exact_size(Vec2::new(row_w, 32.0), Sense::click());
     let rect = outer.shrink2(Vec2::new(8.0, 1.0));
     let hovered = resp.hovered() && openable;
     if selected {
@@ -418,7 +568,7 @@ fn channel_row(ui: &mut Ui, app: &NixApp, ch: &Channel, actions: &mut Vec<Action
         ui.painter()
             .rect_filled(rect, CornerRadius::same(4), t.hover);
     }
-    let (mentions, unread) = if !openable || selected {
+    let (raw_mentions, raw_unread) = if !openable {
         (0, false)
     } else if is_forum {
         let threads = app.store.channel_threads(ch.id);
@@ -431,6 +581,11 @@ fn channel_row(ui: &mut Ui, app: &NixApp, ch: &Channel, actions: &mut Vec<Action
     } else {
         let m = app.store.channel_mention_count(ch.id);
         (m, app.is_unread(ch) || m > 0)
+    };
+    let (mentions, unread) = if selected {
+        (0, false)
+    } else {
+        (raw_mentions, raw_unread)
     };
     if unread {
         // Small white pill on the column's left edge.
@@ -486,6 +641,8 @@ fn channel_row(ui: &mut Ui, app: &NixApp, ch: &Channel, actions: &mut Vec<Action
     if resp.clicked() && openable {
         actions.push(Action::SelectChannel(ch.id));
     }
+    let items = channel_context_items(ch.id, raw_unread);
+    show_context_menu(&resp, t, &items, actions);
     if !openable {
         resp.on_hover_text("Not supported in nixcord yet");
     }
@@ -530,12 +687,10 @@ fn thread_row(ui: &mut Ui, app: &NixApp, ch: &Channel, is_last: bool, actions: &
             .rect_filled(pill, CornerRadius::same(4), t.hover);
     }
 
-    let mentions = if !selected {
-        app.store.channel_mention_count(ch.id)
-    } else {
-        0
-    };
-    let unread = !selected && (app.is_unread(ch) || mentions > 0);
+    let raw_mentions = app.store.channel_mention_count(ch.id);
+    let raw_unread = app.is_unread(ch) || raw_mentions > 0;
+    let mentions = if !selected { raw_mentions } else { 0 };
+    let unread = !selected && raw_unread;
     if unread {
         let dot = Rect::from_center_size(Pos2::new(outer.left(), cy), Vec2::new(8.0, 8.0));
         ui.painter()
@@ -566,6 +721,10 @@ fn thread_row(ui: &mut Ui, app: &NixApp, ch: &Channel, is_last: bool, actions: &
     if resp.clicked() {
         actions.push(Action::SelectChannel(ch.id));
     }
+    let is_archived = ch.is_archived();
+    let is_locked = ch.thread_metadata.as_ref().is_some_and(|m| m.locked);
+    let items = thread_context_items(ch.id, raw_unread, is_archived, is_locked);
+    show_context_menu(&resp, t, &items, actions);
 }
 
 fn dm_list(ui: &mut Ui, app: &NixApp, actions: &mut Vec<Action>) {
@@ -759,10 +918,11 @@ fn user_panel(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
         ui.centered_and_justified(|ui| ui.add(egui::Spinner::new().color(t.muted)));
         return;
     };
-    // Connected: my own status (clickable to change it). Otherwise the connection state.
+    // Connected: my own status or custom status (clickable to change it). Otherwise the connection state.
     let my = app.store.my_status();
+    let custom_sub = app.store.my_custom_status_text();
     let (status, dot) = match app.store.connection() {
-        ConnectionState::Connected => (my.label(), Some(my)),
+        ConnectionState::Connected => (user_panel_subtitle(custom_sub.as_deref(), my), Some(my)),
         ConnectionState::Connecting => ("Connecting…", None),
         ConnectionState::Reconnecting => ("Reconnecting…", None),
         ConnectionState::Offline => ("Offline", None),
@@ -856,6 +1016,12 @@ fn user_panel(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
     });
 }
 
+fn user_panel_subtitle(custom_status: Option<&str>, status: nixcord_model::Status) -> &str {
+    custom_status
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| status.label())
+}
+
 fn strike(ui: &Ui, rect: Rect, color: Color32) {
     let r = rect.shrink(8.0);
     ui.painter()
@@ -865,6 +1031,7 @@ fn strike(ui: &Ui, rect: Rect, color: Color32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nixcord_model::Status;
 
     #[test]
     fn mention_badge_formatting_and_width_reserve() {
@@ -874,5 +1041,94 @@ mod tests {
         assert_eq!(badge_reserve(0), 0.0);
         assert!(badge_reserve(5) > 0.0);
         assert!(badge_reserve(120) > badge_reserve(5));
+    }
+
+    #[test]
+    fn user_panel_subtitle_prefers_custom_status() {
+        assert_eq!(
+            user_panel_subtitle(Some("☕ Hacking on Rust"), Status::Online),
+            "☕ Hacking on Rust"
+        );
+        assert_eq!(user_panel_subtitle(Some("   "), Status::Idle), "Idle");
+        assert_eq!(user_panel_subtitle(None, Status::Dnd), "Do Not Disturb");
+    }
+
+    #[test]
+    fn context_menu_items_reflect_read_and_thread_state() {
+        let gid = Snowflake(10);
+        let g_read = guild_context_items(gid, false);
+        assert_eq!(g_read[0].label, "Mark Server as Read");
+        assert!(!g_read[0].enabled);
+        assert!(g_read[0].action.is_none());
+        assert_eq!(g_read[1].label, "Copy Server ID");
+        assert!(g_read[1].enabled);
+        assert!(matches!(
+            g_read[1].action,
+            Some(Action::Copy(ref s)) if s == "10"
+        ));
+
+        let g_unread = guild_context_items(gid, true);
+        assert!(g_unread[0].enabled);
+        assert!(matches!(
+            g_unread[0].action,
+            Some(Action::MarkGuildRead(Snowflake(10)))
+        ));
+
+        let cid = Snowflake(102);
+        let c_items = channel_context_items(cid, true);
+        assert_eq!(c_items[0].label, "Mark as Read");
+        assert!(c_items[0].enabled);
+        assert!(matches!(
+            c_items[0].action,
+            Some(Action::MarkChannelRead(Snowflake(102)))
+        ));
+        assert_eq!(c_items[1].label, "Copy ID");
+        assert!(matches!(
+            c_items[1].action,
+            Some(Action::Copy(ref s)) if s == "102"
+        ));
+
+        let tid = Snowflake(111);
+        let t_active = thread_context_items(tid, false, false, false);
+        assert!(!t_active[0].enabled);
+        assert_eq!(t_active[1].label, "Archive Thread");
+        assert!(matches!(
+            t_active[1].action,
+            Some(Action::UpdateThread {
+                thread_id: Snowflake(111),
+                archived: Some(true),
+                locked: None,
+            })
+        ));
+        assert_eq!(t_active[2].label, "Lock Thread");
+        assert!(matches!(
+            t_active[2].action,
+            Some(Action::UpdateThread {
+                thread_id: Snowflake(111),
+                archived: None,
+                locked: Some(true),
+            })
+        ));
+
+        let t_archived_locked = thread_context_items(tid, true, true, true);
+        assert!(t_archived_locked[0].enabled);
+        assert_eq!(t_archived_locked[1].label, "Unarchive Thread");
+        assert!(matches!(
+            t_archived_locked[1].action,
+            Some(Action::UpdateThread {
+                thread_id: Snowflake(111),
+                archived: Some(false),
+                locked: None,
+            })
+        ));
+        assert_eq!(t_archived_locked[2].label, "Unlock Thread");
+        assert!(matches!(
+            t_archived_locked[2].action,
+            Some(Action::UpdateThread {
+                thread_id: Snowflake(111),
+                archived: None,
+                locked: Some(false),
+            })
+        ));
     }
 }

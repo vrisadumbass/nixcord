@@ -78,6 +78,8 @@ pub fn header(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Ac
     };
     let is_dm = matches!(channel.kind, ChannelKind::Dm | ChannelKind::GroupDm);
     let is_thread = channel.kind.is_thread();
+    let is_archived = is_thread && channel.is_archived();
+    let is_locked = is_thread && channel.thread_metadata.as_ref().is_some_and(|m| m.locked);
     let parent_channel = is_thread
         .then(|| {
             channel
@@ -211,6 +213,36 @@ pub fn header(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Ac
                 });
             }
         }
+        if is_thread {
+            ui.add_space(4.0);
+            let lock_label = if is_locked { "Unlock" } else { "Lock" };
+            let lock_tip = if is_locked {
+                "Unlock Thread"
+            } else {
+                "Lock Thread"
+            };
+            if thread_header_button(ui, t, lock_label, is_locked, lock_tip).clicked() {
+                actions.push(Action::UpdateThread {
+                    thread_id: ch,
+                    archived: None,
+                    locked: Some(!is_locked),
+                });
+            }
+            ui.add_space(4.0);
+            let arch_label = if is_archived { "Unarchive" } else { "Archive" };
+            let arch_tip = if is_archived {
+                "Unarchive Thread"
+            } else {
+                "Archive Thread"
+            };
+            if thread_header_button(ui, t, arch_label, is_archived, arch_tip).clicked() {
+                actions.push(Action::UpdateThread {
+                    thread_id: ch,
+                    archived: Some(!is_archived),
+                    locked: None,
+                });
+            }
+        }
 
         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
@@ -265,6 +297,12 @@ pub fn header(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Ac
                         );
                     }
                     emoji_text::label_truncated(ui, &app.media, &name, bold(16.0), t.strong);
+                    if is_archived {
+                        thread_status_pill(ui, "Archived", t.idle, t.elevated);
+                    }
+                    if is_locked {
+                        thread_status_pill(ui, "Locked", t.muted, t.elevated);
+                    }
                 }
             }
             if let Some(topic) = topic {
@@ -281,6 +319,60 @@ pub fn header(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Ac
             }
         });
     });
+}
+
+fn thread_status_pill(ui: &mut Ui, label: &str, fg: Color32, bg: Color32) {
+    let g = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), bold(10.5), fg);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(g.size().x + 12.0, 18.0), Sense::hover());
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(4),
+        bg,
+        Stroke::new(1.0, fg.gamma_multiply(0.45)),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().galley(rect.center() - g.size() / 2.0, g, fg);
+}
+
+fn thread_header_button(
+    ui: &mut Ui,
+    t: &crate::theme::Theme,
+    label: &str,
+    active: bool,
+    tooltip: &str,
+) -> egui::Response {
+    let fg = if active { t.strong } else { t.muted };
+    let g = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), bold(12.0), fg);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(g.size().x + 16.0, 26.0), Sense::click());
+    let hovered = resp.hovered();
+    let fill = if hovered {
+        t.selected
+    } else if active {
+        t.hover
+    } else {
+        t.elevated
+    };
+    let border = if active {
+        t.accent.gamma_multiply(0.55)
+    } else {
+        t.divider
+    };
+    let text_col = if hovered || active { t.strong } else { t.muted };
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(4),
+        fill,
+        Stroke::new(1.0, border),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter()
+        .galley(rect.center() - g.size() / 2.0, g, text_col);
+    resp.on_hover_text(tooltip)
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 // ---- empty state --------------------------------------------------------------------
@@ -530,8 +622,60 @@ fn estimate(row: Row, msgs: &[Message], width: f32) -> f32 {
     }
 }
 
+pub(crate) fn thread_banner_notice(is_archived: bool, is_locked: bool) -> Option<&'static str> {
+    match (is_archived, is_locked) {
+        (true, true) => Some("This thread is archived and locked."),
+        (true, false) => {
+            Some("This thread is archived. Unarchive it or send a message to reopen it.")
+        }
+        (false, true) => Some("This thread is locked."),
+        (false, false) => None,
+    }
+}
+
 pub fn messages(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Action>) {
     let t = app.theme;
+    if let Some(channel) = app.store.channel(ch).filter(|c| c.kind.is_thread()) {
+        let is_archived = channel.is_archived();
+        let is_locked = channel.thread_metadata.as_ref().is_some_and(|m| m.locked);
+        if let Some(notice) = thread_banner_notice(is_archived, is_locked) {
+            Frame::new()
+                .fill(t.elevated)
+                .inner_margin(Margin::symmetric(16, 6))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        if is_archived
+                            && thread_header_button(ui, t, "Unarchive", false, "Unarchive Thread")
+                                .clicked()
+                        {
+                            actions.push(Action::UpdateThread {
+                                thread_id: ch,
+                                archived: Some(false),
+                                locked: None,
+                            });
+                        }
+                        if is_locked
+                            && thread_header_button(ui, t, "Unlock", false, "Unlock Thread")
+                                .clicked()
+                        {
+                            actions.push(Action::UpdateThread {
+                                thread_id: ch,
+                                archived: None,
+                                locked: Some(false),
+                            });
+                        }
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            let col = if is_archived { t.idle } else { t.muted };
+                            ui.label(RichText::new(notice).font(prop(13.0)).color(col));
+                        });
+                    });
+                });
+            let r = ui.max_rect();
+            hline(ui, r, ui.cursor().top() - 0.5, t.divider);
+        }
+    }
     let loaded = app.store.history_loaded(ch);
     if !loaded {
         ui.vertical_centered(|ui| {
@@ -1895,5 +2039,32 @@ mod reaction_tests {
         assert_eq!(results[2], "Fallback(\"🇯🇵\")");
         assert_eq!(results[3], "Fallback(\"👍🏽\")");
         assert!(results[4].starts_with("Tex("), "{}", results[4]);
+    }
+
+    #[test]
+    fn thread_banner_and_controls_render_cleanly() {
+        assert_eq!(thread_banner_notice(false, false), None);
+        assert_eq!(
+            thread_banner_notice(true, false),
+            Some("This thread is archived. Unarchive it or send a message to reopen it.")
+        );
+        assert_eq!(
+            thread_banner_notice(false, true),
+            Some("This thread is locked.")
+        );
+        assert_eq!(
+            thread_banner_notice(true, true),
+            Some("This thread is archived and locked.")
+        );
+
+        let ctx = egui::Context::default();
+        let t = crate::theme::by_name("Graphite");
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            thread_status_pill(ui, "Archived", t.idle, t.elevated);
+            thread_status_pill(ui, "Locked", t.muted, t.elevated);
+            let _ = thread_header_button(ui, t, "Archive", false, "Archive Thread");
+            let _ = thread_header_button(ui, t, "Unlock", true, "Unlock Thread");
+        });
+        out.textures_delta.clear();
     }
 }
