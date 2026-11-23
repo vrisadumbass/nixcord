@@ -94,17 +94,38 @@ pub fn header(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Ac
         .flatten()
         .cloned();
 
+    let can_create_thread = matches!(channel.kind, ChannelKind::Text | ChannelKind::Announcement)
+        && app.store.can_send(ch)
+        && !app.view.forbidden.contains(&ch);
+
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        // Search box (local filter over loaded messages).
+        // Search box: Enter executes guild/DM message search; Escape or × closes.
         let (field, _) = ui.allocate_exact_size(Vec2::new(220.0, 28.0), Sense::hover());
         ui.painter()
             .rect_filled(field, CornerRadius::same(4), t.elevated);
-        paint_search(
-            ui,
+        let has_query = !app.view.search.input.trim().is_empty() || app.view.search.open;
+        let icon_rect = Rect::from_center_size(
             Pos2::new(field.right() - 14.0, field.center().y),
-            14.0,
-            t.muted,
+            Vec2::splat(20.0),
         );
+        if has_query {
+            let clear = ui
+                .interact(icon_rect, ui.scope_id().with("search_clear"), Sense::click())
+                .on_hover_text("Clear search")
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            ui.painter().text(
+                icon_rect.center(),
+                Align2::CENTER_CENTER,
+                "×",
+                bold(15.0),
+                if clear.hovered() { t.strong } else { t.muted },
+            );
+            if clear.clicked() {
+                actions.push(Action::CloseSearch);
+            }
+        } else {
+            paint_search(ui, icon_rect.center(), 14.0, t.muted);
+        }
         let mut child = ui.new_child(
             UiBuilder::new()
                 .max_rect(Rect::from_min_max(
@@ -114,15 +135,28 @@ pub fn header(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Ac
                 .layout(Layout::left_to_right(Align::Center)),
         );
         let resp = child.add(
-            egui::TextEdit::singleline(&mut app.chat.filter)
-                .hint_text("Search")
+            egui::TextEdit::singleline(&mut app.view.search.input)
+                .id(Id::unique("header_search"))
+                .hint_text("Search (Enter)")
                 .frame(Frame::NONE)
                 .margin(Margin::ZERO)
                 .font(prop(14.0))
                 .desired_width(f32::INFINITY),
         );
-        if resp.changed() {
-            app.chat.heights.clear();
+        if app.view.search.want_focus {
+            app.view.search.want_focus = false;
+            resp.request_focus();
+        }
+        if resp.has_focus() {
+            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                let raw = app.view.search.input.trim().to_string();
+                if !raw.is_empty() {
+                    actions.push(Action::SearchMessages { raw, offset: 0 });
+                }
+            } else if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                resp.surrender_focus();
+                actions.push(Action::CloseSearch);
+            }
         }
         ui.add_space(8.0);
         let shown = app.members_visible(ui.ctx());
@@ -149,6 +183,30 @@ pub fn header(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Ac
         }
         if members.clicked() {
             app.prefs.show_members = Some(!shown);
+        }
+        if can_create_thread {
+            ui.add_space(4.0);
+            let (tr, tresp) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
+            if tresp.hovered() {
+                ui.painter()
+                    .rect_filled(tr, CornerRadius::same(4), t.hover);
+            }
+            paint_plus(
+                ui,
+                tr.center(),
+                12.0,
+                if tresp.hovered() { t.strong } else { t.muted },
+            );
+            if tresp
+                .on_hover_text("Create Thread")
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+            {
+                actions.push(Action::OpenCreateThread {
+                    parent_id: ch,
+                    is_forum: false,
+                });
+            }
         }
 
         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
@@ -517,6 +575,32 @@ pub fn messages(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<
         .auto_shrink([false, false])
         .stick_to_bottom(true);
 
+    // Jump-to-message target from Search: scroll into view and briefly highlight.
+    const HIGHLIGHT_FOR: std::time::Duration = std::time::Duration::from_millis(2500);
+    let mut highlighted_msg: Option<Snowflake> = None;
+    if let Some(jt) = app.chat.jump_target.as_mut().filter(|j| j.channel == ch) {
+        if !jt.scrolled {
+            if let Some(i) = rows
+                .iter()
+                .position(|r| matches!(r, Row::Msg { idx, .. } if msgs[*idx].id == jt.message))
+            {
+                let target_y = (tops[i] - 120.0).max(0.0);
+                scroll = scroll.stick_to_bottom(false).vertical_scroll_offset(target_y);
+                jt.scrolled = true;
+                jt.highlighted_at = Some(std::time::Instant::now());
+            }
+        }
+        if let Some(at) = jt.highlighted_at {
+            let left = HIGHLIGHT_FOR.saturating_sub(at.elapsed());
+            if left.is_zero() {
+                app.chat.jump_target = None;
+            } else {
+                highlighted_msg = Some(jt.message);
+                ui.ctx().request_repaint_after(left);
+            }
+        }
+    }
+
     // Older messages were just prepended: keep the previously visible message in place.
     if let Some(a) = app.chat.anchor.filter(|a| a.channel == ch) {
         if !app.view.older_pending.contains_key(&ch) {
@@ -598,6 +682,7 @@ pub fn messages(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<
                         pointer,
                         me,
                         guild,
+                        highlighted: highlighted_msg == Some(m.id),
                     };
                     let (h, rect, owner) = message_row(&mut child, app, m, &ctx, actions);
                     if owner {
@@ -786,6 +871,7 @@ struct RowCtx {
     pointer: Option<Pos2>,
     me: Option<Snowflake>,
     guild: Option<Snowflake>,
+    highlighted: bool,
 }
 
 /// Lay out one message. Returns (height, row rect, hovered).
@@ -927,7 +1013,14 @@ fn message_row(
 
     let mentioned = rc.me != Some(m.author.id) && (app.store.is_mentioned(m) || mentions_me);
     let mut shapes = Vec::new();
-    if mentioned {
+    if rc.highlighted {
+        shapes.push(Shape::rect_filled(rect, 0.0, t.accent.gamma_multiply(0.18)));
+        shapes.push(Shape::rect_filled(
+            Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height())),
+            0.0,
+            t.accent,
+        ));
+    } else if mentioned {
         shapes.push(Shape::rect_filled(rect, 0.0, t.mention_bg));
         shapes.push(Shape::rect_filled(
             Rect::from_min_size(rect.min, Vec2::new(2.0, rect.height())),

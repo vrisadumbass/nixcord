@@ -83,6 +83,21 @@ pub struct ComposerState {
     /// Emoji autocomplete: selected row, and the query the user dismissed with Escape.
     pub ac_selected: usize,
     pub ac_dismissed: Option<String>,
+    /// Staged files to upload with the next sent message.
+    pub attachments: Vec<nixcord_http::UploadFile>,
+    /// Background file-picker / drag-drop loader receivers returning `(files, error_messages)`.
+    pub attach_rxs: Vec<std::sync::mpsc::Receiver<(Vec<nixcord_http::UploadFile>, Vec<String>)>>,
+    /// True while a native OS file picker dialog is currently open.
+    pub attach_dialog_open: bool,
+}
+
+/// Target message to scroll into view and briefly highlight after a search jump.
+#[derive(Debug, Clone, Copy)]
+pub struct JumpTarget {
+    pub channel: Snowflake,
+    pub message: Snowflake,
+    pub scrolled: bool,
+    pub highlighted_at: Option<Instant>,
 }
 
 /// Key for the virtualized chat list's row-height cache.
@@ -110,6 +125,7 @@ pub struct ChatState {
     pub hover: Option<(Snowflake, Rect)>,
     pub anchor: Option<ScrollAnchor>,
     pub filter: String,
+    pub jump_target: Option<JumpTarget>,
 }
 
 impl ChatState {
@@ -140,6 +156,10 @@ pub struct ViewState {
     pub profile_popout: Option<ui::profile::ProfilePopout>,
     /// In-flight component interactions keyed by `(message_id, custom_id)`.
     pub pending_interactions: HashMap<(Snowflake, String), Instant>,
+    pub friends: ui::friends::FriendsState,
+    pub search: ui::search::SearchState,
+    pub forum: ui::forum::ForumState,
+    pub create_thread: Option<ui::forum::CreateThreadModal>,
 }
 
 struct Toast {
@@ -385,6 +405,76 @@ impl NixApp {
                     self.toast_err(err);
                 }
             }
+            AppEvent::DmCreated(ch) => {
+                let id = ch.id;
+                self.store.apply(&GatewayEvent::ChannelCreate(ch));
+                self.view.guild = None;
+                self.select_channel(Some(id));
+            }
+            AppEvent::FriendRequestResult { username, error } => {
+                self.view.friends.add_busy = false;
+                match error {
+                    None => {
+                        self.view.friends.add_input.clear();
+                        self.view.friends.add_feedback = Some(ui::friends::AddFeedback::Ok(
+                            format!("Friend request sent to {username}."),
+                        ));
+                    }
+                    Some(err) => {
+                        self.view.friends.add_feedback =
+                            Some(ui::friends::AddFeedback::Err(err));
+                    }
+                }
+            }
+            AppEvent::SearchResults { request_id, result } => {
+                if request_id == self.view.search.request_id {
+                    self.view.search.loading = false;
+                    self.view.search.error = None;
+                    let (total, hits) = ui::search::extract_hits(result, &self.view.search.parsed);
+                    self.view.search.total_results = total;
+                    self.view.search.hits = hits;
+                }
+            }
+            AppEvent::SearchFailed { request_id, error } => {
+                if request_id == self.view.search.request_id {
+                    self.view.search.loading = false;
+                    self.view.search.error = Some(error);
+                }
+            }
+            AppEvent::HistoryAround {
+                channel,
+                around,
+                messages,
+            } => {
+                self.view.history_failed.remove(&channel);
+                self.view.exhausted.remove(&channel);
+                self.store.insert_around_history(channel, messages);
+                self.chat.heights.clear();
+                self.chat.jump_target = Some(JumpTarget {
+                    channel,
+                    message: around,
+                    scrolled: false,
+                    highlighted_at: None,
+                });
+            }
+            AppEvent::ThreadCreated(thread) => {
+                let tid = thread.id;
+                let gid = thread.guild_id;
+                self.store.apply(&GatewayEvent::ThreadCreate(thread));
+                self.view.create_thread = None;
+                if let Some(g) = gid {
+                    self.view.guild = Some(g);
+                }
+                self.select_channel(Some(tid));
+            }
+            AppEvent::CreateThreadFailed(err) => {
+                if let Some(m) = self.view.create_thread.as_mut() {
+                    m.busy = false;
+                    m.error = Some(err);
+                } else {
+                    self.toast_err(err);
+                }
+            }
             AppEvent::HistoryFailed { channel, error } => {
                 // Unblock this channel only, so the user can retry it.
                 self.view.older_pending.remove(&channel);
@@ -461,17 +551,24 @@ impl NixApp {
                 }
             }
             Action::SelectHome => {
+                if self.view.guild.is_some() {
+                    self.view.search.close();
+                }
                 self.view.guild = None;
                 let ch = self.view.last_channel.get(&None).copied();
                 self.select_channel(ch);
             }
             Action::SelectGuild(g) => {
+                if self.view.guild != Some(g) {
+                    self.view.search.close();
+                }
                 self.view.guild = Some(g);
                 let ch = self.view.last_channel.get(&Some(g)).copied().or_else(|| {
-                    self.store
-                        .visible_guild_channels(g)
-                        .into_iter()
+                    let visible = self.store.visible_guild_channels(g);
+                    visible
+                        .iter()
                         .find(|c| c.kind.is_textual())
+                        .or_else(|| visible.iter().find(|c| c.kind.is_openable()))
                         .map(|c| c.id)
                 });
                 self.select_channel(ch);
@@ -501,6 +598,7 @@ impl NixApp {
                 channel,
                 content,
                 reply_to,
+                attachments,
             } => {
                 // Sending while scrolled back: return to the live end so the message shows.
                 if self.store.is_detached(channel) {
@@ -510,6 +608,7 @@ impl NixApp {
                     channel,
                     content,
                     reply_to,
+                    attachments,
                 });
             }
             Action::React {
@@ -592,14 +691,123 @@ impl NixApp {
                         c.kind == ChannelKind::Dm && c.recipients.iter().any(|u| u.id == user_id)
                     })
                     .map(|c| c.id);
+                self.view.profile_popout = None;
                 match dm {
                     Some(id) => {
                         self.view.guild = None;
                         self.select_channel(Some(id));
-                        self.view.profile_popout = None;
                     }
-                    None => self.toast("No existing DM with this user yet"),
+                    None => self.send(Command::CreateDm {
+                        recipient_id: user_id,
+                    }),
                 }
+            }
+            Action::OpenFriends => {
+                self.view.search.close();
+                self.view.guild = None;
+                self.view.last_channel.remove(&None);
+                self.view.friends.confirm_remove = None;
+                self.select_channel(None);
+            }
+            Action::AcceptFriendRequest(user_id) => {
+                self.send(Command::AcceptFriendRequest { user_id });
+            }
+            Action::RemoveRelationship(user_id) => {
+                self.view.friends.confirm_remove = None;
+                self.send(Command::RemoveRelationship { user_id });
+            }
+            Action::BlockUser(user_id) => {
+                self.view.friends.confirm_remove = None;
+                self.send(Command::BlockUser { user_id });
+            }
+            Action::SendFriendRequest(username) => {
+                let trimmed = username.trim().to_string();
+                if trimmed.is_empty() {
+                    return;
+                }
+                self.view.friends.add_busy = true;
+                self.view.friends.add_feedback = None;
+                self.send(Command::SendFriendRequest { username: trimmed });
+            }
+            Action::SearchMessages { raw, offset } => {
+                let scope = match self.view.guild {
+                    Some(gid) => ui::search::SearchScope::Guild(gid),
+                    None => match self.view.channel {
+                        Some(cid) => ui::search::SearchScope::Channel(cid),
+                        None => return,
+                    },
+                };
+                let parsed = ui::search::parse_search_query(&raw, &self.store, self.view.guild, offset);
+                self.view.search.request_id = self.view.search.request_id.wrapping_add(1);
+                let request_id = self.view.search.request_id;
+                self.view.search.open = true;
+                self.view.search.loading = true;
+                self.view.search.scope = Some(scope);
+                self.view.search.submitted_raw = raw;
+                self.view.search.offset = offset;
+                self.view.search.error = None;
+                let query = parsed.query.clone();
+                self.view.search.parsed = parsed;
+                self.send(Command::SearchMessages {
+                    request_id,
+                    scope,
+                    query,
+                });
+            }
+            Action::JumpToMessage {
+                channel_id,
+                message_id,
+            } => {
+                self.select_channel(Some(channel_id));
+                let already_in_window = self
+                    .store
+                    .messages(channel_id)
+                    .iter()
+                    .any(|m| m.id == message_id);
+                if already_in_window {
+                    self.chat.jump_target = Some(JumpTarget {
+                        channel: channel_id,
+                        message: message_id,
+                        scrolled: false,
+                        highlighted_at: None,
+                    });
+                } else {
+                    // Prevent `ensure_history` from racing with our `around` fetch.
+                    self.view.history_requested.insert(channel_id);
+                    self.send(Command::LoadHistoryAround {
+                        channel: channel_id,
+                        around: message_id,
+                    });
+                }
+            }
+            Action::CloseSearch => {
+                self.view.search.close();
+            }
+            Action::OpenCreateThread {
+                parent_id,
+                is_forum,
+            } => {
+                self.view.create_thread =
+                    Some(ui::forum::CreateThreadModal::new(parent_id, is_forum));
+            }
+            Action::CreateThread {
+                parent_id,
+                is_forum,
+                name,
+                message,
+                applied_tags,
+            } => {
+                if let Some(m) = self.view.create_thread.as_mut() {
+                    m.busy = true;
+                    m.error = None;
+                }
+                self.send(Command::CreateThread {
+                    parent_id,
+                    is_forum,
+                    name,
+                    message,
+                    applied_tags,
+                });
             }
             Action::Interact {
                 channel_id,
@@ -832,9 +1040,42 @@ impl NixApp {
             .channel
             .filter(|c| self.store.channel(*c).is_some())
         else {
-            egui::CentralPanel::no_frame().show(ui, |ui| ui::chat::empty_state(ui, self));
+            if self.view.guild.is_none() {
+                ui::friends::show(ui, self, actions);
+            } else {
+                egui::CentralPanel::no_frame().show(ui, |ui| ui::chat::empty_state(ui, self));
+            }
             return;
         };
+
+        let is_forum = self
+            .store
+            .channel(ch)
+            .is_some_and(|c| c.kind == ChannelKind::Forum);
+
+        if is_forum {
+            if self.view.search.open {
+                egui::Panel::right("search_results")
+                    .exact_size(360.0)
+                    .resizable(false)
+                    .show_separator_line(false)
+                    .frame(Frame::new().fill(t.sidebar))
+                    .show(ui, |ui| ui::search::panel(ui, self, actions));
+            } else if self.members_visible(ui.ctx()) {
+                egui::Panel::right("members")
+                    .exact_size(240.0)
+                    .resizable(false)
+                    .show_separator_line(false)
+                    .frame(
+                        Frame::new()
+                            .fill(t.sidebar)
+                            .inner_margin(Margin::symmetric(8, 8)),
+                    )
+                    .show(ui, |ui| ui::chat::members(ui, self, ch, actions));
+            }
+            ui::forum::show(ui, self, ch, actions);
+            return;
+        }
 
         egui::Panel::top("chat_header")
             .exact_size(48.0)
@@ -846,7 +1087,14 @@ impl NixApp {
             )
             .show(ui, |ui| ui::chat::header(ui, self, ch, actions));
 
-        if self.members_visible(ui.ctx()) {
+        if self.view.search.open {
+            egui::Panel::right("search_results")
+                .exact_size(360.0)
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(Frame::new().fill(t.sidebar))
+                .show(ui, |ui| ui::search::panel(ui, self, actions));
+        } else if self.members_visible(ui.ctx()) {
             egui::Panel::right("members")
                 .exact_size(240.0)
                 .resizable(false)
@@ -1004,6 +1252,9 @@ impl eframe::App for NixApp {
                     .show(ui, |ui| ui::login::show(ui, self, &mut actions));
             }
             Screen::Main => {
+                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+                    self.view.search.want_focus = true;
+                }
                 self.ensure_history();
                 self.sync_member_subscription();
                 self.update_seen();
@@ -1011,6 +1262,7 @@ impl eframe::App for NixApp {
                 self.update_window_title(&ctx);
                 self.main_ui(ui, &mut actions);
                 ui::profile::show(&ctx, self, &mut actions);
+                ui::forum::create_modal(&ctx, self, &mut actions);
                 ui::settings::window(&ctx, self, &mut actions);
                 ui::chat::delete_modal(&ctx, self, &mut actions);
                 ui::viewer::show(&ctx, self);

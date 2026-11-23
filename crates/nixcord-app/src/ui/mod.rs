@@ -9,10 +9,13 @@ pub mod components;
 pub mod composer;
 pub mod emoji_picker;
 pub mod emoji_text;
+pub mod forum;
+pub mod friends;
 pub mod login;
 pub mod markdown;
 pub mod presence;
 pub mod profile;
+pub mod search;
 pub mod settings;
 pub mod sidebar;
 pub mod viewer;
@@ -47,6 +50,7 @@ pub enum Action {
         channel: Snowflake,
         content: String,
         reply_to: Option<Snowflake>,
+        attachments: Vec<nixcord_http::UploadFile>,
     },
     React {
         channel: Snowflake,
@@ -91,8 +95,37 @@ pub enum Action {
         guild_id: Option<Snowflake>,
         anchor: Rect,
     },
-    /// Jump to an existing DM channel with `user_id`.
+    /// Jump to an existing DM channel with `user_id` (or create one).
     OpenDm(Snowflake),
+    /// Show the Friends home view.
+    OpenFriends,
+    AcceptFriendRequest(Snowflake),
+    RemoveRelationship(Snowflake),
+    BlockUser(Snowflake),
+    SendFriendRequest(String),
+    /// Execute a guild/DM message search from the header or pagination controls.
+    SearchMessages {
+        raw: String,
+        offset: u32,
+    },
+    /// Jump to a specific message in `channel_id` (fetching `around` if needed).
+    JumpToMessage {
+        channel_id: Snowflake,
+        message_id: Snowflake,
+    },
+    CloseSearch,
+    /// Open the Create Thread / New Forum Post modal.
+    OpenCreateThread {
+        parent_id: Snowflake,
+        is_forum: bool,
+    },
+    CreateThread {
+        parent_id: Snowflake,
+        is_forum: bool,
+        name: String,
+        message: Option<String>,
+        applied_tags: Vec<Snowflake>,
+    },
     /// Trigger a Discord type-3 message component interaction (button or select menu).
     Interact {
         channel_id: Snowflake,

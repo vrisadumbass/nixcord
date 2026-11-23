@@ -550,6 +550,7 @@ fn submit(app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Action>) {
         channel: ch,
         content,
         reply_to,
+        attachments: Vec::new(),
     });
 }
 

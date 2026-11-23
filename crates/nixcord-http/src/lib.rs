@@ -7,6 +7,11 @@
 //! which is pure data and can be unit-tested without a network. [`Http`] turns a `Route`
 //! into a reqwest request, sends it, and maps the response with [`map_error_status`].
 
+pub mod multipart;
+pub use multipart::{
+    EncodedMultipart, MultipartError, UploadFile, MAX_ATTACHMENTS, MAX_FILE_BYTES, MAX_TOTAL_BYTES,
+};
+
 use nixcord_model::components::ComponentInteraction;
 use nixcord_model::{Channel, Emoji, Message, RelationshipKind, Snowflake, User};
 use reqwest::header::{
@@ -46,6 +51,8 @@ pub enum HttpError {
     Transport(String),
     #[error("bad response body: {0}")]
     Decode(String),
+    #[error("invalid upload: {0}")]
+    InvalidUpload(#[from] MultipartError),
 }
 
 pub type Result<T> = std::result::Result<T, HttpError>;
@@ -101,6 +108,17 @@ impl MessageSearchQuery {
     }
 }
 
+/// Request body for creating a public thread (`POST /channels/{id}/threads`) or a Forum post.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CreateThreadRequest {
+    pub name: String,
+    /// Starter message content (required for Forum posts; for text channels sent separately).
+    pub content: Option<String>,
+    /// Forum tag ids to apply (Forum posts only).
+    pub applied_tags: Vec<Snowflake>,
+    pub is_forum: bool,
+}
+
 /// Response from `GET /guilds/{id}/messages/search` or `GET /channels/{id}/messages/search`.
 /// Each inner `Vec<Message>` is a hit together with its surrounding context messages.
 #[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
@@ -141,6 +159,42 @@ impl Route {
         if let Some(b) = before {
             r.query.push(("before", b.to_string()));
         }
+        r
+    }
+
+    pub fn messages_around(channel_id: Snowflake, around: Snowflake, limit: u8) -> Self {
+        let mut r = Self::new(Method::Get, format!("/channels/{channel_id}/messages"));
+        r.query.push(("limit", limit.clamp(1, 100).to_string()));
+        r.query.push(("around", around.to_string()));
+        r
+    }
+
+    /// POST /users/@me/channels — open or create a 1-on-1 DM channel with `recipient_id`.
+    pub fn create_dm(recipient_id: Snowflake) -> Self {
+        let mut r = Self::new(Method::Post, "/users/@me/channels".into());
+        r.body = Some(serde_json::json!({ "recipient_id": recipient_id }));
+        r
+    }
+
+    /// POST /channels/{parent_id}/threads — create a Forum post or public text-channel thread.
+    pub fn create_thread(parent_id: Snowflake, req: &CreateThreadRequest) -> Self {
+        let mut r = Self::new(Method::Post, format!("/channels/{parent_id}/threads"));
+        let mut body = if req.is_forum {
+            let content = req.content.as_deref().unwrap_or("");
+            serde_json::json!({
+                "name": req.name,
+                "message": { "content": content },
+            })
+        } else {
+            serde_json::json!({
+                "name": req.name,
+                "type": 11,
+            })
+        };
+        if req.is_forum && !req.applied_tags.is_empty() {
+            body["applied_tags"] = serde_json::json!(req.applied_tags);
+        }
+        r.body = Some(body);
         r
     }
 
@@ -648,6 +702,118 @@ impl Http {
     ) -> Result<MessageSearchResult> {
         self.json(Route::search_channel_messages(channel_id, query))
             .await
+    }
+
+    /// GET /channels/{id}/messages?around={around}&limit={limit}.
+    pub async fn messages_around(
+        &self,
+        channel_id: Snowflake,
+        around: Snowflake,
+        limit: u8,
+    ) -> Result<Vec<Message>> {
+        self.json(Route::messages_around(channel_id, around, limit))
+            .await
+    }
+
+    /// POST /users/@me/channels — open or create a DM channel with `recipient_id`.
+    pub async fn create_dm(&self, recipient_id: Snowflake) -> Result<Channel> {
+        self.json(Route::create_dm(recipient_id)).await
+    }
+
+    /// POST /channels/{parent_id}/threads — create a Forum post or public text-channel thread.
+    pub async fn create_thread(
+        &self,
+        parent_id: Snowflake,
+        req: &CreateThreadRequest,
+    ) -> Result<Channel> {
+        self.json(Route::create_thread(parent_id, req)).await
+    }
+
+    /// POST /channels/{id}/messages with optional multipart file attachments.
+    /// Falls back to plain JSON [`Http::send_message`] when `files` is empty.
+    pub async fn send_message_with_files(
+        &self,
+        channel_id: Snowflake,
+        content: &str,
+        reply_to: Option<Snowflake>,
+        files: &[UploadFile],
+    ) -> Result<Message> {
+        if files.is_empty() {
+            return self.send_message(channel_id, content, reply_to).await;
+        }
+        let route = Route::send_message(channel_id, content, &generate_nonce(), reply_to);
+        let payload = route.body.unwrap_or_else(|| serde_json::json!({}));
+        let encoded = multipart::encode(&payload, files)?;
+        let bytes = self
+            .execute_raw(
+                Method::Post,
+                &route.path,
+                &encoded.content_type,
+                encoded.body,
+                Duration::from_secs(120),
+            )
+            .await?;
+        serde_json::from_slice(&bytes).map_err(|e| HttpError::Decode(e.to_string()))
+    }
+
+    /// Execute a request with a pre-encoded body and custom `Content-Type` / timeout.
+    async fn execute_raw(
+        &self,
+        method: Method,
+        path: &str,
+        content_type: &str,
+        body: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<Vec<u8>> {
+        let client = self
+            .inner
+            .client
+            .as_ref()
+            .map_err(|e| HttpError::Transport(e.clone()))?;
+        let auth = self.inner.auth.clone().ok_or(HttpError::Unauthorized)?;
+        let route = Route::new(method, path.to_string());
+        let url = route.url(&self.inner.base).map_err(HttpError::Transport)?;
+
+        let mut retried = false;
+        loop {
+            tracing::debug!(method = ?method, path, bytes = body.len(), "http multipart request");
+            let resp = client
+                .request(method.to_reqwest(), url.clone())
+                .header(AUTHORIZATION, auth.clone())
+                .header(CONTENT_TYPE, content_type)
+                .timeout(timeout)
+                .body(body.clone())
+                .send()
+                .await
+                .map_err(|e| HttpError::Transport(e.without_url().to_string()))?;
+            let status = resp.status().as_u16();
+            let retry_header = resp
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| HttpError::Transport(e.without_url().to_string()))?;
+
+            if (200..300).contains(&status) {
+                return Ok(bytes.to_vec());
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            let err = map_error_status(status, retry_header.as_deref(), &text);
+            match err {
+                HttpError::RateLimited(wait) if !retried && wait <= AUTO_RETRY_MAX => {
+                    tracing::warn!(path, ?wait, "rate limited, retrying once");
+                    retried = true;
+                    tokio::time::sleep(wait).await;
+                }
+                err => {
+                    tracing::debug!(path, status, "http error");
+                    return Err(err);
+                }
+            }
+        }
     }
 }
 

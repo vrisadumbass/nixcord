@@ -10,15 +10,16 @@
 
 use crate::backend::{AppEvent, Command, EventTx, HISTORY_PAGE};
 use crate::demo_assets::{avatar_hash, icon_hash, pool_avatar};
+use crate::ui::search::SearchScope;
 use nixcord_gateway::GatewayCommand;
 use nixcord_model::permissions::{SEND_MESSAGES, VIEW_CHANNEL};
 use nixcord_model::CustomEmoji;
 use nixcord_model::{
     Activity, ActivityKind, Attachment, Channel, ChannelKind, Embed, EmbedAuthor, EmbedField,
-    EmbedFooter, EmbedMedia, Emoji, GatewayEvent, Guild, GuildMember, ListMember, MemberListGroup,
-    MemberListItem, MemberListOp, MemberListUpdate, Message, MessageReference, MessageUpdate,
-    Overwrite, OverwriteKind, PartialMember, Presence, Reaction, ReadState, Ready, Relationship,
-    RelationshipKind, Role, Snowflake, Status, ThreadMetadata, User,
+    EmbedFooter, EmbedMedia, Emoji, ForumTag, GatewayEvent, Guild, GuildMember, ListMember,
+    MemberListGroup, MemberListItem, MemberListOp, MemberListUpdate, Message, MessageReference,
+    MessageUpdate, Overwrite, OverwriteKind, PartialMember, Presence, Reaction, ReadState, Ready,
+    Relationship, RelationshipKind, Role, Snowflake, Status, ThreadMetadata, User,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -335,7 +336,7 @@ fn ready() -> Ready {
             )
         },
     ];
-    let rust = guild(
+    let mut rust = guild(
         20,
         "Rust Lounge",
         vec![
@@ -359,11 +360,100 @@ fn ready() -> Ready {
                 Some("Immediate-mode GUI fans"),
             ),
             chan(203, t(20), Announcement, "announcements", t(200), 2, None),
-            chan(204, t(20), Forum, "help-forum", t(200), 3, None),
+            Channel {
+                available_tags: vec![
+                    ForumTag {
+                        id: Snowflake(20401),
+                        name: "Question".into(),
+                        emoji_name: Some("\u{2753}".into()),
+                        ..Default::default()
+                    },
+                    ForumTag {
+                        id: Snowflake(20402),
+                        name: "egui".into(),
+                        emoji_name: Some("\u{1F3A8}".into()),
+                        ..Default::default()
+                    },
+                    ForumTag {
+                        id: Snowflake(20403),
+                        name: "Async".into(),
+                        emoji_name: Some("\u{26A1}".into()),
+                        ..Default::default()
+                    },
+                    ForumTag {
+                        id: Snowflake(20404),
+                        name: "Solved".into(),
+                        emoji_name: Some("\u{2705}".into()),
+                        ..Default::default()
+                    },
+                ],
+                ..chan(
+                    204,
+                    t(20),
+                    Forum,
+                    "help-forum",
+                    t(200),
+                    3,
+                    Some("Ask questions, share patterns, and mark solved posts"),
+                )
+            },
             chan(205, t(20), Category, "Voice", None, 1, None),
             chan(206, t(20), Voice, "Pairing", t(205), 0, None),
         ],
     );
+    rust.threads = vec![
+        Channel {
+            thread_metadata: Some(ThreadMetadata {
+                archived: false,
+                locked: false,
+            }),
+            applied_tags: vec![Snowflake(20401), Snowflake(20402)],
+            last_message_id: Some(snowflake_at(now_ms() - 3 * 60_000, 11)),
+            ..chan(
+                207,
+                t(20),
+                PublicThread,
+                "Keeping egui idle memory under 150 MB on Windows",
+                t(204),
+                0,
+                None,
+            )
+        },
+        Channel {
+            thread_metadata: Some(ThreadMetadata {
+                archived: false,
+                locked: false,
+            }),
+            applied_tags: vec![Snowflake(20403), Snowflake(20404)],
+            last_message_id: Some(snowflake_at(now_ms() - 25 * 60_000, 12)),
+            ..chan(
+                208,
+                t(20),
+                PublicThread,
+                "Clean shutdown for tokio websocket tasks",
+                t(204),
+                0,
+                None,
+            )
+        },
+        Channel {
+            thread_metadata: Some(ThreadMetadata {
+                archived: false,
+                locked: false,
+            }),
+            applied_tags: vec![Snowflake(20402)],
+            last_message_id: Some(snowflake_at(now_ms() - 95 * 60_000, 13)),
+            ..chan(
+                209,
+                t(20),
+                PublicThread,
+                "Custom font fallback order for crisp emoji rendering",
+                t(204),
+                0,
+                None,
+            )
+        },
+    ];
     let pixel = guild(
         30,
         "Pixel Art Club",
@@ -435,21 +525,49 @@ fn ready() -> Ready {
         session_id: "demo".into(),
         resume_gateway_url: None,
         presences: people_presences(),
-        relationships: [1002u64, 1003, 1005, 1008]
-            .iter()
-            .map(|&id| Relationship {
-                id: Snowflake(id),
-                kind: RelationshipKind::Friend,
-                user: p.iter().find(|u| u.id.0 == id).cloned(),
+        relationships: {
+            let mut rels: Vec<Relationship> = [1002u64, 1003, 1005, 1008]
+                .iter()
+                .map(|&id| Relationship {
+                    id: Snowflake(id),
+                    kind: RelationshipKind::Friend,
+                    user: p.iter().find(|u| u.id.0 == id).cloned(),
+                    nickname: None,
+                })
+                .collect();
+            rels.push(Relationship {
+                id: Snowflake(1006),
+                kind: RelationshipKind::IncomingRequest,
+                user: p.iter().find(|u| u.id.0 == 1006).cloned(),
                 nickname: None,
-            })
-            .collect(),
+            });
+            rels.push(Relationship {
+                id: Snowflake(1007),
+                kind: RelationshipKind::OutgoingRequest,
+                user: p.iter().find(|u| u.id.0 == 1007).cloned(),
+                nickname: None,
+            });
+            rels.push(Relationship {
+                id: Snowflake(1009),
+                kind: RelationshipKind::Blocked,
+                user: Some(user(1009, "bramble", Some("Bramble"))),
+                nickname: None,
+            });
+            rels
+        },
         status: Some(Status::Online),
-        read_state: vec![ReadState {
-            id: Snowflake(103),
-            last_message_id: Some(snowflake_at(now_ms() - 30 * 60_000, 0)),
-            mention_count: 1,
-        }],
+        read_state: vec![
+            ReadState {
+                id: Snowflake(103),
+                last_message_id: Some(snowflake_at(now_ms() - 30 * 60_000, 0)),
+                mention_count: 1,
+            },
+            ReadState {
+                id: Snowflake(207),
+                last_message_id: Some(snowflake_at(now_ms() - 40 * 60_000, 0)),
+                mention_count: 0,
+            },
+        ],
     }
 }
 
@@ -1407,10 +1525,24 @@ pub async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx
                 channel,
                 content,
                 reply_to: reply_target,
+                attachments,
             } => {
                 seq += 1;
                 let t = now_ms();
                 let mut mine = base_msg(snowflake_at(t, seq), channel, &people[0], content, t);
+                mine.attachments = attachments
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, f)| Attachment {
+                        id: snowflake_at(t, seq + idx as u64 + 100),
+                        url: format!("https://demo.invalid/attachments/{}", f.filename),
+                        size: f.bytes.len() as u64,
+                        content_type: Some(f.content_type),
+                        filename: f.filename,
+                        width: None,
+                        height: None,
+                    })
+                    .collect();
                 if let Some(target) = reply_target.and_then(|id| {
                     histories
                         .get(&channel)
@@ -1432,13 +1564,12 @@ pub async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx
                 let bot = people[1].clone();
                 seq += 1;
                 let t = now_ms() + 2900;
-                let mut echo = base_msg(
-                    snowflake_at(t, seq),
-                    channel,
-                    &bot,
-                    format!("echo: {}", mine.content),
-                    t,
-                );
+                let echo_text = if mine.content.is_empty() && !mine.attachments.is_empty() {
+                    format!("received {} attachment(s)", mine.attachments.len())
+                } else {
+                    format!("echo: {}", mine.content)
+                };
+                let mut echo = base_msg(snowflake_at(t, seq), channel, &bot, echo_text, t);
                 echo.mentions = vec![mine.author.clone()];
                 reply_to(&mut echo, &mine);
                 histories.entry(channel).or_default().push(echo.clone());
@@ -1503,6 +1634,185 @@ pub async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx
                 }));
             }
             Command::Typing { .. } | Command::Ack { .. } => {}
+            Command::CreateDm { recipient_id } => {
+                let target = people
+                    .iter()
+                    .find(|u| u.id == recipient_id)
+                    .cloned()
+                    .unwrap_or_else(|| user(recipient_id.0, "friend", Some("Friend")));
+                seq += 1;
+                let ch = Channel {
+                    id: Snowflake(9000 + recipient_id.0),
+                    kind: ChannelKind::Dm,
+                    recipients: vec![target],
+                    last_message_id: Some(snowflake_at(now_ms(), seq)),
+                    ..Default::default()
+                };
+                events.send(AppEvent::DmCreated(Box::new(ch)));
+            }
+            Command::AcceptFriendRequest { user_id } => {
+                let u = people.iter().find(|u| u.id == user_id).cloned();
+                events.send(AppEvent::Gateway(GatewayEvent::RelationshipAdd(Box::new(
+                    Relationship {
+                        id: user_id,
+                        kind: RelationshipKind::Friend,
+                        user: u,
+                        nickname: None,
+                    },
+                ))));
+            }
+            Command::RemoveRelationship { user_id } => {
+                events.send(AppEvent::Gateway(GatewayEvent::RelationshipRemove {
+                    user_id,
+                }));
+            }
+            Command::BlockUser { user_id } => {
+                let u = people.iter().find(|u| u.id == user_id).cloned();
+                events.send(AppEvent::Gateway(GatewayEvent::RelationshipAdd(Box::new(
+                    Relationship {
+                        id: user_id,
+                        kind: RelationshipKind::Blocked,
+                        user: u,
+                        nickname: None,
+                    },
+                ))));
+            }
+            Command::SendFriendRequest { username } => {
+                let clean = username.trim().to_string();
+                if clean.eq_ignore_ascii_case("you") {
+                    events.send(AppEvent::FriendRequestResult {
+                        username: clean,
+                        error: Some("You can't send a friend request to yourself.".into()),
+                    });
+                } else {
+                    seq += 1;
+                    let target = people
+                        .iter()
+                        .find(|u| u.username.eq_ignore_ascii_case(&clean))
+                        .cloned()
+                        .unwrap_or_else(|| user(1200 + seq, &clean, Some(&clean)));
+                    events.send(AppEvent::Gateway(GatewayEvent::RelationshipAdd(Box::new(
+                        Relationship {
+                            id: target.id,
+                            kind: RelationshipKind::OutgoingRequest,
+                            user: Some(target),
+                            nickname: None,
+                        },
+                    ))));
+                    events.send(AppEvent::FriendRequestResult {
+                        username: clean,
+                        error: None,
+                    });
+                }
+            }
+            Command::SearchMessages {
+                request_id,
+                scope,
+                query,
+            } => {
+                let demo_ready = ready();
+                let chan_ids: Vec<Snowflake> = match scope {
+                    SearchScope::Guild(gid) => demo_ready
+                        .guilds
+                        .iter()
+                        .find(|g| g.id == gid)
+                        .map(|g| {
+                            g.channels
+                                .iter()
+                                .filter(|c| c.kind.is_textual() && c.id.0 != 109 && c.id.0 != 110)
+                                .chain(g.threads.iter())
+                                .map(|c| c.id)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    SearchScope::Channel(cid) => vec![cid],
+                };
+                for cid in &chan_ids {
+                    histories
+                        .entry(*cid)
+                        .or_insert_with(|| history_for(*cid, &people));
+                }
+                let terms: Vec<String> = query
+                    .content
+                    .as_deref()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .map(|s| s.to_lowercase())
+                    .collect();
+                let all_msgs: Vec<&Message> = chan_ids
+                    .iter()
+                    .filter_map(|cid| histories.get(cid))
+                    .flat_map(|v| v.iter())
+                    .collect();
+                let result = crate::ui::search::local_search(
+                    all_msgs,
+                    &query,
+                    &terms,
+                    query.offset.unwrap_or(0),
+                );
+                let events = events.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    events.send(AppEvent::SearchResults { request_id, result });
+                });
+            }
+            Command::LoadHistoryAround { channel, around } => {
+                let all = histories
+                    .entry(channel)
+                    .or_insert_with(|| history_for(channel, &people));
+                let pos = all
+                    .iter()
+                    .position(|m| m.id == around)
+                    .unwrap_or(all.len().saturating_sub(1));
+                let half = HISTORY_PAGE as usize / 2;
+                let start = pos.saturating_sub(half);
+                let end = (start + HISTORY_PAGE as usize).min(all.len());
+                let page = all[start..end].to_vec();
+                let events = events.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    events.send(AppEvent::HistoryAround {
+                        channel,
+                        around,
+                        messages: page,
+                    });
+                });
+            }
+            Command::CreateThread {
+                parent_id,
+                is_forum: _,
+                name,
+                message,
+                applied_tags,
+            } => {
+                seq += 1;
+                let t = now_ms();
+                let tid = Snowflake(8000 + seq);
+                let gid = guild_of(parent_id);
+                let first_msg = message
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|body| base_msg(snowflake_at(t, seq + 1), tid, &people[0], body, t));
+                let thread = Channel {
+                    id: tid,
+                    kind: ChannelKind::PublicThread,
+                    guild_id: gid,
+                    name: Some(name),
+                    parent_id: Some(parent_id),
+                    last_message_id: first_msg.as_ref().map(|m| m.id),
+                    thread_metadata: Some(ThreadMetadata {
+                        archived: false,
+                        locked: false,
+                    }),
+                    applied_tags,
+                    ..Default::default()
+                };
+                if let Some(m) = first_msg {
+                    histories.insert(tid, vec![m]);
+                } else {
+                    histories.insert(tid, Vec::new());
+                }
+                events.send(AppEvent::ThreadCreated(Box::new(thread)));
+            }
             Command::Interact(ix) => {
                 let events = events.clone();
                 let summary = if ix.values.is_empty() {

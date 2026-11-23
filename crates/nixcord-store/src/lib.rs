@@ -637,6 +637,51 @@ impl Store {
             .map_or(RelationshipKind::None, |r| r.kind)
     }
 
+    /// All stored relationships whose target user is cached.
+    pub fn relationships(&self) -> Vec<(&Relationship, &User)> {
+        self.relationships
+            .values()
+            .filter_map(|r| self.users.get(&r.id).map(|u| (r, u)))
+            .collect()
+    }
+
+    /// Count of incoming friend requests whose user is cached.
+    pub fn incoming_request_count(&self) -> u32 {
+        self.relationships
+            .values()
+            .filter(|r| {
+                r.kind == RelationshipKind::IncomingRequest && self.users.contains_key(&r.id)
+            })
+            .count() as u32
+    }
+
+    /// Iterate over all cached users (used by search `from:` resolution).
+    pub fn users(&self) -> impl Iterator<Item = &User> {
+        self.users.values()
+    }
+
+    /// Replace a channel's message window with a page fetched `around` a jumped-to message.
+    /// Marks the channel detached if the newest returned message is older than the channel's
+    /// known `last_message_id` (so the "Jump to present" banner appears cleanly).
+    pub fn insert_around_history(&mut self, channel_id: Snowflake, mut messages: Vec<Message>) {
+        self.history_loaded.insert(channel_id);
+        for m in &messages {
+            self.cache_message_users(m);
+            self.cache_member(m);
+        }
+        messages.sort_by_key(|m| m.id);
+        messages.dedup_by_key(|m| m.id);
+        cap(&mut messages);
+        let newest = messages.last().map(|m| m.id);
+        let channel_last = self.channels.get(&channel_id).and_then(|c| c.last_message_id);
+        if matches!((newest, channel_last), (Some(n), Some(last)) if n < last) {
+            self.detached.insert(channel_id);
+        } else {
+            self.detached.remove(&channel_id);
+        }
+        self.messages.insert(channel_id, messages);
+    }
+
     /// Borrowed profile snapshot for a user (optionally scoped to a guild for nick,
     /// guild avatar, roles and role color).
     pub fn user_profile(

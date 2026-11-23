@@ -145,6 +145,11 @@ impl ChannelKind {
             Self::AnnouncementThread | Self::PublicThread | Self::PrivateThread
         )
     }
+
+    /// Can the user open this channel in the main view (textual channels, threads, or forums)?
+    pub fn is_openable(self) -> bool {
+        self.is_textual() || self == Self::Forum
+    }
 }
 
 /// Permission bits used by the client (Discord's documented values).
@@ -219,6 +224,19 @@ pub struct Overwrite {
     pub deny: u64,
 }
 
+/// Tag available on a Forum channel (`available_tags`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForumTag {
+    pub id: Snowflake,
+    pub name: String,
+    #[serde(default)]
+    pub moderated: bool,
+    #[serde(default)]
+    pub emoji_id: Option<Snowflake>,
+    #[serde(default)]
+    pub emoji_name: Option<String>,
+}
+
 /// Metadata carried on thread channels (`thread_metadata`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ThreadMetadata {
@@ -252,6 +270,12 @@ pub struct Channel {
     pub permission_overwrites: Vec<Overwrite>,
     #[serde(default)]
     pub thread_metadata: Option<ThreadMetadata>,
+    /// Tags defined on a Forum channel.
+    #[serde(default, deserialize_with = "de_lenient_vec")]
+    pub available_tags: Vec<ForumTag>,
+    /// Tag ids applied to a Forum post thread.
+    #[serde(default, deserialize_with = "de_lenient_vec")]
+    pub applied_tags: Vec<Snowflake>,
 }
 
 impl Channel {
@@ -555,6 +579,9 @@ pub struct Message {
     /// Application that owns an interaction/bot message (used for component interactions).
     #[serde(default)]
     pub application_id: Option<Snowflake>,
+    /// True on matched messages inside Discord message search context groups.
+    #[serde(default)]
+    pub hit: bool,
 }
 
 /// Nonce may come back as a string or a number.

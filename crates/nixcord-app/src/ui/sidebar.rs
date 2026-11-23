@@ -397,19 +397,20 @@ fn guild_channels(ui: &mut Ui, app: &NixApp, gid: Snowflake, actions: &mut Vec<A
 
 fn channel_row(ui: &mut Ui, app: &NixApp, ch: &Channel, actions: &mut Vec<Action>) {
     let t = app.theme;
-    let textual = ch.kind.is_textual();
+    let openable = ch.kind.is_openable();
+    let is_forum = ch.kind == ChannelKind::Forum;
     let selected = app.view.channel == Some(ch.id);
     let row_w = ui.available_width();
     let (outer, resp) = ui.allocate_exact_size(
         Vec2::new(row_w, 32.0),
-        if textual {
+        if openable {
             Sense::click()
         } else {
             Sense::hover()
         },
     );
     let rect = outer.shrink2(Vec2::new(8.0, 1.0));
-    let hovered = resp.hovered() && textual;
+    let hovered = resp.hovered() && openable;
     if selected {
         ui.painter()
             .rect_filled(rect, CornerRadius::same(4), t.selected);
@@ -417,12 +418,20 @@ fn channel_row(ui: &mut Ui, app: &NixApp, ch: &Channel, actions: &mut Vec<Action
         ui.painter()
             .rect_filled(rect, CornerRadius::same(4), t.hover);
     }
-    let mentions = if textual && !selected {
-        app.store.channel_mention_count(ch.id)
+    let (mentions, unread) = if !openable || selected {
+        (0, false)
+    } else if is_forum {
+        let threads = app.store.channel_threads(ch.id);
+        let m: u32 = threads
+            .iter()
+            .map(|th| app.store.channel_mention_count(th.id))
+            .sum();
+        let u = m > 0 || threads.iter().any(|th| app.is_unread(th));
+        (m, u)
     } else {
-        0
+        let m = app.store.channel_mention_count(ch.id);
+        (m, app.is_unread(ch) || m > 0)
     };
-    let unread = textual && !selected && (app.is_unread(ch) || mentions > 0);
     if unread {
         // Small white pill on the column's left edge.
         let dot = Rect::from_center_size(
@@ -432,7 +441,7 @@ fn channel_row(ui: &mut Ui, app: &NixApp, ch: &Channel, actions: &mut Vec<Action
         ui.painter()
             .rect_filled(dot, CornerRadius::same(4), t.strong);
     }
-    let color = if !textual {
+    let color = if !openable {
         t.muted.gamma_multiply(0.55)
     } else if selected || hovered || unread {
         t.strong
@@ -474,10 +483,10 @@ fn channel_row(ui: &mut Ui, app: &NixApp, ch: &Channel, actions: &mut Vec<Action
             t,
         );
     }
-    if resp.clicked() && textual {
+    if resp.clicked() && openable {
         actions.push(Action::SelectChannel(ch.id));
     }
-    if !textual {
+    if !openable {
         resp.on_hover_text("Not supported in nixcord yet");
     }
 }
@@ -561,6 +570,48 @@ fn thread_row(ui: &mut Ui, app: &NixApp, ch: &Channel, is_last: bool, actions: &
 
 fn dm_list(ui: &mut Ui, app: &NixApp, actions: &mut Vec<Action>) {
     let t = app.theme;
+    // Top "Friends" navigation item (active when on Home with no DM selected).
+    let friends_sel = app.view.guild.is_none() && app.view.channel.is_none();
+    let incoming = app.store.incoming_request_count();
+    let (f_outer, f_resp) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 42.0), Sense::click());
+    let f_rect = f_outer.shrink2(Vec2::new(8.0, 1.0));
+    if friends_sel {
+        ui.painter()
+            .rect_filled(f_rect, CornerRadius::same(4), t.selected);
+    } else if f_resp.hovered() {
+        ui.painter()
+            .rect_filled(f_rect, CornerRadius::same(4), t.hover);
+    }
+    let f_color = if friends_sel || f_resp.hovered() {
+        t.strong
+    } else {
+        t.muted
+    };
+    let icon_rect =
+        Rect::from_center_size(Pos2::new(f_rect.left() + 22.0, f_rect.center().y), Vec2::splat(22.0));
+    super::paint_icon(ui, Icon::Members, icon_rect, f_color);
+    ui.painter().text(
+        Pos2::new(f_rect.left() + 44.0, f_rect.center().y),
+        Align2::LEFT_CENTER,
+        "Friends",
+        if friends_sel { bold(15.5) } else { prop(15.5) },
+        f_color,
+    );
+    if incoming > 0 {
+        paint_mention_badge(
+            ui,
+            Pos2::new(f_rect.right() - 6.0, f_rect.center().y),
+            incoming,
+            None,
+            t,
+        );
+    }
+    if f_resp.clicked() {
+        actions.push(Action::OpenFriends);
+    }
+    ui.add_space(10.0);
+
     ui.horizontal(|ui| {
         ui.add_space(16.0);
         ui.label(

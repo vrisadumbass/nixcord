@@ -6,11 +6,16 @@
 //!
 //! Every event send is followed by `ctx.request_repaint()` so an idle UI wakes up.
 
+use crate::ui::search::SearchScope;
 use eframe::egui;
 use nixcord_gateway::GatewayCommand;
-use nixcord_http::{Http, HttpError};
+use nixcord_http::{
+    CreateThreadRequest, Http, HttpError, MessageSearchQuery, MessageSearchResult, UploadFile,
+};
 use nixcord_model::components::ComponentInteraction;
-use nixcord_model::{Emoji, GatewayEvent, Message, MessageUpdate, Snowflake, User};
+use nixcord_model::{
+    Channel, Emoji, GatewayEvent, Message, MessageUpdate, RelationshipKind, Snowflake, User,
+};
 use std::sync::mpsc as std_mpsc;
 use tokio::sync::{mpsc, watch};
 
@@ -45,6 +50,33 @@ pub enum AppEvent {
         custom_id: String,
         error: Option<String>,
     },
+    /// A DM channel was opened/created via POST /users/@me/channels.
+    DmCreated(Box<Channel>),
+    /// Outcome of sending a friend request by username.
+    FriendRequestResult {
+        username: String,
+        error: Option<String>,
+    },
+    /// Result page for an active message search.
+    SearchResults {
+        request_id: u64,
+        result: MessageSearchResult,
+    },
+    /// A message search request failed.
+    SearchFailed {
+        request_id: u64,
+        error: String,
+    },
+    /// Messages fetched `around` a jumped-to message id.
+    HistoryAround {
+        channel: Snowflake,
+        around: Snowflake,
+        messages: Vec<Message>,
+    },
+    /// A new Forum post or public thread was created.
+    ThreadCreated(Box<Channel>),
+    /// Creating a Forum post or thread failed.
+    CreateThreadFailed(String),
     Error(String),
     LoginOk(User),
     LoginFailed {
@@ -67,6 +99,8 @@ pub enum Command {
         content: String,
         /// Send as a reply to this message (pings its author).
         reply_to: Option<Snowflake>,
+        /// Optional file attachments uploaded as multipart/form-data.
+        attachments: Vec<UploadFile>,
     },
     /// Add my reaction. The store update arrives as a gateway MESSAGE_REACTION_ADD.
     React {
@@ -101,6 +135,38 @@ pub enum Command {
     Ack {
         channel: Snowflake,
         message: Snowflake,
+    },
+    /// Open or create a 1-on-1 DM channel with `recipient_id`.
+    CreateDm {
+        recipient_id: Snowflake,
+    },
+    AcceptFriendRequest {
+        user_id: Snowflake,
+    },
+    RemoveRelationship {
+        user_id: Snowflake,
+    },
+    BlockUser {
+        user_id: Snowflake,
+    },
+    SendFriendRequest {
+        username: String,
+    },
+    SearchMessages {
+        request_id: u64,
+        scope: SearchScope,
+        query: MessageSearchQuery,
+    },
+    LoadHistoryAround {
+        channel: Snowflake,
+        around: Snowflake,
+    },
+    CreateThread {
+        parent_id: Snowflake,
+        is_forum: bool,
+        name: String,
+        message: Option<String>,
+        applied_tags: Vec<Snowflake>,
     },
     Logout,
 }
@@ -286,7 +352,11 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
             channel,
             content,
             reply_to,
-        } => match http.send_message(channel, &content, reply_to).await {
+            attachments,
+        } => match http
+            .send_message_with_files(channel, &content, reply_to, &attachments)
+            .await
+        {
             Ok(m) => events.send(AppEvent::Sent(Box::new(m))),
             Err(HttpError::Forbidden) => events.send(AppEvent::Forbidden { channel }),
             Err(e) => events.send(AppEvent::Error(format!("Couldn't send: {e}"))),
@@ -350,6 +420,99 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
         Command::Ack { channel, message } => {
             if let Err(e) = http.ack_message(channel, message).await {
                 tracing::debug!("ack failed: {e}");
+            }
+        }
+        Command::CreateDm { recipient_id } => match http.create_dm(recipient_id).await {
+            Ok(ch) => events.send(AppEvent::DmCreated(Box::new(ch))),
+            Err(e) => events.send(AppEvent::Error(format!("Couldn't open DM: {e}"))),
+        },
+        Command::AcceptFriendRequest { user_id } => {
+            if let Err(e) = http.put_relationship(user_id, None).await {
+                events.send(AppEvent::Error(format!("Couldn't accept request: {e}")));
+            }
+        }
+        Command::RemoveRelationship { user_id } => {
+            if let Err(e) = http.remove_relationship(user_id).await {
+                events.send(AppEvent::Error(format!("Couldn't update relationship: {e}")));
+            }
+        }
+        Command::BlockUser { user_id } => {
+            if let Err(e) = http
+                .put_relationship(user_id, Some(RelationshipKind::Blocked))
+                .await
+            {
+                events.send(AppEvent::Error(format!("Couldn't block user: {e}")));
+            }
+        }
+        Command::SendFriendRequest { username } => {
+            let err = http
+                .send_friend_request(&username)
+                .await
+                .err()
+                .map(|e| e.to_string());
+            events.send(AppEvent::FriendRequestResult {
+                username,
+                error: err,
+            });
+        }
+        Command::SearchMessages {
+            request_id,
+            scope,
+            query,
+        } => {
+            let res = match scope {
+                SearchScope::Guild(gid) => http.search_guild_messages(gid, &query).await,
+                SearchScope::Channel(cid) => http.search_channel_messages(cid, &query).await,
+            };
+            match res {
+                Ok(result) => events.send(AppEvent::SearchResults { request_id, result }),
+                Err(e) => events.send(AppEvent::SearchFailed {
+                    request_id,
+                    error: format!("Search failed: {e}"),
+                }),
+            }
+        }
+        Command::LoadHistoryAround { channel, around } => {
+            match http.messages_around(channel, around, HISTORY_PAGE).await {
+                Ok(messages) => events.send(AppEvent::HistoryAround {
+                    channel,
+                    around,
+                    messages,
+                }),
+                Err(e) => events.send(AppEvent::Error(format!("Couldn't jump to message: {e}"))),
+            }
+        }
+        Command::CreateThread {
+            parent_id,
+            is_forum,
+            name,
+            message,
+            applied_tags,
+        } => {
+            let req = CreateThreadRequest {
+                name,
+                content: message.clone(),
+                applied_tags,
+                is_forum,
+            };
+            match http.create_thread(parent_id, &req).await {
+                Ok(thread) => {
+                    let tid = thread.id;
+                    events.send(AppEvent::ThreadCreated(Box::new(thread)));
+                    if !is_forum {
+                        if let Some(body) = message.filter(|s| !s.trim().is_empty()) {
+                            match http.send_message(tid, &body, None).await {
+                                Ok(m) => events.send(AppEvent::Sent(Box::new(m))),
+                                Err(e) => events.send(AppEvent::Error(format!(
+                                    "Thread created, but starter message failed: {e}"
+                                ))),
+                            }
+                        }
+                    }
+                }
+                Err(e) => events.send(AppEvent::CreateThreadFailed(format!(
+                    "Couldn't create thread: {e}"
+                ))),
             }
         }
         Command::Login(_) | Command::Logout | Command::Gateway(_) => {}
