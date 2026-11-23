@@ -1,10 +1,11 @@
 //! Message composer: Enter sends, Shift+Enter inserts a newline, Up on an empty composer
 //! edits your last message, Escape cancels edit/reply. Typing indicator underneath.
 //!
-//! Attachments: click `+` to open a non-blocking native file picker (`rfd`), or drag and
-//! drop files onto the window. Staged attachments appear in a horizontal tray above the
-//! input box with image/file badges, formatted sizes, and `×` remove buttons. Messages
-//! with attachments can be sent with or without text.
+//! Attachments: click `+` to open a non-blocking native file picker (`rfd`), drag and
+//! drop files onto the window, or press `Ctrl+V` to paste a clipboard image as PNG.
+//! Staged attachments appear in a horizontal tray above the input box with image/file
+//! badges, formatted sizes, and `×` remove buttons. Messages with attachments can be
+//! sent with or without text.
 //!
 //! Emoji: the smiley button on the right opens the emoji picker (inserts at the caret).
 //! Typing `:hea` (two or more name characters after a colon) shows matching emoji above the
@@ -37,6 +38,10 @@ const TYPING_EVERY: Duration = Duration::from_secs(8);
 /// Attachment card dimensions in the horizontal tray above the composer.
 const ATTACH_CARD_W: f32 = 176.0;
 const ATTACH_CARD_H: f32 = 52.0;
+
+/// Maximum uncompressed RGBA bytes accepted from the clipboard before PNG encoding
+/// (64 MiB = 16 megapixels at 4 bytes/pixel) to prevent allocation spikes.
+const MAX_CLIPBOARD_RGBA_BYTES: usize = 64 * 1024 * 1024;
 
 pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Action>) {
     // Always drain background file-picker / drag-drop tasks first so finished dialogs
@@ -167,6 +172,16 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
 
     let id = Id::unique(("composer", ch));
     let focused = ui.memory(|m| m.has_focus(id));
+
+    // Clipboard image paste (Ctrl+V / Cmd+V): if no non-empty text Event::Paste is present,
+    // check the OS clipboard on a background thread and stage any image as `pasted-image.png`.
+    if focused && app.composer.editing.is_none() && ui.input(should_paste_clipboard_image) {
+        ui.input_mut(|i| {
+            i.consume_key(Modifiers::COMMAND, Key::V);
+            i.consume_key(Modifiers::CTRL, Key::V);
+        });
+        spawn_clipboard_paste(ui.ctx().clone(), &mut app.composer);
+    }
 
     // Emoji autocomplete: its keys are taken before the text edit sees them.
     let ac = if focused {
@@ -522,6 +537,102 @@ fn spawn_file_picker(ctx: egui::Context, composer: &mut ComposerState, max_files
         composer.attach_dialog_open = true;
         composer.attach_rxs.push(rx);
     }
+}
+
+/// Returns `true` when the input frame requests a paste (`Ctrl+V` / `Cmd+V` or an empty
+/// `Event::Paste`) without any non-empty text `Event::Paste`, indicating we should check
+/// the OS clipboard for an image while letting normal text pastes flow to `TextEdit`.
+fn should_paste_clipboard_image(input: &egui::InputState) -> bool {
+    let has_text_paste = input
+        .events
+        .iter()
+        .any(|e| matches!(e, egui::Event::Paste(text) if !text.is_empty()));
+    if has_text_paste {
+        return false;
+    }
+    let has_empty_paste = input
+        .events
+        .iter()
+        .any(|e| matches!(e, egui::Event::Paste(text) if text.is_empty()));
+    let has_ctrl_v = input.key_pressed(Key::V) && (input.modifiers.command || input.modifiers.ctrl);
+    has_empty_paste || has_ctrl_v
+}
+
+/// Spawn a non-blocking background thread to check the OS clipboard for an image,
+/// encode it to PNG in memory, and stage it as `"pasted-image.png"`.
+fn spawn_clipboard_paste(ctx: egui::Context, composer: &mut ComposerState) {
+    let (tx, rx) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("nixcord-paste".into())
+        .spawn(move || {
+            let Ok(img) = arboard::Clipboard::new().and_then(|mut cb| cb.get_image()) else {
+                return;
+            };
+            let batch = match encode_rgba_png(img.width, img.height, img.bytes.as_ref()) {
+                Ok(png_bytes) => (
+                    vec![UploadFile::from_bytes("pasted-image.png", png_bytes)],
+                    Vec::new(),
+                ),
+                Err(err) => (Vec::new(), vec![err]),
+            };
+            let _ = tx.send(batch);
+            ctx.request_repaint();
+        });
+    if spawned.is_ok() {
+        composer.attach_rxs.push(rx);
+    }
+}
+
+/// Encode an in-memory RGBA8 pixel buffer (`width * height * 4` bytes) into a PNG image,
+/// enforcing dimension validity, a raw pixel allocation cap, and [`MAX_FILE_BYTES`].
+fn encode_rgba_png(width: usize, height: usize, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    encode_rgba_png_with_limit(width, height, rgba, MAX_FILE_BYTES)
+}
+
+fn encode_rgba_png_with_limit(
+    width: usize,
+    height: usize,
+    rgba: &[u8],
+    max_file_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    use image::codecs::png::PngEncoder;
+    use image::{ExtendedColorType, ImageEncoder};
+
+    if width == 0 || height == 0 {
+        return Err("Clipboard image has empty dimensions.".into());
+    }
+    let (Ok(w32), Ok(h32)) = (u32::try_from(width), u32::try_from(height)) else {
+        return Err("Clipboard image dimensions overflow u32.".into());
+    };
+    let Some(expected_len) = width.checked_mul(height).and_then(|px| px.checked_mul(4)) else {
+        return Err("Clipboard image size overflows.".into());
+    };
+    if expected_len > MAX_CLIPBOARD_RGBA_BYTES {
+        return Err(format!(
+            "Pasted image is too large ({width}×{height} exceeds {} raw pixel limit).",
+            fmt_size(MAX_CLIPBOARD_RGBA_BYTES as u64)
+        ));
+    }
+    if rgba.len() != expected_len {
+        return Err(format!(
+            "Clipboard image buffer length mismatch (expected {expected_len} bytes, got {}).",
+            rgba.len()
+        ));
+    }
+
+    let mut png_bytes = Vec::with_capacity((expected_len / 4).clamp(256, 512 * 1024));
+    PngEncoder::new(&mut png_bytes)
+        .write_image(rgba, w32, h32, ExtendedColorType::Rgba8)
+        .map_err(|e| format!("Couldn't encode pasted image as PNG: {e}"))?;
+
+    if png_bytes.len() > max_file_bytes {
+        return Err(format!(
+            "`pasted-image.png` exceeds the {} limit ({}).",
+            fmt_size(max_file_bytes as u64),
+            fmt_size(png_bytes.len() as u64)
+        ));
+    }
+    Ok(png_bytes)
 }
 
 /// Handle OS file drag-hover (overlay) and file drops into the composer.
@@ -1335,5 +1446,89 @@ mod tests {
         .clear();
 
         assert_eq!(attachments.len(), 3);
+    }
+
+    #[test]
+    fn encode_rgba_png_produces_valid_png_and_roundtrips_dimensions() {
+        // 3x2 RGBA test pattern.
+        let (w, h) = (3usize, 2usize);
+        let rgba: Vec<u8> = vec![
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, // row 0: R, G, B
+            255, 255, 0, 255, 0, 255, 255, 128, 255, 0, 255, 64, // row 1: Y, C, M
+        ];
+
+        let png = encode_rgba_png(w, h, &rgba).expect("encode_rgba_png should succeed");
+        // Verify 8-byte PNG magic signature.
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(png.len() <= MAX_FILE_BYTES);
+
+        // Round-trip decode with `image` to verify dimensions and exact RGBA pixels.
+        let decoded = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+            .expect("encoded PNG should decode")
+            .into_rgba8();
+        assert_eq!(decoded.width(), w as u32);
+        assert_eq!(decoded.height(), h as u32);
+        assert_eq!(decoded.as_raw(), &rgba);
+
+        // Verify UploadFile wrapping sets image/png content type.
+        let file = UploadFile::from_bytes("pasted-image.png", png);
+        assert_eq!(file.filename, "pasted-image.png");
+        assert_eq!(file.content_type, "image/png");
+        assert!(file.is_image());
+    }
+
+    #[test]
+    fn encode_rgba_png_enforces_dimensions_and_size_limits() {
+        // Zero dimensions rejected.
+        assert!(encode_rgba_png(0, 4, &[]).is_err());
+        assert!(encode_rgba_png(4, 0, &[]).is_err());
+
+        // Mismatched RGBA slice length rejected.
+        assert!(encode_rgba_png(2, 2, &[0u8; 15]).is_err());
+        assert!(encode_rgba_png(2, 2, &[0u8; 17]).is_err());
+
+        // Raw pixel ceiling (MAX_CLIPBOARD_RGBA_BYTES) rejected before allocation/encoding.
+        let too_wide = (MAX_CLIPBOARD_RGBA_BYTES / 4) + 1;
+        let err = encode_rgba_png(too_wide, 1, &[]).unwrap_err();
+        assert!(err.contains("raw pixel limit"));
+
+        // Encoded PNG byte cap (MAX_FILE_BYTES / custom limit) enforced.
+        let rgba = vec![42u8; 4 * 4 * 4];
+        let err = encode_rgba_png_with_limit(4, 4, &rgba, 16).unwrap_err();
+        assert!(err.contains("pasted-image.png"));
+        assert!(err.contains("exceeds"));
+    }
+
+    #[test]
+    fn should_paste_clipboard_image_distinguishes_text_vs_image_paste() {
+        // Non-empty text paste must NOT be intercepted so TextEdit receives it normally.
+        let mut input = egui::InputState::default();
+        input.events.push(egui::Event::Paste("hello world".into()));
+        input.modifiers = Modifiers::COMMAND;
+        input.events.push(egui::Event::Key {
+            key: Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        });
+        assert!(!should_paste_clipboard_image(&input));
+
+        // Ctrl+V / Cmd+V with no text paste triggers clipboard image check.
+        let mut input = egui::InputState::default();
+        input.modifiers = Modifiers::COMMAND;
+        input.events.push(egui::Event::Key {
+            key: Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        });
+        assert!(should_paste_clipboard_image(&input));
+
+        // Empty Event::Paste also triggers clipboard image check.
+        let mut input = egui::InputState::default();
+        input.events.push(egui::Event::Paste(String::new()));
+        assert!(should_paste_clipboard_image(&input));
     }
 }

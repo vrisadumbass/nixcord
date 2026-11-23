@@ -34,6 +34,9 @@ serde.workspace = true
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 # Native save dialog for the image viewer (Win32 / AppKit / XDG portal; no GTK).
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+# Clipboard image paste (Ctrl+V) in the composer, encoded to PNG in memory.
+arboard = "3.7"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 
 # Renderer per OS (see src/platform.rs): wgpu on Direct3D 12 only on Windows (no
 # Vulkan/GL/Metal wgpu backends compiled in), with glow kept as a fallback for machines
