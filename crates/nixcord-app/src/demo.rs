@@ -321,6 +321,7 @@ fn history_for(channel: Snowflake, people: &[User], me_mentions: bool) -> Vec<Me
             attachments: Vec::new(),
             mentions,
             referenced_message: None,
+            ..Default::default()
         };
         if m.content.starts_with("here is the log") {
             m.attachments.push(Attachment {
@@ -399,6 +400,7 @@ pub async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx
                     attachments: Vec::new(),
                     mentions: Vec::new(),
                     referenced_message: None,
+                    ..Default::default()
                 };
                 events.send(AppEvent::Sent(Box::new(mine.clone())));
                 if content.trim_start().starts_with("/forbidden") {
@@ -429,6 +431,7 @@ pub async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx
                         attachments: Vec::new(),
                         mentions: vec![mine.author.clone()],
                         referenced_message: Some(Box::new(mine)),
+                        ..Default::default()
                     };
                     events.send(AppEvent::Gateway(GatewayEvent::MessageCreate(Box::new(
                         reply,
@@ -447,6 +450,7 @@ pub async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx
                         content: Some(content),
                         edited_timestamp: Some(iso(now_ms())),
                         attachments: None,
+                        ..Default::default()
                     },
                 ))));
             }

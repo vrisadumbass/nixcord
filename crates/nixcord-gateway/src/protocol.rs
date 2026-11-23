@@ -107,10 +107,6 @@ pub struct ReadySession {
 /// `Ok(None)` means the event type is not one we handle.
 pub fn decode_dispatch(t: &str, d: &str) -> Result<Option<GatewayEvent>, JsonError> {
     #[derive(Deserialize)]
-    struct IdOnly {
-        id: Snowflake,
-    }
-    #[derive(Deserialize)]
     struct MsgDelete {
         id: Snowflake,
         channel_id: Snowflake,
@@ -126,9 +122,19 @@ pub fn decode_dispatch(t: &str, d: &str) -> Result<Option<GatewayEvent>, JsonErr
         "RESUMED" => GatewayEvent::Resumed,
         "GUILD_CREATE" => GatewayEvent::GuildCreate(Box::new(decode_guild(d)?)),
         "GUILD_UPDATE" => GatewayEvent::GuildUpdate(Box::new(decode_guild(d)?)),
-        "GUILD_DELETE" => GatewayEvent::GuildDelete {
-            id: serde_json::from_str::<IdOnly>(d)?.id,
-        },
+        "GUILD_DELETE" => {
+            #[derive(Deserialize)]
+            struct GuildDel {
+                id: Snowflake,
+                #[serde(default)]
+                unavailable: bool,
+            }
+            let g: GuildDel = serde_json::from_str(d)?;
+            GatewayEvent::GuildDelete {
+                id: g.id,
+                unavailable: g.unavailable,
+            }
+        }
         "CHANNEL_CREATE" => {
             GatewayEvent::ChannelCreate(Box::new(serde_json::from_str::<Channel>(d)?))
         }
@@ -387,7 +393,10 @@ mod tests {
         );
         assert_eq!(
             decode_dispatch("GUILD_DELETE", r#"{"id":"5","unavailable":true}"#).unwrap(),
-            Some(GatewayEvent::GuildDelete { id: Snowflake(5) })
+            Some(GatewayEvent::GuildDelete {
+                id: Snowflake(5),
+                unavailable: true
+            })
         );
         assert_eq!(
             decode_dispatch("RESUMED", "{}").unwrap(),

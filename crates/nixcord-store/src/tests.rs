@@ -61,6 +61,7 @@ fn msg(id: u64, channel: u64, author: u64) -> Message {
         attachments: Vec::new(),
         mentions: Vec::new(),
         referenced_message: None,
+        ..Default::default()
     }
 }
 
@@ -222,7 +223,10 @@ fn guild_create_fills_unavailable_guild() {
 fn guild_delete_drops_channels_and_messages() {
     let mut s = basic();
     s.insert_history(sf(10), vec![msg(5, 10, 3)]);
-    s.apply(&GatewayEvent::GuildDelete { id: sf(100) });
+    s.apply(&GatewayEvent::GuildDelete {
+        id: sf(100),
+        unavailable: false,
+    });
     assert!(s.guild(sf(100)).is_none());
     assert!(s.guilds().is_empty());
     assert!(s.channel(sf(10)).is_none());
@@ -385,6 +389,7 @@ fn history_dedupe_on_overlap_and_sort() {
         content: Some("edited".into()),
         edited_timestamp: None,
         attachments: None,
+        ..Default::default()
     })));
     s.insert_history(
         sf(10),
@@ -448,6 +453,7 @@ fn message_update_partial_patch() {
         content: None,
         edited_timestamp: Some("2024-01-02T00:00:00Z".into()),
         attachments: None,
+        ..Default::default()
     })));
     let m = &s.messages(sf(10))[0];
     assert_eq!(m.content, "m5");
@@ -461,6 +467,7 @@ fn message_update_partial_patch() {
         content: Some("new".into()),
         edited_timestamp: None,
         attachments: Some(vec![]),
+        ..Default::default()
     })));
     let m = &s.messages(sf(10))[0];
     assert_eq!(m.content, "new");
@@ -474,6 +481,7 @@ fn message_update_partial_patch() {
         content: Some("x".into()),
         edited_timestamp: None,
         attachments: None,
+        ..Default::default()
     })));
 }
 

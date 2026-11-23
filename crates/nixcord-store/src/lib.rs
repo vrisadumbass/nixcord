@@ -84,7 +84,9 @@ impl Store {
                 let replace = !g.channels.is_empty() || !self.guilds.contains_key(&g.id);
                 self.upsert_guild(g, replace);
             }
-            GatewayEvent::GuildDelete { id } => self.remove_guild(*id),
+            GatewayEvent::GuildDelete { id, .. } => self.remove_guild(*id),
+            // TODO(data agent): apply reactions.
+            GatewayEvent::ReactionAdd { .. } | GatewayEvent::ReactionRemove { .. } => {}
             GatewayEvent::ChannelCreate(ch) | GatewayEvent::ChannelUpdate(ch) => {
                 self.upsert_channel(ch)
             }

@@ -51,7 +51,7 @@ impl<'de> Deserialize<'de> for Snowflake {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct User {
     pub id: Snowflake,
     pub username: String,
@@ -187,7 +187,7 @@ pub struct Guild {
     pub unavailable: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Attachment {
     pub id: Snowflake,
     pub filename: String,
@@ -202,13 +202,122 @@ pub struct Attachment {
     pub height: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Guild member data attached to guild messages (`member` field). Used for role colors
+/// and nicknames.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PartialMember {
+    #[serde(default)]
+    pub roles: Vec<Snowflake>,
+    #[serde(default)]
+    pub nick: Option<String>,
+    /// Guild-specific avatar hash.
+    #[serde(default)]
+    pub avatar: Option<String>,
+}
+
+/// Unicode emoji have only `name`; custom emoji have `id` (+ `name`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct Emoji {
+    #[serde(default)]
+    pub id: Option<Snowflake>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub animated: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Reaction {
+    pub emoji: Emoji,
+    #[serde(default)]
+    pub count: u32,
+    /// Did the current user react with this.
+    #[serde(default)]
+    pub me: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EmbedMedia {
+    pub url: String,
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EmbedAuthor {
+    pub name: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub icon_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EmbedFooter {
+    pub text: String,
+    #[serde(default)]
+    pub icon_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EmbedField {
+    pub name: String,
+    pub value: String,
+    #[serde(default)]
+    pub inline: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Embed {
+    /// "rich", "image", "video", "gifv", "article", "link".
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub color: Option<u32>,
+    #[serde(default)]
+    pub author: Option<EmbedAuthor>,
+    #[serde(default)]
+    pub footer: Option<EmbedFooter>,
+    #[serde(default)]
+    pub fields: Vec<EmbedField>,
+    #[serde(default)]
+    pub thumbnail: Option<EmbedMedia>,
+    #[serde(default)]
+    pub image: Option<EmbedMedia>,
+    #[serde(default)]
+    pub provider: Option<EmbedAuthor>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MessageReference {
+    #[serde(default)]
+    pub message_id: Option<Snowflake>,
+    #[serde(default)]
+    pub channel_id: Option<Snowflake>,
+    #[serde(default)]
+    pub guild_id: Option<Snowflake>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Message {
     pub id: Snowflake,
     pub channel_id: Snowflake,
     #[serde(default)]
     pub guild_id: Option<Snowflake>,
     pub author: User,
+    /// Present on guild messages (MESSAGE_CREATE and REST history).
+    #[serde(default)]
+    pub member: Option<PartialMember>,
     #[serde(default)]
     pub content: String,
     /// ISO8601 string, as sent by Discord.
@@ -218,13 +327,36 @@ pub struct Message {
     #[serde(default)]
     pub attachments: Vec<Attachment>,
     #[serde(default)]
+    pub embeds: Vec<Embed>,
+    #[serde(default)]
+    pub reactions: Vec<Reaction>,
+    #[serde(default)]
     pub mentions: Vec<User>,
     #[serde(default)]
+    pub mention_everyone: bool,
+    #[serde(default)]
+    pub mention_roles: Vec<Snowflake>,
+    #[serde(default)]
+    pub message_reference: Option<MessageReference>,
+    #[serde(default)]
     pub referenced_message: Option<Box<Message>>,
+    /// Echoed back from the send request; lets the app match its optimistic message.
+    #[serde(default, deserialize_with = "de_nonce")]
+    pub nonce: Option<String>,
+}
+
+/// Nonce may come back as a string or a number.
+fn de_nonce<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(match v {
+        Some(serde_json::Value::String(s)) => Some(s),
+        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    })
 }
 
 /// Partial message from MESSAGE_UPDATE: only `id` and `channel_id` are guaranteed.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct MessageUpdate {
     pub id: Snowflake,
     pub channel_id: Snowflake,
@@ -234,6 +366,10 @@ pub struct MessageUpdate {
     pub edited_timestamp: Option<String>,
     #[serde(default)]
     pub attachments: Option<Vec<Attachment>>,
+    #[serde(default)]
+    pub embeds: Option<Vec<Embed>>,
+    #[serde(default)]
+    pub mentions: Option<Vec<User>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -265,8 +401,10 @@ pub enum GatewayEvent {
 
     GuildCreate(Box<Guild>),
     GuildUpdate(Box<Guild>),
+    /// `unavailable == true` means an outage, not that we left: keep the guild, grey it out.
     GuildDelete {
         id: Snowflake,
+        unavailable: bool,
     },
     ChannelCreate(Box<Channel>),
     ChannelUpdate(Box<Channel>),
@@ -281,6 +419,46 @@ pub enum GatewayEvent {
         channel_id: Snowflake,
         user_id: Snowflake,
     },
+    ReactionAdd {
+        channel_id: Snowflake,
+        message_id: Snowflake,
+        user_id: Snowflake,
+        emoji: Emoji,
+    },
+    ReactionRemove {
+        channel_id: Snowflake,
+        message_id: Snowflake,
+        user_id: Snowflake,
+        emoji: Emoji,
+    },
+}
+
+/// Discord CDN URL helpers. `size` should be a power of two (16..=4096).
+pub mod cdn {
+    use super::Snowflake;
+
+    pub const BASE: &str = "https://cdn.discordapp.com";
+
+    /// User avatar, or the default avatar when `hash` is None.
+    pub fn avatar(user_id: Snowflake, hash: Option<&str>, size: u32) -> String {
+        match hash {
+            Some(h) => format!("{BASE}/avatars/{user_id}/{h}.webp?size={size}"),
+            None => format!("{BASE}/embed/avatars/{}.png", (user_id.0 >> 22) % 6),
+        }
+    }
+
+    pub fn guild_icon(guild_id: Snowflake, hash: &str, size: u32) -> String {
+        format!("{BASE}/icons/{guild_id}/{hash}.webp?size={size}")
+    }
+
+    pub fn member_avatar(guild_id: Snowflake, user_id: Snowflake, hash: &str, size: u32) -> String {
+        format!("{BASE}/guilds/{guild_id}/users/{user_id}/avatars/{hash}.webp?size={size}")
+    }
+
+    pub fn emoji(id: Snowflake, animated: bool, size: u32) -> String {
+        let ext = if animated { "gif" } else { "webp" };
+        format!("{BASE}/emojis/{id}.{ext}?size={size}")
+    }
 }
 
 #[cfg(test)]

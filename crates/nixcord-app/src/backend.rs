@@ -248,5 +248,6 @@ pub fn update_from(m: &Message) -> MessageUpdate {
         content: Some(m.content.clone()),
         edited_timestamp: m.edited_timestamp.clone(),
         attachments: Some(m.attachments.clone()),
+        ..Default::default()
     }
 }
