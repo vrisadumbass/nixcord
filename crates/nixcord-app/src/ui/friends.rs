@@ -337,32 +337,36 @@ fn list_view(
         .corner_radius(CornerRadius::same(6))
         .inner_margin(Margin::symmetric(10, 6))
         .show(ui, |ui| {
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if !state.filter.is_empty() {
-                    let (r, resp) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
-                    let col = if resp.hovered() { t.strong } else { t.muted };
-                    ui.painter()
-                        .text(r.center(), Align2::CENTER_CENTER, "×", bold(16.0), col);
-                    if resp
-                        .on_hover_cursor(CursorIcon::PointingHand)
-                        .on_hover_text("Clear search")
-                        .clicked()
-                    {
-                        state.filter.clear();
+            ui.allocate_ui_with_layout(
+                Vec2::new(ui.available_width(), 22.0),
+                Layout::right_to_left(Align::Center),
+                |ui| {
+                    if !state.filter.is_empty() {
+                        let (r, resp) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
+                        let col = if resp.hovered() { t.strong } else { t.muted };
+                        ui.painter()
+                            .text(r.center(), Align2::CENTER_CENTER, "×", bold(16.0), col);
+                        if resp
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .on_hover_text("Clear search")
+                            .clicked()
+                        {
+                            state.filter.clear();
+                        }
+                    } else {
+                        let (r, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+                        paint_search(ui, r.center(), 14.0, t.muted);
                     }
-                } else {
-                    let (r, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
-                    paint_search(ui, r.center(), 14.0, t.muted);
-                }
 
-                ui.add(
-                    egui::TextEdit::singleline(&mut state.filter)
-                        .hint_text("Search")
-                        .frame(Frame::NONE)
-                        .font(prop(14.0))
-                        .desired_width(ui.available_width()),
-                );
-            });
+                    ui.add(
+                        egui::TextEdit::singleline(&mut state.filter)
+                            .hint_text("Search")
+                            .frame(Frame::NONE)
+                            .font(prop(14.0))
+                            .desired_width(ui.available_width()),
+                    );
+                },
+            );
         });
 
     ui.add_space(16.0);
@@ -706,33 +710,39 @@ fn add_friend_view(ui: &mut Ui, state: &mut FriendsState, t: &Theme, actions: &m
         .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::symmetric(12, 8))
         .show(ui, |ui| {
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let btn_label = if state.add_busy {
-                    "Sending…"
-                } else {
-                    "Send Friend Request"
-                };
-                if submit_button(ui, t, btn_label, can_submit).clicked() && can_submit {
-                    submit = true;
-                }
-                ui.add_space(8.0);
-                let resp = ui.add_enabled(
-                    !state.add_busy,
-                    egui::TextEdit::singleline(&mut state.add_input)
-                        .id(input_id)
-                        .hint_text("Enter a username")
-                        .frame(Frame::NONE)
-                        .font(prop(14.5))
-                        .desired_width(ui.available_width()),
-                );
-                if resp.changed() {
-                    state.add_feedback = None;
-                }
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && can_submit
-                {
-                    submit = true;
-                }
-            });
+            ui.allocate_ui_with_layout(
+                Vec2::new(ui.available_width(), 32.0),
+                Layout::right_to_left(Align::Center),
+                |ui| {
+                    let btn_label = if state.add_busy {
+                        "Sending…"
+                    } else {
+                        "Send Friend Request"
+                    };
+                    if submit_button(ui, t, btn_label, can_submit).clicked() && can_submit {
+                        submit = true;
+                    }
+                    ui.add_space(8.0);
+                    let resp = ui.add_enabled(
+                        !state.add_busy,
+                        egui::TextEdit::singleline(&mut state.add_input)
+                            .id(input_id)
+                            .hint_text("Enter a username")
+                            .frame(Frame::NONE)
+                            .font(prop(14.5))
+                            .desired_width(ui.available_width()),
+                    );
+                    if resp.changed() {
+                        state.add_feedback = None;
+                    }
+                    if resp.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                        && can_submit
+                    {
+                        submit = true;
+                    }
+                },
+            );
         });
 
     if submit {

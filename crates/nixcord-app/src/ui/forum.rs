@@ -468,83 +468,87 @@ fn toolbar(
     state: &mut ForumState,
     actions: &mut Vec<Action>,
 ) {
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        ui.spacing_mut().item_spacing.x = 10.0;
+    ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width(), 34.0),
+        Layout::right_to_left(Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
 
-        let new_post = primary_button(ui, t, "+ New Post", data.can_post);
-        if data.can_post {
-            if new_post.clicked() {
-                actions.push(Action::OpenCreateThread {
-                    parent_id: data.forum_id,
-                    is_forum: true,
-                });
+            let new_post = primary_button(ui, t, "+ New Post", data.can_post);
+            if data.can_post {
+                if new_post.clicked() {
+                    actions.push(Action::OpenCreateThread {
+                        parent_id: data.forum_id,
+                        is_forum: true,
+                    });
+                }
+            } else {
+                new_post.on_hover_text("You don't have permission to create posts here.");
             }
-        } else {
-            new_post.on_hover_text("You don't have permission to create posts here.");
-        }
 
-        // Search-posts field filling remaining width.
-        let search_w = ui.available_width().max(140.0);
-        let (field, _) = ui.allocate_exact_size(Vec2::new(search_w, 34.0), Sense::hover());
-        ui.painter().rect(
-            field,
-            CornerRadius::same(6),
-            t.elevated,
-            Stroke::new(1.0, t.divider),
-            egui::StrokeKind::Inside,
-        );
-        paint_search(
-            ui,
-            Pos2::new(field.left() + 14.0, field.center().y),
-            14.0,
-            t.muted,
-        );
-        let has_query = !state.search.is_empty();
-        let right_pad = if has_query { 28.0 } else { 10.0 };
-        let mut child = ui.new_child(
-            UiBuilder::new()
-                .max_rect(Rect::from_min_max(
-                    Pos2::new(field.left() + 28.0, field.top()),
-                    Pos2::new(field.right() - right_pad, field.bottom()),
-                ))
-                .layout(Layout::left_to_right(Align::Center)),
-        );
-        child.add(
-            egui::TextEdit::singleline(&mut state.search)
-                .hint_text("Search posts…")
-                .frame(Frame::NONE)
-                .margin(Margin::ZERO)
-                .font(prop(14.0))
-                .desired_width(f32::INFINITY),
-        );
-        if has_query {
-            let clear_rect = Rect::from_center_size(
-                Pos2::new(field.right() - 14.0, field.center().y),
-                Vec2::splat(20.0),
+            // Search-posts field filling remaining width.
+            let search_w = ui.available_width().max(140.0);
+            let (field, _) = ui.allocate_exact_size(Vec2::new(search_w, 34.0), Sense::hover());
+            ui.painter().rect(
+                field,
+                CornerRadius::same(6),
+                t.elevated,
+                Stroke::new(1.0, t.divider),
+                egui::StrokeKind::Inside,
             );
-            let clear_resp = ui
-                .interact(
-                    clear_rect,
-                    ui.scope_id().with("forum_search_clear"),
-                    Sense::click(),
-                )
-                .on_hover_cursor(CursorIcon::PointingHand);
-            ui.painter().text(
-                clear_rect.center(),
-                Align2::CENTER_CENTER,
-                "×",
-                bold(15.0),
-                if clear_resp.hovered() {
-                    t.strong
-                } else {
-                    t.muted
-                },
+            paint_search(
+                ui,
+                Pos2::new(field.left() + 14.0, field.center().y),
+                14.0,
+                t.muted,
             );
-            if clear_resp.on_hover_text("Clear search").clicked() {
-                state.search.clear();
+            let has_query = !state.search.is_empty();
+            let right_pad = if has_query { 28.0 } else { 10.0 };
+            let mut child = ui.new_child(
+                UiBuilder::new()
+                    .max_rect(Rect::from_min_max(
+                        Pos2::new(field.left() + 28.0, field.top()),
+                        Pos2::new(field.right() - right_pad, field.bottom()),
+                    ))
+                    .layout(Layout::left_to_right(Align::Center)),
+            );
+            child.add(
+                egui::TextEdit::singleline(&mut state.search)
+                    .hint_text("Search posts…")
+                    .frame(Frame::NONE)
+                    .margin(Margin::ZERO)
+                    .font(prop(14.0))
+                    .desired_width(f32::INFINITY),
+            );
+            if has_query {
+                let clear_rect = Rect::from_center_size(
+                    Pos2::new(field.right() - 14.0, field.center().y),
+                    Vec2::splat(20.0),
+                );
+                let clear_resp = ui
+                    .interact(
+                        clear_rect,
+                        ui.scope_id().with("forum_search_clear"),
+                        Sense::click(),
+                    )
+                    .on_hover_cursor(CursorIcon::PointingHand);
+                ui.painter().text(
+                    clear_rect.center(),
+                    Align2::CENTER_CENTER,
+                    "×",
+                    bold(15.0),
+                    if clear_resp.hovered() {
+                        t.strong
+                    } else {
+                        t.muted
+                    },
+                );
+                if clear_resp.on_hover_text("Clear search").clicked() {
+                    state.search.clear();
+                }
             }
-        }
-    });
+        },
+    );
 }
 
 fn tag_filter_bar(
@@ -600,40 +604,47 @@ fn post_card(
             .map_or(card.activity_ms, |p| p.timestamp_ms);
         let stamp = fmt_stamp(stamp_ms, clock_24h);
 
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            if !stamp.is_empty() {
-                ui.label(RichText::new(&stamp).font(prop(12.0)).color(t.muted));
-            }
-            if card.mentions > 0 {
-                paint_inline_mention_badge(ui, card.mentions, t);
-            }
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), 22.0),
+            Layout::right_to_left(Align::Center),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if !stamp.is_empty() {
+                    ui.label(RichText::new(&stamp).font(prop(12.0)).color(t.muted));
+                }
+                if card.mentions > 0 {
+                    paint_inline_mention_badge(ui, card.mentions, t);
+                }
 
-            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 7.0;
-                if card.unread {
-                    let (dot_rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
-                    ui.painter().circle_filled(dot_rect.center(), 4.0, t.accent);
-                }
-                let title_color = if card.unread { t.strong } else { t.text };
-                emoji_text::label_truncated(ui, media, &card.title, bold(16.0), title_color);
-                if card.locked {
-                    let g = ui
-                        .painter()
-                        .layout_no_wrap("Locked".into(), bold(10.5), t.muted);
-                    let (r, _) =
-                        ui.allocate_exact_size(Vec2::new(g.size().x + 12.0, 18.0), Sense::hover());
-                    ui.painter().rect(
-                        r,
-                        CornerRadius::same(4),
-                        t.hover,
-                        Stroke::new(1.0, t.divider),
-                        egui::StrokeKind::Inside,
-                    );
-                    ui.painter().galley(r.center() - g.size() / 2.0, g, t.muted);
-                }
-            });
-        });
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 7.0;
+                    if card.unread {
+                        let (dot_rect, _) =
+                            ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                        ui.painter().circle_filled(dot_rect.center(), 4.0, t.accent);
+                    }
+                    let title_color = if card.unread { t.strong } else { t.text };
+                    emoji_text::label_truncated(ui, media, &card.title, bold(16.0), title_color);
+                    if card.locked {
+                        let g = ui
+                            .painter()
+                            .layout_no_wrap("Locked".into(), bold(10.5), t.muted);
+                        let (r, _) = ui.allocate_exact_size(
+                            Vec2::new(g.size().x + 12.0, 18.0),
+                            Sense::hover(),
+                        );
+                        ui.painter().rect(
+                            r,
+                            CornerRadius::same(4),
+                            t.hover,
+                            Stroke::new(1.0, t.divider),
+                            egui::StrokeKind::Inside,
+                        );
+                        ui.painter().galley(r.center() - g.size() / 2.0, g, t.muted);
+                    }
+                });
+            },
+        );
 
         // Recent message preview snippet (when cached) or subtle hint.
         if let Some(prev) = &card.preview {
@@ -952,25 +963,29 @@ fn render_create_modal(
                 submit = true;
             }
 
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                let submit_label = if modal.busy {
-                    "Creating…"
-                } else if modal.is_forum {
-                    "Create Post"
-                } else {
-                    "Create Thread"
-                };
-                if primary_button(ui, t, submit_label, valid).clicked() {
-                    submit = true;
-                }
-                if modal.busy {
-                    ui.add(egui::Spinner::new().size(16.0).color(t.muted));
-                }
-                if secondary_button(ui, t, "Cancel", !modal.busy).clicked() {
-                    close = true;
-                }
-            });
+            ui.allocate_ui_with_layout(
+                Vec2::new(ui.available_width(), 34.0),
+                Layout::right_to_left(Align::Center),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let submit_label = if modal.busy {
+                        "Creating…"
+                    } else if modal.is_forum {
+                        "Create Post"
+                    } else {
+                        "Create Thread"
+                    };
+                    if primary_button(ui, t, submit_label, valid).clicked() {
+                        submit = true;
+                    }
+                    if modal.busy {
+                        ui.add(egui::Spinner::new().size(16.0).color(t.muted));
+                    }
+                    if secondary_button(ui, t, "Cancel", !modal.busy).clicked() {
+                        close = true;
+                    }
+                },
+            );
         });
 
     if submit && can_submit_create_thread(modal) {
@@ -999,16 +1014,20 @@ fn render_create_modal(
 // ---- shared UI primitives -----------------------------------------------------------
 
 fn field_header(ui: &mut Ui, t: &Theme, title: &str, counter: &str, warn: bool) {
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        ui.label(RichText::new(counter).font(prop(11.5)).color(if warn {
-            t.danger
-        } else {
-            t.muted
-        }));
-        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-            ui.label(RichText::new(title).font(bold(11.5)).color(t.muted));
-        });
-    });
+    ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width(), 18.0),
+        Layout::right_to_left(Align::Center),
+        |ui| {
+            ui.label(RichText::new(counter).font(prop(11.5)).color(if warn {
+                t.danger
+            } else {
+                t.muted
+            }));
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                ui.label(RichText::new(title).font(bold(11.5)).color(t.muted));
+            });
+        },
+    );
 }
 
 fn tag_pill(
