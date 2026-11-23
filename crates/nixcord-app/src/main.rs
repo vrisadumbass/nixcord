@@ -4,6 +4,7 @@
 mod app;
 mod backend;
 mod demo;
+mod media;
 mod theme;
 mod token;
 mod ui;
