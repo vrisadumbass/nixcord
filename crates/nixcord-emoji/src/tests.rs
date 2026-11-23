@@ -6,10 +6,24 @@ fn twemoji_file_names() {
     assert_eq!(twemoji_name("\u{2764}\u{FE0F}"), "2764");
     // 👍🏽: base + skin tone.
     assert_eq!(twemoji_name("\u{1F44D}\u{1F3FD}"), "1f44d-1f3fd");
-    // 🏳️‍🌈: contains a ZWJ, so U+FE0F stays.
+    // 🏳️‍🌈: contains a ZWJ, so U+FE0F stays — even if the input omitted U+FE0F.
     assert_eq!(
         twemoji_name("\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}"),
         "1f3f3-fe0f-200d-1f308"
+    );
+    assert_eq!(
+        twemoji_name("\u{1F3F3}\u{200D}\u{1F308}"),
+        "1f3f3-fe0f-200d-1f308"
+    );
+    // ❤️‍🔥 unqualified ZWJ restores U+FE0F.
+    assert_eq!(
+        twemoji_name("\u{2764}\u{200D}\u{1F525}"),
+        "2764-fe0f-200d-1f525"
+    );
+    // Skin-toned ZWJ keeps its modifier.
+    assert_eq!(
+        twemoji_name("\u{1F469}\u{1F3FC}\u{200D}\u{1F4BB}"),
+        "1f469-1f3fc-200d-1f4bb"
     );
     // 1️⃣: keycaps lose their U+FE0F.
     assert_eq!(twemoji_name("1\u{FE0F}\u{20E3}"), "31-20e3");
@@ -178,7 +192,23 @@ fn search_ranking() {
     let mut sorted = kinds.clone();
     sorted.sort();
     assert_eq!(kinds, sorted);
-    assert!(names("hea").contains(&"heart"));
+    // "hea" ranks hearts first, ahead of non-heart objects/aliases like headphones/headstone.
+    let hea = names("hea");
+    assert_eq!(hea[0], "heart");
+    assert_eq!(hea[1], "hearts");
+    assert!(
+        hea[..6].iter().all(|n| n.starts_with("heart")),
+        "expected top 6 for 'hea' to be hearts, got {hea:?}"
+    );
+    // Short non-People matches still outrank longer People matches (e.g. cat/cake before call_me).
+    let ca = names("ca");
+    assert_eq!(ca[0], "flag_ca"); // exact alias "ca"
+    assert_eq!(ca[1], "cat");
+    assert!(
+        ca.iter().position(|&n| n == "cake") < ca.iter().position(|&n| n == "call_me"),
+        "got {ca:?}"
+    );
+    assert_eq!(names("fir")[0], "fire");
     assert_eq!(search("thumbsup", 1)[0].0.as_str(), "\u{1F44D}");
     // Keyword-only match ("lol" is a tag of 😄).
     assert!(search("lol", 50)

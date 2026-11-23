@@ -1370,6 +1370,37 @@ fn reactions_row(ui: &mut Ui, app: &NixApp, m: &Message, actions: &mut Vec<Actio
     });
 }
 
+/// How a unicode reaction renders inside a pill (never a tofu box).
+#[derive(Debug, PartialEq)]
+enum ReactionUnicode<'a> {
+    Tex(crate::media::Tex),
+    Fallback(&'a str),
+    Shortcode(String),
+}
+
+fn decide_reaction_unicode<'a>(
+    ctx: &egui::Context,
+    name: &'a str,
+    status: crate::media::TwemojiStatus,
+) -> ReactionUnicode<'a> {
+    match status {
+        crate::media::TwemojiStatus::Ready(tex) => ReactionUnicode::Tex(tex),
+        crate::media::TwemojiStatus::Loading => ReactionUnicode::Fallback(name),
+        crate::media::TwemojiStatus::Failed => {
+            let g = emoji_text::glyph(name);
+            let font = prop((18.0 * 0.8_f32).max(6.0));
+            if emoji_text::flag_code(name).is_some() || emoji_text::has_font_glyphs(ctx, &font, &g)
+            {
+                ReactionUnicode::Fallback(name)
+            } else if let Some(e) = nixcord_emoji::find(name) {
+                ReactionUnicode::Shortcode(format!(":{}:", e.shortcode()))
+            } else {
+                ReactionUnicode::Fallback(name)
+            }
+        }
+    }
+}
+
 /// One reaction pill: emoji + count, rounded; tinted with a blurple border when mine.
 fn reaction_pill(ui: &mut Ui, app: &NixApp, r: &Reaction) -> egui::Response {
     let t = app.theme;
@@ -1377,7 +1408,28 @@ fn reaction_pill(ui: &mut Ui, app: &NixApp, r: &Reaction) -> egui::Response {
     let count_g =
         ui.painter()
             .layout_no_wrap(count, bold(14.0), if r.me { t.strong } else { t.text });
-    let size = Vec2::new(8.0 + 18.0 + 6.0 + count_g.size().x + 8.0, 26.0);
+    let uni = match (r.emoji.id, r.emoji.name.as_deref()) {
+        (None, Some(name)) => {
+            let status = app
+                .media
+                .try_borrow_mut()
+                .map_or(crate::media::TwemojiStatus::Failed, |mut m| {
+                    m.twemoji_points_status(name, 18.0)
+                });
+            Some(decide_reaction_unicode(ui.ctx(), name, status))
+        }
+        _ => None,
+    };
+    let shortcode_g = match &uni {
+        Some(ReactionUnicode::Shortcode(s)) => Some(ui.painter().layout_no_wrap(
+            s.clone(),
+            prop(13.0),
+            if r.me { t.strong } else { t.text },
+        )),
+        _ => None,
+    };
+    let emoji_w = shortcode_g.as_ref().map_or(18.0, |g| g.size().x);
+    let size = Vec2::new(8.0 + emoji_w + 6.0 + count_g.size().x + 8.0, 26.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let (fill, stroke) = if r.me {
         (t.accent.gamma_multiply(0.18), Stroke::new(1.0, t.accent))
@@ -1394,20 +1446,34 @@ fn reaction_pill(ui: &mut Ui, app: &NixApp, r: &Reaction) -> egui::Response {
         egui::StrokeKind::Inside,
     );
     let emoji_rect = Rect::from_center_size(
-        Pos2::new(rect.left() + 8.0 + 9.0, rect.center().y),
-        Vec2::splat(18.0),
+        Pos2::new(rect.left() + 8.0 + emoji_w / 2.0, rect.center().y),
+        Vec2::new(emoji_w, 18.0),
     );
-    match (r.emoji.id, r.emoji.name.as_deref()) {
-        (Some(id), _) => {
+    match (r.emoji.id, uni, shortcode_g) {
+        (Some(id), _, _) => {
             let mut child = ui.new_child(UiBuilder::new().max_rect(emoji_rect));
             app.media
                 .borrow_mut()
                 .emoji(&mut child, id, r.emoji.animated, 18.0);
         }
-        (None, Some(name)) => {
-            emoji_text::paint_emoji_ui(ui, emoji_rect, name, &app.media, t.strong);
+        (None, Some(ReactionUnicode::Tex(tex)), _) => {
+            let r = Rect::from_center_size(emoji_rect.center(), Vec2::splat(18.0));
+            ui.painter().add(
+                egui::epaint::RectShape::filled(r, CornerRadius::ZERO, Color32::WHITE)
+                    .with_texture(tex.id, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))),
+            );
         }
-        (None, None) => {}
+        (None, Some(ReactionUnicode::Fallback(name)), _) => {
+            emoji_text::paint_fallback(ui.painter(), emoji_rect, name, t.strong);
+        }
+        (None, Some(ReactionUnicode::Shortcode(_)), Some(g)) => {
+            ui.painter().galley(
+                Pos2::new(rect.left() + 8.0, rect.center().y - g.size().y / 2.0),
+                g,
+                t.text,
+            );
+        }
+        _ => {}
     }
     ui.painter().galley(
         Pos2::new(
@@ -1587,5 +1653,57 @@ pub fn delete_modal(ctx: &egui::Context, app: &mut NixApp, actions: &mut Vec<Act
         Some(false) => app.view.confirm_delete = None,
         None if resp.should_close() => app.view.confirm_delete = None,
         None => {}
+    }
+}
+
+#[cfg(test)]
+mod reaction_tests {
+    use super::*;
+    use crate::media::{Tex, TwemojiStatus};
+
+    #[test]
+    fn reaction_unicode_fallback_avoids_tofu() {
+        let ctx = egui::Context::default();
+        let mut results = Vec::new();
+        for _ in 0..2 {
+            results.clear();
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                // Missing-glyph emoji (crab) falls back to :crab: once Twemoji fails.
+                results.push(format!(
+                    "{:?}",
+                    decide_reaction_unicode(ui.ctx(), "\u{1F980}", TwemojiStatus::Failed)
+                ));
+                // While loading, keep fixed square fallback (no width jump).
+                results.push(format!(
+                    "{:?}",
+                    decide_reaction_unicode(ui.ctx(), "\u{1F980}", TwemojiStatus::Loading)
+                ));
+                // Flag pair uses compact 2-letter flag badge fallback (not tofu).
+                results.push(format!(
+                    "{:?}",
+                    decide_reaction_unicode(ui.ctx(), "\u{1F1EF}\u{1F1F5}", TwemojiStatus::Failed)
+                ));
+                // Skin-toned emoji whose base glyph exists uses cleaned monochrome glyph.
+                results.push(format!(
+                    "{:?}",
+                    decide_reaction_unicode(ui.ctx(), "\u{1F44D}\u{1F3FD}", TwemojiStatus::Failed)
+                ));
+                // Loaded Twemoji texture always renders as texture.
+                let tex = Tex {
+                    id: egui::TextureId::default(),
+                    size: [24, 24],
+                };
+                results.push(format!(
+                    "{:?}",
+                    decide_reaction_unicode(ui.ctx(), "\u{1F980}", TwemojiStatus::Ready(tex))
+                ));
+            });
+            out.textures_delta.clear();
+        }
+        assert_eq!(results[0], "Shortcode(\":crab:\")");
+        assert_eq!(results[1], "Fallback(\"🦀\")");
+        assert_eq!(results[2], "Fallback(\"🇯🇵\")");
+        assert_eq!(results[3], "Fallback(\"👍🏽\")");
+        assert!(results[4].starts_with("Tex("), "{}", results[4]);
     }
 }

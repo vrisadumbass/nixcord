@@ -108,11 +108,19 @@ enum Entry {
 }
 
 /// A texture ready to paint.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tex {
     pub id: TextureId,
     /// Pixel size.
     pub size: [u32; 2],
+}
+
+/// Lookup state for a unicode emoji's Twemoji texture.
+#[derive(Clone, Copy, Debug)]
+pub enum TwemojiStatus {
+    Ready(Tex),
+    Loading,
+    Failed,
 }
 
 /// An image the viewer can show.
@@ -416,17 +424,18 @@ impl Media {
         resp
     }
 
-    /// Color Twemoji texture of unicode emoji `emoji` at `px` pixels, if loaded (starts the
-    /// load on a miss). See the module docs.
-    pub fn twemoji(&mut self, emoji: &str, px: u32) -> Option<Tex> {
+    /// Lookup status for unicode emoji `emoji` at `px` pixels (starts the load on a miss).
+    /// Distinguishes in-flight loads from offline/failed lookups.
+    pub fn twemoji_status(&mut self, emoji: &str, px: u32) -> TwemojiStatus {
         let px = px.clamp(8, 160);
         let key = Key::new(nixcord_emoji::twemoji_url(emoji), px, px);
         self.begin_pass();
         let id = key.id();
         if let Some(g) = self.cached(id) {
             return match g {
-                Got::Ready(t) => Some(t),
-                _ => None,
+                Got::Ready(t) => TwemojiStatus::Ready(t),
+                Got::Loading => TwemojiStatus::Loading,
+                Got::Failed => TwemojiStatus::Failed,
             };
         }
         if !self.ensure_emoji_fetcher() {
@@ -436,13 +445,28 @@ impl Media {
                     retry_at: Instant::now() + std::time::Duration::from_secs(3600),
                 },
             );
-            return None;
+            return TwemojiStatus::Failed;
         }
         if let Some(f) = &self.fetcher {
             f.request(key);
         }
         self.entries.insert(id, Entry::Loading);
-        None
+        TwemojiStatus::Loading
+    }
+
+    /// [`Media::twemoji_status`] for an emoji drawn `size` points square.
+    pub fn twemoji_points_status(&mut self, emoji: &str, size: f32) -> TwemojiStatus {
+        let px = self.px(size);
+        self.twemoji_status(emoji, px)
+    }
+
+    /// Color Twemoji texture of unicode emoji `emoji` at `px` pixels, if loaded (starts the
+    /// load on a miss). See the module docs.
+    pub fn twemoji(&mut self, emoji: &str, px: u32) -> Option<Tex> {
+        match self.twemoji_status(emoji, px) {
+            TwemojiStatus::Ready(t) => Some(t),
+            _ => None,
+        }
     }
 
     /// [`Media::twemoji`] for an emoji drawn `size` points square.
