@@ -93,17 +93,17 @@ then calls `request_repaint()`. The UI sends `Command`s to the backend. UI code 
 - **Core:**
   - Token login, saved in the OS keychain.
   - Gateway reconnect/resume with `zlib-stream` transport compression.
-  - Servers, channels, Forum post boards (tag filters & new posts), active threads (+ thread creation) and DMs.
+  - Servers, channels, Forum post boards (tag filters & new posts), active threads (+ thread creation, archive/unarchive & lock/unlock controls) and DMs.
   - History with scroll-back (a sliding window past the 250-message cap), "Jump to present",
     and Message Search (`Ctrl+F`, `from:` / `in:` filters, paginated results drawer, jump-to-message).
-  - Send (including multipart file uploads via picker or drag-and-drop), edit (Up arrow), delete, reply.
+  - Send (including multipart file uploads via picker, drag-and-drop, or `Ctrl+V` clipboard image paste), edit (Up arrow), delete, reply.
   - Reactions, typing indicators, unread & mention badges (channels, threads, forums, DMs, server rail,
-    window title) and clickable in-app mention toasts.
+    window title), right-click "Mark as Read" (channels, forums, threads, servers) and clickable in-app mention toasts.
 - **Rendering:**
   - Markdown with syntax-highlighted code, spoilers, color-emoji mention pills and timestamps.
   - Embeds (rich and link) and attachments.
   - Message components: legacy action rows and V2 (container, section, gallery, file,
-    separator, interactive buttons and string select menus).
+    separator, interactive buttons, string select menus, and searchable entity select menus for User/Role/Mentionable/Channel).
   - Role colors, nicknames, APP badge.
 - **Media:**
   - Avatars and server icons.
@@ -118,7 +118,7 @@ then calls `request_repaint()`. The UI sends `Command`s to the backend. UI code 
   - `:shortcode:` autocomplete.
 - **Presence & Profiles:**
   - Status dots, activities and custom status.
-  - Own status picker (op 3).
+  - Own status picker & custom status editor (op 3, persisted across restarts).
   - Real member list via op 37 and GUILD_MEMBER_LIST_UPDATE, with role groups and Online/Offline.
   - Floating user profile popouts (avatar, status, custom status, activity, role pills, DM & copy actions).
   - Friends home view (Online, All, Pending, Blocked, Add Friend) with accept/decline/remove/block/DM actions.
@@ -148,19 +148,16 @@ demo mode only:
 - `zlib-stream` gateway compression against live Discord.
 - Live component interactions (`POST /interactions`), message acks (`POST /channels/{c}/messages/{m}/ack`),
   multipart uploads, message search / `around` jumps, Friends/DM creation routes, Forum/thread creation
-  (`POST /channels/{id}/threads`), and `READY.read_state` / `MESSAGE_ACK` / `THREAD_*` events on real servers.
+  (`POST /channels/{id}/threads`), thread archive/lock (`PATCH /channels/{id}`), and `READY.read_state` /
+  `MESSAGE_ACK` / `THREAD_*` events on real servers.
 
 Not built yet:
 - Voice and video calls, screen share.
 - Native OS desktop notifications (in-app mention toasts, mention badges, unread counts and
   window title badges are built).
-- Thread archiving/locking controls and clipboard image paste (`Ctrl+V` upload; file picker and
-  drag-and-drop uploads are built).
-- Entity select menus (user/role/mentionable/channel) and modals for bot interactions
-  (buttons and string selects are interactive).
+- Modals for bot interactions (buttons, string selects, and entity select menus are interactive).
 - Stickers, the GIF picker.
 - Full profile modals (bio/banners/mutuals), server settings.
-- Saving status changes to the account (currently session-only), custom status editing.
 - Plugin API (planned: a stable Rust trait plus WASM).
 
 UI polish backlog:

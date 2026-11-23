@@ -1656,10 +1656,7 @@ impl Store {
             None
         };
 
-        if th.is_archived()
-            && !self.history_loaded.contains(&th.id)
-            && !self.channels.contains_key(&th.id)
-        {
+        if th.is_archived() && !self.history_loaded.contains(&th.id) {
             self.remove_thread(th.id, prev_guild.or(th.guild_id));
             return;
         }

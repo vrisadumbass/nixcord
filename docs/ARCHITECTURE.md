@@ -67,7 +67,8 @@ never depend on each other.
 - Close codes 4004 -> `AuthFailed`, stop. 4010-4014 -> fatal, stop. Others -> backoff retry.
 - App -> gateway commands (`run_with_commands`): op 37 Guild Subscriptions Bulk (member
   list ranges, typing, activities for the open guild channel) and op 3 Presence Update
-  (own status). Coalesced and throttled (op 37 at most every 750 ms, op 3 every 4 s;
+  (own status + optional type-4 `"Custom Status"` activity, persisted in prefs and restored
+  on `READY`). Coalesced and throttled (op 37 at most every 750 ms, op 3 every 4 s;
   Discord allows 5 presence updates per 20 s), sent only after READY/RESUMED.
 - Decoded user-account events: PRESENCE_UPDATE, GUILD_MEMBER_LIST_UPDATE
   (SYNC/INSERT/UPDATE/DELETE/INVALIDATE), READY_SUPPLEMENTAL, RELATIONSHIP_ADD/REMOVE,

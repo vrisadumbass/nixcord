@@ -2025,3 +2025,69 @@ fn profile_helpers_roles_relationships_and_snapshot() {
     assert!(s.user_profile(sf(1), None).unwrap().is_me);
     assert!(s.user_profile(sf(999), Some(sf(100))).is_none());
 }
+
+#[test]
+fn mark_guild_read_forum_mark_read_and_my_custom_status() {
+    let mut g = guild(
+        100,
+        vec![
+            chan(10, ChannelKind::Text, Some(100), None, 0),
+            chan(20, ChannelKind::Forum, Some(100), None, 1),
+        ],
+    );
+    g.threads = vec![
+        thread(50, 100, 10, Some(100)),
+        thread(60, 100, 20, Some(100)),
+    ];
+
+    let mut s = Store::new();
+    s.apply(&GatewayEvent::Ready(Box::new(Ready {
+        user: user(1),
+        guilds: vec![g],
+        ..Default::default()
+    })));
+
+    // Incoming messages in text channel (10), text thread (50), and forum post (60).
+    for (mid, cid) in [(200, 10), (201, 50), (202, 60)] {
+        let mut m = msg(mid, cid, 2);
+        m.mentions = vec![user(1)];
+        s.apply(&GatewayEvent::MessageCreate(Box::new(m)));
+    }
+    assert!(s.channel_unread(sf(10)));
+    assert!(s.channel_unread(sf(50)));
+    assert!(s.channel_unread(sf(60)));
+    assert_eq!(s.guild_mention_count(sf(100)), 3);
+
+    // Marking a Forum channel read also marks its child threads read.
+    s.mark_read(sf(20));
+    assert!(!s.channel_unread(sf(60)));
+    assert_eq!(s.channel_mention_count(sf(60)), 0);
+    assert_eq!(s.guild_mention_count(sf(100)), 2);
+
+    // Marking the guild read clears all remaining channels and threads in the guild.
+    s.mark_guild_read(sf(100));
+    assert!(!s.guild_unread(sf(100)));
+    assert_eq!(s.guild_mention_count(sf(100)), 0);
+
+    // Custom status on self is returned by status_text(me).
+    assert!(s.my_custom_status().is_none());
+    assert!(s.status_text(sf(1)).is_none());
+    s.set_my_custom_status(Some(CustomStatus {
+        text: Some("  hacking on nixcord  ".into()),
+        emoji: Some(Emoji {
+            id: None,
+            name: Some("🦀".into()),
+            animated: false,
+        }),
+    }));
+    assert_eq!(
+        s.my_custom_status_text().as_deref(),
+        Some("🦀 hacking on nixcord")
+    );
+    assert_eq!(
+        s.status_text(sf(1)).as_deref(),
+        Some("🦀 hacking on nixcord")
+    );
+    s.set_my_custom_status(Some(CustomStatus::default()));
+    assert!(s.my_custom_status().is_none());
+}

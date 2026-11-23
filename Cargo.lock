@@ -2317,9 +2317,11 @@ dependencies = [
 name = "nixcord"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "chrono",
  "eframe",
  "egui",
+ "image",
  "keyring",
  "nixcord-emoji",
  "nixcord-gateway",

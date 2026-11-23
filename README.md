@@ -34,13 +34,13 @@ are CC0, public domain or Apache-2.0; see [assets/demo/LICENSES.md](assets/demo/
 
 Early (v0.1). Working:
 
-- Login, servers, channels, Forum channels, active threads (with creation), DMs, Friends page, history, message search (`Ctrl+F`), and send (with file uploads & drag-and-drop)/edit/delete/reply.
-- Reactions, typing indicators, unread/mention badges, in-app mention toasts, and `zlib-stream` reconnect/resume.
-- Markdown with code highlighting, embeds, and interactive bot components (V2 layouts, clickable buttons and string selects).
+- Login, servers, channels, Forum channels, active threads (with creation, archiving & locking), DMs, Friends page, history, message search (`Ctrl+F`), and send (with file uploads, drag-and-drop & `Ctrl+V` clipboard image paste)/edit/delete/reply.
+- Reactions, typing indicators, unread/mention badges, right-click "Mark as Read", in-app mention toasts, and `zlib-stream` reconnect/resume.
+- Markdown with code highlighting, embeds, and interactive bot components (V2 layouts, clickable buttons, string selects, and searchable User/Role/Mentionable/Channel entity selects).
 - Avatars and server icons, color emoji (Twemoji) with a picker and `:shortcode:`
   autocomplete, and custom emoji.
 - An in-app image viewer, GIF/animated WebP playback, and inline H.264 video with audio.
-- Presence and status, floating user profile popouts, the member list with role groups, and permission-aware channel lists.
+- Presence, persistent status and custom status editor, floating user profile popouts, the member list with role groups, and permission-aware channel lists.
 - Themes.
 
 Not yet: voice, OS desktop notifications, stickers/GIF picker, and plugins.
