@@ -353,6 +353,9 @@ fn chat_prefs(ui: &mut Ui, app: &mut NixApp) {
     heading(ui, t, "Display");
     ui.checkbox(&mut app.prefs.clock_24h, "Use a 24-hour clock");
     ui.add_space(4.0);
+    ui.checkbox(&mut app.prefs.autoplay_gifs, "Play GIFs automatically")
+        .on_hover_text("When off, GIFs and animated emoji play while hovered");
+    ui.add_space(4.0);
     let mut auto = app.prefs.show_members.is_none();
     if ui
         .checkbox(
@@ -424,10 +427,12 @@ fn about(ui: &mut Ui, app: &mut NixApp) {
     );
     ui.label(RichText::new("No telemetry. Messages are kept in memory only.").color(t.text));
     let (n, bytes) = app.media.borrow().stats();
+    let (an, abytes) = app.media.borrow().anim_stats();
     ui.label(
         RichText::new(format!(
-            "Images in memory: {n} ({:.1} MB)",
-            bytes as f64 / (1024.0 * 1024.0)
+            "Images in memory: {n} ({:.1} MB), animations: {an} ({:.1} MB)",
+            bytes as f64 / (1024.0 * 1024.0),
+            abytes as f64 / (1024.0 * 1024.0)
         ))
         .color(t.muted),
     );

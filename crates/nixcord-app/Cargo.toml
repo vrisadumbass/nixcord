@@ -9,6 +9,11 @@ license.workspace = true
 name = "nixcord"
 path = "src/main.rs"
 
+[features]
+default = ["video"]
+# Inline video player (H.264 MP4/MOV). Adds about 0.7 MB to the release exe.
+video = ["dep:nixcord-video"]
+
 [dependencies]
 nixcord-model.workspace = true
 nixcord-gateway.workspace = true
@@ -16,6 +21,9 @@ nixcord-http.workspace = true
 nixcord-store.workspace = true
 nixcord-markdown.workspace = true
 nixcord-media.workspace = true
+nixcord-emoji.workspace = true
+# Inline video playback (OpenH264 + symphonia + cpal); `--no-default-features` drops it.
+nixcord-video = { workspace = true, optional = true }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

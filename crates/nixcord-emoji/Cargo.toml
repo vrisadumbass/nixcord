@@ -1,0 +1,9 @@
+[package]
+name = "nixcord-emoji"
+description = "Unicode emoji data, segmentation, search and Twemoji file names for nixcord (pure, no UI)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+unicode-segmentation = "1.13"

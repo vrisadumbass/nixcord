@@ -424,25 +424,29 @@ pub fn member_row(ui: &mut Ui, app: &NixApp, u: &User, guild: Option<Snowflake>,
         Pos2::new(rect.right() - 4.0, rect.bottom()),
     )
     .intersect(ui.clip_rect());
-    let name = ui.painter().layout_no_wrap(
-        member_name(&app.store, guild, u).to_string(),
+    // Names and status lines may contain emoji: drawn as color Twemoji.
+    let p = ui.painter().with_clip_rect(clip);
+    let name = super::emoji_text::layout(
+        &p,
+        member_name(&app.store, guild, u),
         prop(15.5),
         color,
+        f32::INFINITY,
+        0,
     );
     let sub = app
         .store
         .status_text(u.id)
-        .map(|s| ui.painter().layout_no_wrap(s, prop(12.5), fade(t.muted)));
+        .map(|s| super::emoji_text::layout(&p, &s, prop(12.5), fade(t.muted), f32::INFINITY, 0));
     let name_w = name.size().x;
     let name_h = name.size().y;
     let top = match &sub {
         Some(s) => rect.center().y - (name_h + s.size().y) / 2.0,
         None => rect.center().y - name_h / 2.0,
     };
-    let p = ui.painter().with_clip_rect(clip);
-    p.galley(Pos2::new(left, top), name, color);
+    name.paint(&p, Pos2::new(left, top), &app.media);
     if let Some(s) = sub {
-        p.galley(Pos2::new(left, top + name_h), s, t.muted);
+        s.paint(&p, Pos2::new(left, top + name_h), &app.media);
     }
     if u.bot && left + name_w + 40.0 < rect.right() {
         super::paint_app_badge(ui, Pos2::new(left + name_w + 5.0, top + name_h / 2.0));

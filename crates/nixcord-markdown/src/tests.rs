@@ -745,6 +745,10 @@ fn doc_helpers() {
     assert!(parse("<:a:1> <a:b:2>").is_emoji_only());
     assert!(!parse("hi <:a:1>").is_emoji_only());
     assert!(!parse("").is_emoji_only());
+    assert!(parse("\u{1F980} \u{2764}\u{FE0F}").is_emoji_only());
+    assert!(parse("<:a:1> \u{1F44D}\u{1F3FD}").is_emoji_only());
+    assert!(!parse("\u{1F980} ok").is_emoji_only());
+    assert!(!parse("123 #").is_emoji_only());
 
     let p = parse("# T\n**b** [l](https://x.y) <@1>").plain_text_with(&|i| match i {
         Inline::Mention(Mention::User(id)) => format!("@u{id}"),

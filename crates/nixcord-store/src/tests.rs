@@ -1496,3 +1496,39 @@ fn visible_channels_hide_denied_hidden_and_empty_categories() {
         .collect();
     assert_eq!(ids, vec![100, 11]);
 }
+
+#[test]
+fn guild_emojis_update_replaces_list() {
+    use nixcord_model::CustomEmoji;
+    let emoji = |id: u64, name: &str| CustomEmoji {
+        id: sf(id),
+        name: name.into(),
+        animated: false,
+        available: true,
+    };
+    let mut s = Store::new();
+    let mut g = guild(1, vec![]);
+    g.emojis = vec![emoji(5, "ferris")];
+    s.apply(&GatewayEvent::GuildCreate(Box::new(g)));
+    assert_eq!(s.guild(sf(1)).unwrap().emojis.len(), 1);
+    // GUILD_UPDATE without emojis keeps them.
+    s.apply(&GatewayEvent::GuildUpdate(Box::new(guild(1, vec![]))));
+    assert_eq!(s.guild(sf(1)).unwrap().emojis[0].name, "ferris");
+    s.apply(&GatewayEvent::GuildEmojisUpdate {
+        guild_id: sf(1),
+        emojis: vec![emoji(6, "crab"), emoji(7, "party")],
+    });
+    let names: Vec<&str> = s
+        .guild(sf(1))
+        .unwrap()
+        .emojis
+        .iter()
+        .map(|e| e.name.as_str())
+        .collect();
+    assert_eq!(names, ["crab", "party"]);
+    // Unknown guild: ignored.
+    s.apply(&GatewayEvent::GuildEmojisUpdate {
+        guild_id: sf(9),
+        emojis: vec![],
+    });
+}

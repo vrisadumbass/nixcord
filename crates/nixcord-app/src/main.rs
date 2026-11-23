@@ -9,17 +9,47 @@ mod platform;
 mod theme;
 mod token;
 mod ui;
+mod video;
 
 use eframe::egui;
 
 fn main() -> eframe::Result {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("NIXCORD_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    let mut filter = tracing_subscriber::EnvFilter::try_from_env("NIXCORD_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    // Transport crates can log raw frames/headers at debug/trace, which would include the
+    // token (identify payload, Authorization header). Cap them no matter what NIXCORD_LOG
+    // says; more specific directives win over a bare level like `debug`.
+    for quiet in [
+        "tungstenite=warn",
+        "tokio_tungstenite=warn",
+        "rustls=warn",
+        "hyper=warn",
+        "hyper_util=warn",
+        "reqwest=warn",
+        "h2=warn",
+    ] {
+        if let Ok(d) = quiet.parse() {
+            filter = filter.add_directive(d);
+        }
+    }
+    let log = tracing_subscriber::fmt().with_env_filter(filter);
+    // Release builds are windows-subsystem binaries without a console: NIXCORD_LOG_FILE
+    // appends the log to a file instead of stderr.
+    let log_file = std::env::var_os("NIXCORD_LOG_FILE").and_then(|path| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .inspect_err(|e| eprintln!("NIXCORD_LOG_FILE: cannot open {path:?}: {e}"))
+            .ok()
+    });
+    match log_file {
+        Some(file) => log
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .init(),
+        None => log.with_writer(std::io::stderr).init(),
+    }
 
     let demo = std::env::args().any(|a| a == "--demo")
         || std::env::var("NIXCORD_DEMO").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));

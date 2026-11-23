@@ -6,3 +6,4 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+nixcord-emoji.workspace = true

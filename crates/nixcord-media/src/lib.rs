@@ -11,7 +11,10 @@
 //!   once, which bounds the transient peak.
 //! - The background runtime is started by the caller only when the first image is needed.
 
+pub mod anim;
+pub mod anim_url;
 pub mod demo;
+pub mod demo_anim;
 pub mod disk;
 pub mod lru;
 pub mod size;
@@ -101,4 +104,11 @@ impl Failure {
 pub struct Loaded {
     pub key: Key,
     pub result: Result<Image, Failure>,
+}
+
+/// A finished animation request, as received from [`Fetcher::try_recv_anim`].
+#[derive(Debug)]
+pub struct LoadedAnim {
+    pub key: Key,
+    pub result: Result<anim::Decoded, Failure>,
 }

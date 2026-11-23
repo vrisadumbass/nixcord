@@ -8,6 +8,8 @@
 //!
 //! Textures come from `Media::viewer_tex` (a large copy sized to the window, the chat
 //! preview scaled up until it arrives); `Media::close_viewer` frees the large one on close.
+//! Animated images (GIF / animated WebP / APNG, `gifv` embeds) play here; only real video
+//! keeps the "Open in browser to play" button.
 //! The state lives in `Media::viewer`, so the app only calls [`show`] once per frame, after
 //! the main UI.
 
@@ -130,6 +132,8 @@ pub fn show(ctx: &egui::Context, app: &mut NixApp) {
             }
         }
     }
+    // Video mode: the fullscreen player (`crate::video`), drawn over everything.
+    crate::video::fullscreen(ctx, app);
     if closed {
         app.composer.want_focus = true;
     }
@@ -305,8 +309,8 @@ fn draw(
                 }
             }
 
-            // ---- GIF / video: first frame only ----
-            if item.is_animated() {
+            // ---- video: we can't play it here (GIFs / animated WebP play above) ----
+            if item.is_video() {
                 let r = Rect::from_center_size(rect.center(), Vec2::new(214.0, 40.0));
                 let resp = ui.interact(r, ui.scope_id().with("play"), Sense::click());
                 let fill = if resp.hovered() {
@@ -335,7 +339,7 @@ fn draw(
                 );
                 if resp
                     .on_hover_cursor(CursorIcon::PointingHand)
-                    .on_hover_text("Animated images show their first frame here")
+                    .on_hover_text("Videos play in the browser")
                     .clicked()
                 {
                     ctx.open_url(egui::OpenUrl::new_tab(&item.url));

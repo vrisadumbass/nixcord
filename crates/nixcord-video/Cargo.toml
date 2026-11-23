@@ -1,0 +1,20 @@
+[package]
+name = "nixcord-video"
+description = "Inline H.264 video playback for nixcord: MP4/MOV demux, OpenH264, symphonia audio, cpal output"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nixcord-media.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# Same TLS stack as nixcord-http / nixcord-media, so nothing new gets compiled for HTTPS.
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
+# Cisco's H.264 decoder, compiled from the bundled source (BSD-2-Clause).
+openh264 = { version = "0.9.10", default-features = false, features = ["source"] }
+# Audio decoders only (no format readers: the MP4 demuxer is ours, see `mp4.rs`).
+symphonia-core = "0.6.1"
+symphonia-codec-aac = "0.6.1"
+symphonia-bundle-mp3 = { version = "0.6.1", default-features = false, features = ["mp3"] }
+cpal = "0.18.2"

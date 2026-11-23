@@ -195,14 +195,23 @@ impl Session {
                 Err(e) => tracing::warn!(error = %e, "READY without session info"),
             }
         }
-        match protocol::decode_dispatch(t, d) {
+        let mut out = match protocol::decode_dispatch(t, d) {
             Ok(Some(ev)) => vec![Action::Emit(ev)],
             Ok(None) => Vec::new(),
             Err(e) => {
                 tracing::warn!(event = t, error = %e, "failed to decode gateway event");
                 Vec::new()
             }
-        }
+        };
+        // Presences riding on other events (GUILD_CREATE, PRESENCES_REPLACE), applied
+        // after the event itself.
+        out.extend(protocol::dispatch_presences(t, d).into_iter().map(|p| {
+            Action::Emit(GatewayEvent::PresenceUpdate {
+                presence: Box::new(p),
+                user: None,
+            })
+        }));
+        out
     }
 
     /// Server closed the socket with `code` (None = no close frame).
@@ -448,6 +457,25 @@ mod tests {
             a[0],
             Action::StartHeartbeat(Duration::from_millis(DEFAULT_HEARTBEAT_MS))
         );
+    }
+
+    #[test]
+    fn guild_create_presences_are_emitted_after_the_guild() {
+        let mut s = Session::new();
+        let a = s.handle_text(
+            r#"{"op":0,"s":2,"t":"GUILD_CREATE","d":{"id":"100","name":"G","channels":[],
+                "presences":[{"user":{"id":"20"},"status":"dnd","activities":[]}]}}"#,
+        );
+        assert!(matches!(&a[0], Action::Emit(GatewayEvent::GuildCreate(_))));
+        match &a[1] {
+            Action::Emit(GatewayEvent::PresenceUpdate { presence, user }) => {
+                assert_eq!(presence.user_id, Snowflake(20));
+                assert_eq!(presence.guild_id, Some(Snowflake(100)));
+                assert!(user.is_none());
+            }
+            x => panic!("{x:?}"),
+        }
+        assert_eq!(a.len(), 2);
     }
 
     #[test]

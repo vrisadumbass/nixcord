@@ -20,7 +20,8 @@
 //!   squircle radius). It draws NO fallback and returns `false` when there is no image
 //!   (yet), so the rail keeps painting its own hover/selected fill + initials.
 //! - `media.emoji(ui, emoji_id, animated, 22.0)` for custom emoji (reactions, inline
-//!   `<:name:id>`). Animated emoji show their first frame. Fallback: a faint rounded square.
+//!   `<:name:id>`). Animated emoji play (see `media/anim.rs`); the still shows while the
+//!   frames load. Fallback: a faint rounded square.
 //! - `media.image(ui, &url, Vec2::new(400.0, 300.0), Some((w, h)))` for attachments
 //!   (`a.url`, `a.width.zip(a.height)`) and embed images/thumbnails (prefer `proxy_url`,
 //!   `media.width.zip(media.height)`). Aspect-correct inside `max_size`, never upscaled,
@@ -29,6 +30,10 @@
 //!   known so the row height is stable before the image arrives (the chat list caches row
 //!   heights). Discord attachment / embed-proxy URLs are fetched pre-scaled by the media
 //!   proxy, so we download about as many pixels as we show.
+//! - GIFs and animated WebP/APNG (attachments, `gifv` embeds via `media.gifv(..)`,
+//!   animated emoji, `a_` avatars on hover) play inline; see `media/anim.rs` for the memory
+//!   budget and playback rules. `media.video_poster(..)` draws a video's poster with a
+//!   play button that opens the browser.
 //! - `media.clear()` on logout drops every texture and closes the viewer;
 //!   `media.stats()` -> `(textures, bytes)` of the LRU (viewer textures are not counted).
 //!
@@ -54,6 +59,15 @@
 //! Demo mode (`Media::new(ctx, true)`) never touches the network: avatars, icons, emoji and
 //! attachment "screenshots" are generated locally by `nixcord_media::demo`, seeded by the
 //! user/guild/emoji id or a hash of the URL.
+//!
+//! # Unicode emoji (Twemoji)
+//!
+//! `media.twemoji(emoji, px)` returns the color Twemoji image of a unicode emoji decoded to
+//! `px` pixels square (one cache entry per emoji and size, like any other image; the PNGs
+//! are 72x72, so even the picker's 48 px cells cost 9 KB each). `None` while loading or
+//! after a failure: callers draw the font glyph instead (see `ui::emoji_text`). In demo
+//! mode Twemoji comes from the disk cache only (no network), unless `NIXCORD_DEMO_NET=1`
+//! allows fetching it.
 
 use eframe::egui::{
     self, epaint::RectShape, Align2, Color32, CornerRadius, Pos2, Rect, Response, Sense,
@@ -65,6 +79,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Instant;
+
+mod anim;
 
 /// Total RGBA bytes of textures kept around (visible ones are never evicted).
 const TEXTURE_CAP: usize = 24 * 1024 * 1024;
@@ -104,12 +120,14 @@ pub struct ViewImage {
     pub filename: String,
     /// Cache id of the chat preview (drawn scaled up while the large copy loads).
     preview_id: u64,
+    /// Animated-image URLs to play instead of `url` (a `gifv` embed's GIF / WebP).
+    alt: Vec<String>,
 }
 
 impl ViewImage {
-    /// GIF / video: the viewer shows the first frame only and offers the browser.
-    pub fn is_animated(&self) -> bool {
-        murl::is_animated(&self.url)
+    /// Real video: the viewer cannot play it and offers the browser. (GIFs play.)
+    pub fn is_video(&self) -> bool {
+        nixcord_media::anim_url::is_video(&self.url)
     }
     #[cfg(test)]
     pub fn for_test(url: &str, natural: Option<(u32, u32)>) -> Self {
@@ -118,6 +136,7 @@ impl ViewImage {
             natural,
             filename: murl::file_name(url),
             preview_id: 0,
+            alt: Vec::new(),
         }
     }
 }
@@ -186,6 +205,8 @@ pub struct Media {
     save_tx: mpsc::Sender<SaveMsg>,
     save_rx: mpsc::Receiver<SaveMsg>,
     notices: Vec<String>,
+    /// Decoded animations (own LRU; see `media/anim.rs`).
+    anim: anim::Anims,
     /// Open viewer state (owned here so the app needs no extra field).
     pub viewer: Option<crate::ui::viewer::State>,
 }
@@ -211,6 +232,7 @@ impl Media {
             save_tx,
             save_rx,
             notices: Vec::new(),
+            anim: anim::Anims::default(),
             viewer: None,
         }
     }
@@ -224,6 +246,7 @@ impl Media {
     pub fn clear(&mut self) {
         self.entries.retain(|_, e| matches!(e, Entry::Loading));
         self.lru = ByteLru::new();
+        self.clear_anims();
         self.close_viewer();
         self.open = None;
         self.drawn.clear();
@@ -271,8 +294,14 @@ impl Media {
                     (None, Some(h)) => Some(cdn::avatar(user.id, Some(h), size::cdn_size(px))),
                     (None, None) => None,
                 };
+                let hash = member.map(|(_, h)| h).or(user.avatar.as_deref());
+                let hover_anim =
+                    hash.is_some_and(|h| h.starts_with("a_")) && ui.rect_contains_pointer(rect);
                 match url {
-                    Some(url) => self.net(Key::new(url, px, px)),
+                    Some(url) => match hover_anim.then(|| self.anim_avatar(&url, px)).flatten() {
+                        Some(t) => Got::Ready(t),
+                        None => self.net(Key::new(url, px, px)),
+                    },
                     None => Got::Failed,
                 }
             };
@@ -327,7 +356,11 @@ impl Media {
         let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
         if ui.is_rect_visible(rect) {
             let px = self.px(size);
-            let got = if self.demo {
+            let hover = ui.rect_contains_pointer(rect);
+            let frame = animated.then(|| self.anim_emoji(id.0, px, hover)).flatten();
+            let got = if let Some(t) = frame {
+                Got::Ready(t)
+            } else if self.demo {
                 self.local(local_id(3, id.0, px, px), px as u64 * px as u64, || {
                     demo::emoji(id.0, px)
                 })
@@ -358,11 +391,49 @@ impl Media {
         resp
     }
 
+    /// Color Twemoji texture of unicode emoji `emoji` at `px` pixels, if loaded (starts the
+    /// load on a miss). See the module docs.
+    pub fn twemoji(&mut self, emoji: &str, px: u32) -> Option<Tex> {
+        let px = px.clamp(8, 160);
+        let key = Key::new(nixcord_emoji::twemoji_url(emoji), px, px);
+        self.begin_pass();
+        let id = key.id();
+        if let Some(g) = self.cached(id) {
+            return match g {
+                Got::Ready(t) => Some(t),
+                _ => None,
+            };
+        }
+        if !self.ensure_emoji_fetcher() {
+            self.entries.insert(
+                id,
+                Entry::Failed {
+                    retry_at: Instant::now() + std::time::Duration::from_secs(3600),
+                },
+            );
+            return None;
+        }
+        if let Some(f) = &self.fetcher {
+            f.request(key);
+        }
+        self.entries.insert(id, Entry::Loading);
+        None
+    }
+
+    /// [`Media::twemoji`] for an emoji drawn `size` points square.
+    pub fn twemoji_points(&mut self, emoji: &str, size: f32) -> Option<Tex> {
+        let px = self.px(size);
+        self.twemoji(emoji, px)
+    }
+
     /// Texture of a custom emoji drawn `size` points square, if loaded (starts the load on a
     /// miss). Backs the markdown renderer's `EmojiImages` hook.
     pub fn emoji_texture(&mut self, id: u64, animated: bool, size: f32) -> Option<TextureId> {
         let px = self.px(size);
-        let got = if self.demo {
+        let frame = animated.then(|| self.anim_emoji(id, px, false)).flatten();
+        let got = if let Some(t) = frame {
+            Got::Ready(t)
+        } else if self.demo {
             self.local(local_id(3, id, px, px), px as u64 * px as u64, || {
                 demo::emoji(id, px)
             })
@@ -383,6 +454,45 @@ impl Media {
         &mut self,
         ui: &mut Ui,
         url: &str,
+        max_size: Vec2,
+        natural: Option<(u32, u32)>,
+    ) -> Response {
+        self.image_with(ui, url, &[], max_size, natural)
+    }
+
+    /// A `gifv` embed: plays the first loadable of `anim` (animated GIF / WebP URLs, see
+    /// `nixcord_media::anim_url::gifv_candidates`), showing the `poster` still meanwhile.
+    pub fn gifv(
+        &mut self,
+        ui: &mut Ui,
+        poster: &str,
+        anim: &[String],
+        max_size: Vec2,
+        natural: Option<(u32, u32)>,
+    ) -> Response {
+        self.image_with(ui, poster, anim, max_size, natural)
+    }
+
+    /// A still for the video player (`crate::video`): `url` decoded into a `px` box. Paints
+    /// nothing and opens no viewer. `Ok(None)` while loading, `Err` if it failed (or in demo
+    /// mode, which has no network).
+    #[cfg_attr(not(feature = "video"), allow(dead_code))]
+    pub fn still(&mut self, url: &str, px: (u32, u32)) -> Result<Option<Tex>, ()> {
+        if self.demo {
+            return Err(());
+        }
+        match self.net(Key::new(url, px.0, px.1)) {
+            Got::Ready(t) => Ok(Some(t)),
+            Got::Loading => Ok(None),
+            Got::Failed => Err(()),
+        }
+    }
+
+    fn image_with(
+        &mut self,
+        ui: &mut Ui,
+        url: &str,
+        alt: &[String],
         max_size: Vec2,
         natural: Option<(u32, u32)>,
     ) -> Response {
@@ -411,12 +521,47 @@ impl Media {
         let preview_id = key
             .as_ref()
             .map_or_else(|| local_id(4, seed, pw, ph), Key::id);
+        // Animated: decode every frame (attachments / gifv / animated WebP).
+        let anim_urls = if !alt.is_empty() {
+            Some(alt.to_vec())
+        } else if nixcord_media::anim_url::maybe_animated(url) {
+            Some(match natural {
+                Some(_) => nixcord_media::anim_url::image_candidates(url, pw, ph),
+                None => vec![url.to_owned()],
+            })
+        } else {
+            None
+        };
+        let anim_px = key.as_ref().map_or((pw, ph), |k| (k.max_w, k.max_h));
+        let anim_id = match alt.first() {
+            Some(a) => local_id(8, murl::fnv1a64(a.as_bytes()), anim_px.0, anim_px.1),
+            None => preview_id,
+        };
 
         // Visible check needs a rect, but the rect for unknown sizes depends on the texture:
         // peek at the would-be rect first.
         let probe = Rect::from_min_size(ui.cursor().min, Vec2::new(w, h));
+        let mut badge = false;
         let got = if !ui.is_rect_visible(probe) {
             Got::Loading
+        } else if let Some(urls) = &anim_urls {
+            let shown = self.anim_get(anim::Req {
+                id: anim_id,
+                urls,
+                px: anim_px,
+                // Same seed as the viewer uses (it keys on the animated URL).
+                demo: Some(anim::DemoAnim::Party(
+                    alt.first().map_or(seed, |a| murl::fnv1a64(a.as_bytes())),
+                )),
+                hover: ui.rect_contains_pointer(probe),
+                viewer: false,
+            });
+            badge = shown.badge;
+            match (shown.got, key) {
+                // gifv: the poster still while the animation loads (or if it can't).
+                (Got::Loading | Got::Failed, Some(key)) if !alt.is_empty() => self.net(key),
+                (g, _) => g,
+            }
         } else if let Some(key) = key {
             self.net(key)
         } else {
@@ -436,7 +581,12 @@ impl Media {
         let rounding = CornerRadius::same(IMAGE_RADIUS);
         let v = ui.visuals();
         match got {
-            Got::Ready(t) => paint_texture(ui, rect, rounding, t, false),
+            Got::Ready(t) => {
+                paint_texture(ui, rect, rounding, t, false);
+                if badge {
+                    anim::paint_badge(ui, rect);
+                }
+            }
             Got::Loading => {
                 ui.painter().rect_filled(rect, rounding, v.faint_bg_color);
             }
@@ -458,6 +608,17 @@ impl Media {
             natural,
             filename: murl::file_name(url),
             preview_id,
+            alt: Vec::new(),
+        };
+        let img = match alt.first() {
+            Some(a) => ViewImage {
+                url: a.clone(),
+                filename: murl::file_name(a),
+                preview_id: anim_id,
+                alt: alt.to_vec(),
+                ..img
+            },
+            None => img,
         };
         if resp.clicked() {
             self.open = Some((group, img.clone()));
@@ -513,6 +674,10 @@ impl Media {
         let id = key
             .as_ref()
             .map_or_else(|| local_id(5, seed, bw, bh), Key::id);
+        if let Some(v) = self.viewer_anim(img, bw, bh) {
+            self.big.clear();
+            return v;
+        }
 
         // Already cached as a regular image (small natural size: the preview is the whole
         // image).
@@ -703,6 +868,7 @@ impl Media {
         while let Ok((id, img)) = self.demo_rx.try_recv() {
             self.upload_big(id, Ok(img));
         }
+        self.pump_anims();
 
         if let Some(f) = &self.fetcher {
             let mut loaded = Vec::new();
@@ -792,14 +958,34 @@ impl Media {
 
     /// Start the fetcher on first use. `false` if it can't run (or in demo mode).
     fn ensure_fetcher(&mut self) -> bool {
-        if self.demo || self.net_broken {
+        if self.demo {
+            return false;
+        }
+        self.spawn_fetcher(false)
+    }
+
+    /// The fetcher for Twemoji. In demo mode it is started offline (disk cache only)
+    /// unless `NIXCORD_DEMO_NET=1`; nothing else uses it there.
+    fn ensure_emoji_fetcher(&mut self) -> bool {
+        if self.demo {
+            let net = std::env::var_os("NIXCORD_DEMO_NET").is_some_and(|v| v == "1");
+            self.spawn_fetcher(!net)
+        } else {
+            self.ensure_fetcher()
+        }
+    }
+
+    fn spawn_fetcher(&mut self, offline: bool) -> bool {
+        if self.net_broken {
             return false;
         }
         if self.fetcher.is_none() {
             let ctx = self.ctx.clone();
-            match Fetcher::spawn(nixcord_media::Config::default(), move || {
-                ctx.request_repaint()
-            }) {
+            let config = nixcord_media::Config {
+                offline,
+                ..nixcord_media::Config::default()
+            };
+            match Fetcher::spawn(config, move || ctx.request_repaint()) {
                 Ok(f) => self.fetcher = Some(f),
                 Err(e) => {
                     tracing::error!("media fetcher failed to start: {e}");
@@ -960,6 +1146,14 @@ impl crate::ui::markdown::EmojiImages for MediaEmoji<'_> {
             .try_borrow_mut()
             .ok()?
             .emoji_texture(id, animated, size)
+    }
+
+    fn unicode(&self, _: &egui::Context, emoji: &str, size: f32) -> Option<TextureId> {
+        self.0
+            .try_borrow_mut()
+            .ok()?
+            .twemoji_points(emoji, size)
+            .map(|t| t.id)
     }
 }
 

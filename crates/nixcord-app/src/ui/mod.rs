@@ -7,6 +7,8 @@
 pub mod chat;
 pub mod components;
 pub mod composer;
+pub mod emoji_picker;
+pub mod emoji_text;
 pub mod login;
 pub mod markdown;
 pub mod presence;
@@ -78,6 +80,10 @@ pub enum Action {
     Copy(String),
     Typing(Snowflake),
     OpenSettings,
+    /// An emoji was picked (picker or autocomplete): count it for "Frequently Used".
+    EmojiUsed(String),
+    /// Default skin tone for emoji (0 = none, 1..=5).
+    SetSkinTone(u8),
     /// Short notice at the bottom of the window.
     Toast(String),
 }

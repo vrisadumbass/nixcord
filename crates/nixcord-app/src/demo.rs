@@ -11,6 +11,7 @@
 use crate::backend::{AppEvent, Command, EventTx, HISTORY_PAGE};
 use nixcord_gateway::GatewayCommand;
 use nixcord_model::permissions::{SEND_MESSAGES, VIEW_CHANNEL};
+use nixcord_model::CustomEmoji;
 use nixcord_model::{
     Activity, ActivityKind, Attachment, Channel, ChannelKind, Embed, EmbedAuthor, EmbedField,
     EmbedFooter, EmbedMedia, Emoji, GatewayEvent, Guild, GuildMember, ListMember, MemberListGroup,
@@ -74,8 +75,8 @@ fn people() -> Vec<User> {
         user(1002, "sol", Some("Sol")),
         user(1003, "quill", Some("Quill")),
         user(1004, "pip", None),
-        user(1005, "ferris", Some("Ferris")),
-        user(1006, "mira_dev", Some("Mira")),
+        user(1005, "ferris", Some("Ferris \u{1F980}")),
+        user(1006, "mira_dev", Some("Mira \u{2728}")),
         user(1007, "tamsin", Some("Tamsin")),
         user(1008, "otto", Some("Otto Kranz")),
     ]
@@ -173,6 +174,42 @@ fn guild(id: u64, name: &str, channels: Vec<Channel>) -> Guild {
             roles: member_for(Snowflake(ME), g).roles,
             ..Default::default()
         }],
+        emojis: demo_guild_emojis(id),
+    }
+}
+
+/// Custom emoji of the demo servers (images are generated locally, see `Media`).
+fn demo_guild_emojis(guild: u64) -> Vec<CustomEmoji> {
+    let e = |id: u64, name: &str, animated: bool| CustomEmoji {
+        id: Snowflake(id),
+        name: name.into(),
+        animated,
+        available: true,
+    };
+    match guild {
+        10 => vec![
+            e(EMOJI_FERRIS, "ferris", false),
+            e(EMOJI_PARTY, "party", true),
+            e(EMOJI_PARTY + 1, "nixcord", false),
+            e(EMOJI_PARTY + 2, "shipit", false),
+            e(EMOJI_PARTY + 3, "heart_nix", false),
+            e(EMOJI_PARTY + 4, "pepe_think", false),
+            e(EMOJI_PARTY + 5, "catjam", true),
+            e(EMOJI_PARTY + 6, "kekw", false),
+            e(EMOJI_PARTY + 7, "pog", false),
+            e(EMOJI_PARTY + 8, "sadge", false),
+            // Locked (e.g. lost boost level): hidden from the picker.
+            CustomEmoji {
+                available: false,
+                ..e(EMOJI_PARTY + 9, "locked", false)
+            },
+        ],
+        20 => vec![
+            e(EMOJI_PARTY + 20, "rustacean", false),
+            e(EMOJI_PARTY + 21, "unsafe", false),
+            e(EMOJI_PARTY + 22, "borrowck", false),
+        ],
+        _ => Vec::new(),
     }
 }
 
@@ -206,7 +243,7 @@ fn ready() -> Ready {
                 103,
                 t(10),
                 Text,
-                "suggestions",
+                "\u{1F4A1}-suggestions",
                 t(101),
                 1,
                 Some("Ideas welcome"),
@@ -215,7 +252,7 @@ fn ready() -> Ready {
                 104,
                 t(10),
                 Text,
-                "bugs",
+                "\u{1F41B}-bugs",
                 t(101),
                 2,
                 Some("Please include your version and logs"),
@@ -654,17 +691,30 @@ fn showcase_messages(
         channel,
         ferris,
         format!(
-            "unicode \u{1F980}\u{1F680}\u{2728} and custom <:ferris:{EMOJI_FERRIS}> \
-             <a:party:{EMOJI_PARTY}> in one line"
+            "unicode \u{1F980}\u{1F680}\u{2728} flags \u{1F1EF}\u{1F1F5}\u{1F3F3}\u{FE0F}\u{200D}\u{1F308} \
+             family \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} tones \u{1F44D}\u{1F3FD}\u{1F44B}\u{1F3FF} \
+             keycap 1\u{FE0F}\u{20E3} \u{2764}\u{FE0F} \u{00A9}\u{FE0F} (plain #1 and \u{a9} stay text) \
+             and custom <:ferris:{EMOJI_FERRIS}> <a:party:{EMOJI_PARTY}> in one line"
         ),
         t,
     );
-    emoji.reactions = vec![reaction(
-        custom_emoji(EMOJI_FERRIS, "ferris", false),
-        5,
-        true,
-    )];
+    emoji.reactions = vec![
+        reaction(custom_emoji(EMOJI_FERRIS, "ferris", false), 5, true),
+        reaction(unicode("\u{1F980}"), 3, false),
+        reaction(unicode("\u{1F1EF}\u{1F1F5}"), 2, false),
+        reaction(unicode("\u{1F44D}\u{1F3FD}"), 1, true),
+    ];
     out.push(emoji);
+
+    // Emoji-only message: shown jumbo.
+    let (id, t) = at(7);
+    out.push(base_msg(
+        id,
+        channel,
+        juan,
+        "\u{1F980}\u{1F389}\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}".to_string(),
+        t,
+    ));
 
     // Role mention: I have @dev, so this pings me too.
     let (id, t) = at(6);
@@ -685,6 +735,115 @@ fn showcase_messages(
     let (id, t) = at(2);
     out.push(vote_buttons(id, channel, bot, t));
 
+    // GIFs: two attachments and a Tenor gifv embed (generated locally in demo mode).
+    let (id, t) = at(1);
+    let mut gifs = base_msg(
+        id,
+        channel,
+        rebrax,
+        format!("gif test <a:party:{EMOJI_PARTY}>"),
+        t,
+    );
+    for (k, (w, h)) in [(240u32, 160u32), (200, 200)].into_iter().enumerate() {
+        gifs.attachments.push(Attachment {
+            id: snowflake_at(t, 0x47_0000 + k as u64),
+            filename: format!("party-{k}.gif"),
+            url: format!("https://cdn.discordapp.com/attachments/104/{k}/party-{k}.gif"),
+            size: 180_000,
+            content_type: Some("image/gif".into()),
+            width: Some(w),
+            height: Some(h),
+        });
+    }
+    let tenor =
+        |code: &str, ext: &str| format!("https://media.tenor.com/nixDemoGifAA{code}/dance.{ext}");
+    gifs.embeds.push(Embed {
+        kind: Some("gifv".into()),
+        url: Some("https://tenor.com/view/dance-gif-1234567".into()),
+        provider: Some(EmbedAuthor {
+            name: "Tenor".into(),
+            url: Some("https://tenor.co".into()),
+            icon_url: None,
+        }),
+        thumbnail: Some(EmbedMedia {
+            url: tenor("Ae", "png"),
+            proxy_url: None,
+            width: Some(300),
+            height: Some(170),
+        }),
+        video: Some(EmbedMedia {
+            url: tenor("Po", "mp4"),
+            proxy_url: None,
+            width: Some(300),
+            height: Some(170),
+        }),
+        ..Default::default()
+    });
+    gifs.reactions = vec![reaction(custom_emoji(EMOJI_PARTY, "party", true), 3, true)];
+    out.push(gifs);
+
+    // Videos (see `crate::video`): opt-in, since demo mode has no network.
+    let (id, t) = at(0);
+    out.extend(demo_videos(channel, mira, id, t));
+
+    out
+}
+
+/// A local video when `NIXCORD_DEMO_VIDEO=<path>` is set, and a small public test clip when
+/// `NIXCORD_DEMO_NET=1` allows the network.
+fn demo_videos(channel: Snowflake, author: &User, id: Snowflake, t: u64) -> Vec<Message> {
+    let mut out = Vec::new();
+    let video = |k: u64, filename: String, url: String, size: u64, wh: Option<(u32, u32)>| {
+        let mut m = base_msg(
+            Snowflake(id.0 + k),
+            channel,
+            author,
+            format!("video test: {filename}"),
+            t,
+        );
+        m.attachments.push(Attachment {
+            id: Snowflake(id.0 + 0x100 + k),
+            filename,
+            url,
+            size,
+            content_type: Some("video/mp4".into()),
+            width: wh.map(|d| d.0),
+            height: wh.map(|d| d.1),
+        });
+        m
+    };
+    if let Some(path) = std::env::var_os("NIXCORD_DEMO_VIDEO").map(std::path::PathBuf::from) {
+        let name = path
+            .file_name()
+            .map_or_else(|| "video.mp4".into(), |n| n.to_string_lossy().into_owned());
+        let size = std::fs::metadata(&path).map_or(0, |m| m.len());
+        let url = format!("{}{name}", crate::video::DEMO_VIDEO_URL);
+        out.push(video(0, name, url.clone(), size, None));
+        // The same file as a `gifv` embed: muted, looping, no controls.
+        let mut gifv = base_msg(Snowflake(id.0 + 2), channel, author, "gifv test".into(), t);
+        gifv.embeds.push(Embed {
+            kind: Some("gifv".into()),
+            url: Some(url.clone()),
+            video: Some(EmbedMedia {
+                url,
+                proxy_url: None,
+                width: Some(320),
+                height: Some(180),
+            }),
+            ..Default::default()
+        });
+        out.push(gifv);
+    }
+    if std::env::var_os("NIXCORD_DEMO_NET").is_some_and(|v| v == "1") {
+        let url = crate::video::DEMO_NET_VIDEO.to_owned();
+        out.push(video(
+            1,
+            "flower.mp4".into(),
+            url,
+            1_128_375,
+            Some((960, 540)),
+        ));
+    }
     out
 }
 
@@ -848,7 +1007,12 @@ fn presence_of(id: u64) -> Option<Presence> {
         ),
         1006 => (
             Status::Dnd,
-            vec![activity(Custom, "Custom Status", Some("deep focus"), None)],
+            vec![activity(
+                Custom,
+                "Custom Status",
+                Some("deep focus \u{1F3A7}\u{2615}"),
+                Some("\u{1F9E0}"),
+            )],
         ),
         1007 => return None,
         1008 => (

@@ -1,8 +1,9 @@
 //! Background fetcher: its own small tokio runtime on one thread, bounded concurrency,
 //! in-flight dedupe, remembered failures, optional disk cache.
 
+use crate::anim::{self, Budget, Decoded};
 use crate::disk::DiskCache;
-use crate::{decode, url, Failure, Image, Key, Loaded};
+use crate::{decode, url, Failure, Image, Key, Loaded, LoadedAnim};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
@@ -18,12 +19,19 @@ pub struct Config {
     pub max_decodes: usize,
     /// Largest accepted download.
     pub max_bytes: usize,
+    /// Largest accepted download for an animation ([`Fetcher::request_anim`]).
+    pub max_anim_bytes: usize,
+    /// Decoded-size limits for one animation.
+    pub anim_budget: Budget,
     /// Whole-request timeout.
     pub timeout: Duration,
     pub connect_timeout: Duration,
     /// Disk cache directory; `None` disables the disk cache.
     pub disk_dir: Option<PathBuf>,
     pub disk_cap: u64,
+    /// Never download: serve only what the disk cache already has (a miss fails with
+    /// [`Failure::NotFound`]). Demo mode uses this for Twemoji.
+    pub offline: bool,
 }
 
 impl Default for Config {
@@ -32,10 +40,13 @@ impl Default for Config {
             max_in_flight: 6,
             max_decodes: 2,
             max_bytes: 8 * 1024 * 1024,
+            max_anim_bytes: 12 * 1024 * 1024,
+            anim_budget: Budget::default(),
             timeout: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(10),
             disk_dir: crate::disk::default_dir(),
             disk_cap: 50 * 1024 * 1024,
+            offline: false,
         }
     }
 }
@@ -44,6 +55,7 @@ impl Default for Config {
 pub struct Fetcher {
     tx: mpsc::UnboundedSender<Req>,
     rx: std_mpsc::Receiver<Loaded>,
+    rx_anim: std_mpsc::Receiver<LoadedAnim>,
 }
 
 type Wake = Arc<dyn Fn() + Send + Sync>;
@@ -56,6 +68,7 @@ const MAX_SAVE_BYTES: u64 = 500 * 1024 * 1024;
 
 enum Req {
     Load(Key),
+    LoadAnim(Key),
     Save {
         url: String,
         path: PathBuf,
@@ -69,10 +82,15 @@ struct Shared {
     net: Semaphore,
     decodes: Semaphore,
     max_bytes: usize,
-    in_flight: Mutex<HashSet<Key>>,
+    max_anim_bytes: usize,
+    anim_budget: Budget,
+    offline: bool,
+    /// (key, is animation) being fetched.
+    in_flight: Mutex<HashSet<(Key, bool)>>,
     /// URL -> (retry at, why). Requests before `retry at` fail immediately.
     failed: Mutex<HashMap<String, (Instant, Failure)>>,
     out: std_mpsc::Sender<Loaded>,
+    out_anim: std_mpsc::Sender<LoadedAnim>,
     wake: Wake,
 }
 
@@ -82,6 +100,7 @@ impl Fetcher {
     pub fn spawn(config: Config, wake: impl Fn() + Send + Sync + 'static) -> std::io::Result<Self> {
         let (tx, mut req_rx) = mpsc::unbounded_channel::<Req>();
         let (out, rx) = std_mpsc::channel();
+        let (out_anim, rx_anim) = std_mpsc::channel();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .max_blocking_threads(config.max_decodes.max(1) + 1)
@@ -106,9 +125,13 @@ impl Fetcher {
             net: Semaphore::new(config.max_in_flight.max(1)),
             decodes: Semaphore::new(config.max_decodes.max(1)),
             max_bytes: config.max_bytes,
+            max_anim_bytes: config.max_anim_bytes,
+            anim_budget: config.anim_budget,
+            offline: config.offline,
             in_flight: Mutex::new(HashSet::new()),
             failed: Mutex::new(HashMap::new()),
             out,
+            out_anim,
             wake: Arc::new(wake),
         });
         std::thread::Builder::new()
@@ -126,10 +149,16 @@ impl Fetcher {
                     while let Some(req) = req_rx.recv().await {
                         match req {
                             Req::Load(key) => {
-                                if !lock(&shared.in_flight).insert(key.clone()) {
+                                if !lock(&shared.in_flight).insert((key.clone(), false)) {
                                     continue; // already being fetched
                                 }
                                 tokio::spawn(job(shared.clone(), key));
+                            }
+                            Req::LoadAnim(key) => {
+                                if !lock(&shared.in_flight).insert((key.clone(), true)) {
+                                    continue;
+                                }
+                                tokio::spawn(job_anim(shared.clone(), key));
                             }
                             Req::Save { url, path, done } => {
                                 let s = shared.clone();
@@ -142,12 +171,23 @@ impl Fetcher {
                     }
                 });
             })?;
-        Ok(Self { tx, rx })
+        Ok(Self { tx, rx, rx_anim })
     }
 
     /// Fire-and-forget. Duplicate requests for an in-flight key are ignored.
     pub fn request(&self, key: Key) {
         let _ = self.tx.send(Req::Load(key));
+    }
+
+    /// Like [`Fetcher::request`], but decode every frame of an animated GIF / WebP / APNG
+    /// (see [`crate::anim`]); results arrive through [`Fetcher::try_recv_anim`].
+    pub fn request_anim(&self, key: Key) {
+        let _ = self.tx.send(Req::LoadAnim(key));
+    }
+
+    /// Next finished animation request, if any. Never blocks.
+    pub fn try_recv_anim(&self) -> Option<LoadedAnim> {
+        self.rx_anim.try_recv().ok()
     }
 
     /// Download `url` as-is (original bytes, no decode, no disk cache) into `path`, streaming
@@ -176,12 +216,41 @@ async fn job(s: Arc<Shared>, key: Key) {
     if let Err(f) = result {
         lock(&s.failed).insert(key.url.clone(), (Instant::now() + f.retry_after(), f));
     }
-    lock(&s.in_flight).remove(&key);
+    lock(&s.in_flight).remove(&(key.clone(), false));
     let _ = s.out.send(Loaded { key, result });
     (s.wake)();
 }
 
+async fn job_anim(s: Arc<Shared>, key: Key) {
+    let result = load_anim(&s, &key).await;
+    if let Err(f) = result {
+        lock(&s.failed).insert(key.url.clone(), (Instant::now() + f.retry_after(), f));
+    }
+    lock(&s.in_flight).remove(&(key.clone(), true));
+    let _ = s.out_anim.send(LoadedAnim { key, result });
+    (s.wake)();
+}
+
 async fn load(s: &Arc<Shared>, key: &Key) -> Result<Image, Failure> {
+    let bytes = fetch_bytes(s, key, s.max_bytes).await?;
+    let _permit = s.decodes.acquire().await.map_err(|_| Failure::Decode)?;
+    let (w, h) = (key.max_w, key.max_h);
+    tokio::task::spawn_blocking(move || decode(&bytes, w, h))
+        .await
+        .map_err(|_| Failure::Decode)?
+}
+
+async fn load_anim(s: &Arc<Shared>, key: &Key) -> Result<Decoded, Failure> {
+    let bytes = fetch_bytes(s, key, s.max_anim_bytes).await?;
+    let _permit = s.decodes.acquire().await.map_err(|_| Failure::Decode)?;
+    let (w, h, budget) = (key.max_w, key.max_h, s.anim_budget);
+    tokio::task::spawn_blocking(move || anim::decode_anim(&bytes, w, h, budget))
+        .await
+        .map_err(|_| Failure::Decode)?
+}
+
+/// Disk cache hit, or a capped download (written to the disk cache in the background).
+async fn fetch_bytes(s: &Arc<Shared>, key: &Key, max_bytes: usize) -> Result<Vec<u8>, Failure> {
     if let Some(&(until, f)) = lock(&s.failed).get(&key.url) {
         if Instant::now() < until {
             return Err(f);
@@ -199,10 +268,11 @@ async fn load(s: &Arc<Shared>, key: &Key) -> Result<Image, Failure> {
     };
     let bytes = match cached {
         Some(b) => b,
+        None if s.offline => return Err(Failure::NotFound),
         None => {
             let bytes = {
                 let _permit = s.net.acquire().await.map_err(|_| Failure::Network)?;
-                download(&s.client, &key.url, s.max_bytes).await?
+                download(&s.client, &key.url, max_bytes).await?
             };
             if s.disk.is_some() {
                 // Write in the background; decode does not wait for it.
@@ -217,11 +287,7 @@ async fn load(s: &Arc<Shared>, key: &Key) -> Result<Image, Failure> {
             bytes
         }
     };
-    let _permit = s.decodes.acquire().await.map_err(|_| Failure::Decode)?;
-    let (w, h) = (key.max_w, key.max_h);
-    tokio::task::spawn_blocking(move || decode(&bytes, w, h))
-        .await
-        .map_err(|_| Failure::Decode)?
+    Ok(bytes)
 }
 
 async fn download(client: &reqwest::Client, url: &str, max: usize) -> Result<Vec<u8>, Failure> {
@@ -295,6 +361,50 @@ async fn save_to(client: &reqwest::Client, url: &str, path: &Path) -> Result<u64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offline_serves_disk_cache_only() {
+        let dir = std::env::temp_dir().join(format!("nixcord-offline-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cached = "https://example.invalid/cached.png";
+        let png = crate::encode_png(&Image {
+            width: 4,
+            height: 4,
+            rgba: vec![200; 64],
+        })
+        .unwrap();
+        DiskCache::open(&dir, 1 << 20)
+            .unwrap()
+            .put(url::cache_key(cached), &png);
+        let cfg = Config {
+            disk_dir: Some(dir.clone()),
+            offline: true,
+            ..Config::default()
+        };
+        let f = Fetcher::spawn(cfg, || {}).unwrap();
+        f.request(Key::new(cached, 2, 2));
+        f.request(Key::new("https://example.invalid/missing.png", 2, 2));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut got = Vec::new();
+        while got.len() < 2 && Instant::now() < deadline {
+            match f.try_recv() {
+                Some(l) => got.push(l),
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        let hit = got
+            .iter()
+            .find(|l| l.key.url == cached)
+            .expect("cached result");
+        assert_eq!(hit.result.as_ref().map(|i| i.width), Ok(2));
+        let miss = got
+            .iter()
+            .find(|l| l.key.url != cached)
+            .expect("miss result");
+        assert_eq!(miss.result.as_ref().err(), Some(&Failure::NotFound));
+        drop(f);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Real network round trip. Run with `cargo test -p nixcord-media -- --ignored`.
     #[test]

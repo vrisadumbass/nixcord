@@ -30,7 +30,7 @@
 //! - Rendering is cheap: the AST is cached, egui caches the laid-out galleys, and the only
 //!   per-frame work is building one `LayoutJob` per paragraph and hit-testing pills/links.
 
-use super::{paint_icon, role_color, Icon};
+use super::{emoji_text, paint_icon, role_color, Icon};
 use crate::theme::Theme;
 use eframe::egui::{
     self, text::LayoutJob, Align, Align2, Color32, CornerRadius, CursorIcon, FontFamily, FontId,
@@ -151,6 +151,13 @@ pub trait EmojiImages {
         animated: bool,
         size: f32,
     ) -> Option<egui::TextureId>;
+
+    /// Color image (Twemoji) for unicode emoji `emoji` (one grapheme cluster), drawn `size`
+    /// points square. `None` until loaded: the renderer then draws the font glyph in the
+    /// same reserved square, so the layout doesn't move when the image arrives.
+    fn unicode(&self, _ctx: &egui::Context, _emoji: &str, _size: f32) -> Option<egui::TextureId> {
+        None
+    }
 }
 
 // ---- api ----------------------------------------------------------------------------
@@ -430,9 +437,12 @@ enum RunKind<'d> {
         id: Id,
         revealed: bool,
     },
+    /// An image in a reserved square: a custom emoji (`glyph` empty) or a unicode emoji
+    /// (`tex` is `None` until its Twemoji image loads; `glyph` is drawn meanwhile).
     Emoji {
-        tex: egui::TextureId,
+        tex: Option<egui::TextureId>,
         size: f32,
+        glyph: &'d str,
     },
     Timestamp {
         tooltip: String,
@@ -463,6 +473,15 @@ impl Builder<'_> {
             runs: Vec::new(),
             pad: 0.0,
         }
+    }
+
+    /// Reserve a `size`-point square for an emoji (see `emoji_text::placeholder`).
+    fn push_emoji(&mut self, size: f32, line_height: Option<f32>) -> Range<usize> {
+        let start = self.chars;
+        emoji_text::append_placeholder(&mut self.job, self.pad + 1.0, size, line_height);
+        self.chars += 2;
+        self.pad = 1.0;
+        start..self.chars
     }
 
     fn push(&mut self, text: &str, fmt: TextFormat) -> Range<usize> {
@@ -497,7 +516,7 @@ fn hl_color(kind: HlKind, dark: bool) -> Color32 {
 }
 
 /// Screen rects (one per wrapped row) covering chars `range` of `galley`.
-fn char_rects(galley: &Galley, range: &Range<usize>, origin: Pos2, out: &mut Vec<Rect>) {
+pub(crate) fn char_rects(galley: &Galley, range: &Range<usize>, origin: Pos2, out: &mut Vec<Rect>) {
     let mut idx = 0;
     for row in &galley.rows {
         let n = row.glyphs.len();
@@ -832,9 +851,12 @@ impl<'a> Renderer<'_, 'a> {
         let t = self.t();
         for node in inl {
             match node {
-                Inline::Text(s) => {
-                    b.push(s, self.fmt(&st));
-                }
+                Inline::Text(s) => match self.ctx.emoji {
+                    Some(images) if !st.mono => self.text_with_emoji(ui, b, s, st, images),
+                    _ => {
+                        b.push(s, self.fmt(&st));
+                    }
+                },
                 Inline::Bold(c) => self.walk(ui, b, c, Style { bold: true, ..st }),
                 Inline::Italic(c) => self.walk(ui, b, c, Style { italic: true, ..st }),
                 Inline::Underline(c) => self.walk(
@@ -912,19 +934,15 @@ impl<'a> Renderer<'_, 'a> {
                         Some(tex) => {
                             // Reserve `size` points with two invisible hairline glyphs
                             // spaced apart, so the emoji wraps like a word.
-                            let f = TextFormat {
-                                font_id: FontId::proportional(1.0),
-                                color: Color32::TRANSPARENT,
-                                extra_letter_spacing: size,
-                                line_height: Some(st.line_height.max(size + 4.0)),
-                                ..Default::default()
-                            };
-                            b.pad += 1.0;
-                            let chars = b.push("ii", f);
-                            b.pad = 1.0;
+                            let lh = Some(st.line_height.max(size + 4.0));
+                            let chars = b.push_emoji(size, lh);
                             if !st.hidden {
                                 b.runs.push(Run {
-                                    kind: RunKind::Emoji { tex, size },
+                                    kind: RunKind::Emoji {
+                                        tex: Some(tex),
+                                        size,
+                                        glyph: "",
+                                    },
                                     chars,
                                 });
                             }
@@ -942,6 +960,53 @@ impl<'a> Renderer<'_, 'a> {
                     if !st.hidden {
                         b.runs.push(Run {
                             kind: RunKind::Timestamp { tooltip },
+                            chars,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Plain text with its unicode emoji as reserved squares (Twemoji, or the font glyph
+    /// until the image loads).
+    fn text_with_emoji<'d>(
+        &mut self,
+        ui: &Ui,
+        b: &mut Builder<'d>,
+        s: &'d str,
+        st: Style,
+        images: &dyn EmojiImages,
+    ) {
+        let size = if self.jumbo {
+            48.0
+        } else {
+            (st.size * 1.375).round()
+        };
+        let line_height = if self.jumbo {
+            st.line_height.max(size + 4.0)
+        } else {
+            st.line_height.max(size)
+        };
+        for run in nixcord_emoji::emoji_runs(s) {
+            match run {
+                nixcord_emoji::TextOrEmoji::Text(t) => {
+                    b.push(t, self.fmt(&st));
+                }
+                nixcord_emoji::TextOrEmoji::Emoji(e) => {
+                    let tex = if st.hidden {
+                        None
+                    } else {
+                        images.unicode(ui.ctx(), e, size)
+                    };
+                    let chars = b.push_emoji(size, Some(line_height));
+                    if !st.hidden {
+                        b.runs.push(Run {
+                            kind: RunKind::Emoji {
+                                tex,
+                                size,
+                                glyph: e,
+                            },
                             chars,
                         });
                     }
@@ -1120,14 +1185,27 @@ impl<'a> Renderer<'_, 'a> {
         // Foreground: emoji images, link hover underline.
         for &(ri, r) in &rects {
             match &runs[ri].kind {
-                RunKind::Emoji { tex, size } => {
+                RunKind::Emoji { tex, size, glyph } => {
                     let img = Rect::from_center_size(r.center(), Vec2::splat(*size));
-                    p.image(
-                        *tex,
-                        img,
-                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                        Color32::WHITE,
-                    );
+                    match tex {
+                        Some(tex) => {
+                            p.image(
+                                *tex,
+                                img,
+                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+                        }
+                        None => {
+                            p.text(
+                                img.center(),
+                                Align2::CENTER_CENTER,
+                                emoji_text::glyph(glyph),
+                                FontId::proportional((*size * 0.8).round()),
+                                t.text,
+                            );
+                        }
+                    }
                 }
                 RunKind::Link { .. } if hovered == Some(ri) => {
                     let y = r.bottom() - 2.5;

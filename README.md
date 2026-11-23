@@ -3,7 +3,8 @@
 A lightweight, native Discord client written in Rust. No Electron, no webview, no telemetry.
 
 - **Native UI** with [egui](https://github.com/emilk/egui): starts instantly, sips RAM.
-- **Zero telemetry.** The client talks to the Discord gateway and REST API, and nothing else.
+- **Zero telemetry.** No analytics, no tracking, no crash reporting. See
+  [Network](#network) for every host the client contacts.
 - **Gradient themes**, a dozen built in, and easy to add your own.
 - **Hackable.** A small crate-per-concern workspace with a pure, unit-tested state store.
   PRs welcome, forks welcome. It's open source, after all.
@@ -17,10 +18,32 @@ A lightweight, native Discord client written in Rust. No Electron, no webview, n
 
 ## Status
 
-Early (v0.1). Working: login, guilds, channels, DMs, message history, sending, editing,
-deleting, typing indicators, reconnect/resume, themes.
-Not yet: images and avatars, markdown, reactions, voice, member list, notifications.
+Early (v0.1). Working:
+
+- Login, servers, channels, DMs, history, and send/edit/delete/reply.
+- Reactions, typing indicators, and reconnect/resume.
+- Markdown with code highlighting, embeds, and bot components (V2 layouts, buttons, selects).
+- Avatars and server icons, color emoji (Twemoji) with a picker and `:shortcode:`
+  autocomplete, and custom emoji.
+- An in-app image viewer, GIF/animated WebP playback, and inline H.264 video with audio.
+- Presence and status, the member list with role groups, and permission-aware channel lists.
+- Themes.
+
+Not yet: voice, notifications, threads, and clicking bot buttons (interactions).
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design and roadmap.
+
+## Network
+
+nixcord contacts only these hosts:
+
+| Host | Why |
+|---|---|
+| `gateway.discord.gg`, `discord.com` | Discord gateway and API |
+| `cdn.discordapp.com`, `media.discordapp.net`, `images-ext-*.discordapp.net` | Avatars, icons, emoji, attachments, and embed images (Discord's own CDN/proxy) |
+| `cdn.jsdelivr.net` | Twemoji color emoji images, cached on disk after the first load |
+| `media.tenor.com`, `media.giphy.com` | Tenor and Giphy GIFs, which Discord sends as video. These are fetched directly, so those providers see your IP address when one is on screen. |
+
+There is no telemetry endpoint.
 
 ## Build
 
@@ -36,6 +59,13 @@ Try the UI without an account (no network at all):
 cargo run --release -- --demo
 ```
 
+Inline video playback (H.264 MP4/MOV with AAC/MP3 audio) is the default `video` feature. It
+compiles OpenH264 from source (needs a C/C++ compiler; NASM is optional and only speeds up
+decoding) and, on Linux, plays audio through ALSA (`libasound2-dev` / `alsa-lib-devel`).
+Build without it: `cargo build --release -p nixcord --no-default-features`. In demo mode,
+`NIXCORD_DEMO_VIDEO=path/to/clip.mp4` adds a message playing a local file, and
+`NIXCORD_DEMO_NET=1` one with a small public test clip.
+
 ## Logging in
 
 Paste your token on the login screen, or set `NIXCORD_TOKEN`. If you tick "remember", the
@@ -49,6 +79,7 @@ crates/nixcord-model    serde data types
 crates/nixcord-gateway  websocket gateway (identify, heartbeat, resume)
 crates/nixcord-http     REST client
 crates/nixcord-store    in-memory state, capped per channel
+crates/nixcord-video    inline video: MP4/MOV demux, OpenH264, symphonia audio, cpal
 crates/nixcord-app      the egui app (binary: nixcord)
 ```
 
@@ -60,3 +91,20 @@ must pass. Keep RAM in mind: don't cache what you don't render.
 ## License
 
 Dual-licensed under MIT ([LICENSE](LICENSE)) or Apache-2.0 ([LICENSE-APACHE](LICENSE-APACHE)), at your option.
+
+Emoji graphics: Twemoji by Twitter, Inc and other contributors, CC-BY 4.0
+(<https://creativecommons.org/licenses/by/4.0/>), loaded from the maintained fork
+[jdecked/twemoji](https://github.com/jdecked/twemoji). Emoji names, keywords and shortcodes in
+`crates/nixcord-emoji` are generated from [emojibase-data](https://emojibase.dev) (MIT).
+
+Video playback (the `video` feature) links these codec libraries:
+
+- [OpenH264](https://github.com/cisco/openh264) by Cisco (H.264 decoding), BSD-2-Clause,
+  compiled from source via the [`openh264`](https://crates.io/crates/openh264) crate
+  (BSD-2-Clause). Cisco's offer to cover the MPEG LA H.264 patent royalties applies only to
+  the prebuilt OpenH264 binaries downloaded from Cisco, so it does not cover this build;
+  H.264 patent licensing, where it applies, is up to whoever distributes the binary. Build
+  with `-p nixcord --no-default-features` to leave H.264 out.
+- [Symphonia](https://github.com/pdeljanov/Symphonia) AAC and MP3 decoders, MPL-2.0
+  (used unmodified; source at the link).
+- [cpal](https://github.com/RustAudio/cpal) (audio output), Apache-2.0.

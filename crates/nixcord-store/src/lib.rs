@@ -43,6 +43,55 @@ pub enum ConnectionState {
     Reconnecting,
 }
 
+/// One user's presences, by scope. Discord sends an *overall* presence (no `guild_id`)
+/// for friends and implicit relationships, and *per-guild* presences for guild members,
+/// friends and DM recipients. A status is account-wide, but a per-guild "offline" (or a
+/// member list row without presence) only says the user left that scope: it must not
+/// wipe an online friend's overall presence. So:
+/// - overall online: stored, it wins over (and replaces) every per-guild copy;
+/// - overall offline: the user is offline everywhere, everything is dropped;
+/// - per-guild online: stored only while there is no overall presence;
+/// - per-guild offline: drops that guild's copy only.
+///
+/// The shown presence is the overall one, else the most recently updated guild copy.
+#[derive(Debug, Default)]
+struct UserPresences {
+    overall: Option<Presence>,
+    /// Most recently updated last.
+    guilds: Vec<(Snowflake, Presence)>,
+}
+
+impl UserPresences {
+    fn shown(&self) -> Option<&Presence> {
+        self.overall
+            .as_ref()
+            .or_else(|| self.guilds.last().map(|(_, p)| p))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.overall.is_none() && self.guilds.is_empty()
+    }
+}
+
+/// What a presence did to the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresenceEffect {
+    Stored,
+    /// Offline without activities: an entry (scope) removed, or nothing to remove.
+    Removed,
+    /// A per-guild copy ignored because the overall presence is authoritative.
+    Shadowed,
+}
+
+/// Running counts of presences applied, for `NIXCORD_LOG=nixcord_store=debug`.
+#[derive(Debug, Default, Clone, Copy)]
+struct PresenceDiag {
+    updates: u64,
+    friend_updates: u64,
+    removed: u64,
+    shadowed: u64,
+}
+
 #[derive(Default)]
 pub struct Store {
     connection: ConnectionState,
@@ -67,8 +116,11 @@ pub struct Store {
     /// channel -> (user, when TYPING_START was received).
     typing: HashMap<Snowflake, Vec<(Snowflake, Instant)>>,
     users: HashMap<Snowflake, User>,
-    /// user -> latest presence. Offline users without activities are not stored.
-    presences: HashMap<Snowflake, Presence>,
+    /// user -> presences by scope (see [`UserPresences`]). Offline users without
+    /// activities are not stored.
+    presences: HashMap<Snowflake, UserPresences>,
+    /// Counters for the presence debug log.
+    presence_diag: PresenceDiag,
     /// target user -> relationship (friends, blocked, requests).
     relationships: HashMap<Snowflake, Relationship>,
     my_status: Status,
@@ -102,31 +154,40 @@ impl Store {
                 for r in &ready.relationships {
                     self.relationship_add(r);
                 }
-                for p in &ready.presences {
-                    self.set_presence(p);
-                }
+                self.apply_presence_batch("READY", &ready.presences);
                 self.my_status = ready.status.unwrap_or(Status::Online);
                 self.connection = ConnectionState::Connected;
             }
             GatewayEvent::ReadySupplemental(sup) => {
-                for p in &sup.presences {
-                    self.set_presence(p);
-                }
+                self.apply_presence_batch("READY_SUPPLEMENTAL", &sup.presences);
             }
             GatewayEvent::PresenceUpdate { presence, user } => {
                 if let Some(u) = user {
                     self.cache_user(u);
                 }
-                self.set_presence(presence);
+                self.presence_update(presence);
             }
             GatewayEvent::MemberListUpdate(u) => self.member_list_update(u),
             GatewayEvent::RelationshipAdd(r) => self.relationship_add(r),
             GatewayEvent::RelationshipRemove { user_id } => {
                 self.relationships.remove(user_id);
+                // Overall presences are only sent for relationships: the stored one
+                // would never be updated again. Per-guild ones keep flowing.
+                if let Some(e) = self.presences.get_mut(user_id) {
+                    e.overall = None;
+                    if e.is_empty() {
+                        self.presences.remove(user_id);
+                    }
+                }
             }
             GatewayEvent::OwnStatus(s) => self.my_status = *s,
             GatewayEvent::GuildMemberUpdate { guild_id, member } => {
                 self.cache_guild_member(*guild_id, member);
+            }
+            GatewayEvent::GuildEmojisUpdate { guild_id, emojis } => {
+                if let Some(g) = self.guilds.get_mut(guild_id) {
+                    g.emojis.clone_from(emojis);
+                }
             }
             GatewayEvent::Resumed => self.connection = ConnectionState::Connected,
             GatewayEvent::Disconnected { will_retry, .. } => {
@@ -140,7 +201,19 @@ impl Store {
             GatewayEvent::GuildCreate(g) => self.upsert_guild(g, true),
             GatewayEvent::GuildUpdate(g) => {
                 let replace = !g.channels.is_empty() || !self.guilds.contains_key(&g.id);
+                // A GUILD_UPDATE without `emojis` keeps the list we have.
+                let keep = g.emojis.is_empty();
+                let old = keep
+                    .then(|| {
+                        self.guilds
+                            .get_mut(&g.id)
+                            .map(|o| std::mem::take(&mut o.emojis))
+                    })
+                    .flatten();
                 self.upsert_guild(g, replace);
+                if let (Some(old), Some(new)) = (old, self.guilds.get_mut(&g.id)) {
+                    new.emojis = old;
+                }
             }
             GatewayEvent::GuildDelete { id, unavailable } => {
                 if *unavailable {
@@ -423,8 +496,9 @@ impl Store {
     }
 
     /// Latest presence of a user, if they are online or have an activity.
+    /// The overall presence when known (friends), else the latest per-guild one.
     pub fn presence(&self, user: Snowflake) -> Option<&Presence> {
-        self.presences.get(&user)
+        self.presences.get(&user)?.shown()
     }
 
     /// Status of a user (`Offline` when unknown). For myself, my own status.
@@ -435,14 +509,12 @@ impl Store {
                 s => s,
             };
         }
-        self.presences
-            .get(&user)
-            .map_or(Status::Offline, |p| p.status)
+        self.presence(user).map_or(Status::Offline, |p| p.status)
     }
 
     /// Custom status or activity line for a user.
     pub fn status_text(&self, user: Snowflake) -> Option<String> {
-        self.presences.get(&user)?.status_text()
+        self.presence(user)?.status_text()
     }
 
     /// My own status as last set / reported (may be `Invisible`).
@@ -618,21 +690,149 @@ impl Store {
             })
     }
 
-    fn set_presence(&mut self, p: &Presence) {
-        if p.status == Status::Offline && p.activities.is_empty() {
-            self.presences.remove(&p.user_id);
-            return;
-        }
-        let mut p = p.clone();
-        // Presences are kept per user; the guild a given copy came from doesn't matter.
-        p.guild_id = None;
-        match self.presences.get_mut(&p.user_id) {
-            Some(existing) if *existing == p => {}
-            Some(existing) => *existing = p,
+    fn is_friend(&self, user: Snowflake) -> bool {
+        self.relationships
+            .get(&user)
+            .is_some_and(|r| r.kind == RelationshipKind::Friend)
+    }
+
+    /// Apply one presence in `scope` (`None` = overall, `Some(guild)` = per-guild). See
+    /// [`UserPresences`] for the rules.
+    fn set_presence(&mut self, p: &Presence, scope: Option<Snowflake>) -> PresenceEffect {
+        let id = p.user_id;
+        let offline = p.status == Status::Offline && p.activities.is_empty();
+        let effect = match scope {
+            None if offline => {
+                self.presences.remove(&id);
+                PresenceEffect::Removed
+            }
             None => {
-                self.presences.insert(p.user_id, p);
+                let e = self.presences.entry(id).or_default();
+                let mut p = p.clone();
+                p.guild_id = None;
+                if e.overall.as_ref() != Some(&p) {
+                    e.overall = Some(p);
+                }
+                e.guilds = Vec::new();
+                PresenceEffect::Stored
+            }
+            Some(g) => {
+                let Some(e) = self.presences.get_mut(&id) else {
+                    if offline {
+                        return PresenceEffect::Removed;
+                    }
+                    let mut p = p.clone();
+                    p.guild_id = Some(g);
+                    self.presences.insert(
+                        id,
+                        UserPresences {
+                            overall: None,
+                            guilds: vec![(g, p)],
+                        },
+                    );
+                    return PresenceEffect::Stored;
+                };
+                e.guilds.retain(|(x, _)| *x != g);
+                let effect = if offline {
+                    PresenceEffect::Removed
+                } else if e.overall.is_some() {
+                    PresenceEffect::Shadowed
+                } else {
+                    let mut p = p.clone();
+                    p.guild_id = Some(g);
+                    e.guilds.push((g, p));
+                    PresenceEffect::Stored
+                };
+                if e.is_empty() {
+                    self.presences.remove(&id);
+                }
+                effect
+            }
+        };
+        match effect {
+            PresenceEffect::Removed => self.presence_diag.removed += 1,
+            PresenceEffect::Shadowed => self.presence_diag.shadowed += 1,
+            PresenceEffect::Stored => {}
+        }
+        effect
+    }
+
+    /// One PRESENCE_UPDATE (or a presence carried by GUILD_CREATE / PRESENCES_REPLACE).
+    fn presence_update(&mut self, p: &Presence) {
+        let before = self.status(p.user_id);
+        let effect = self.set_presence(p, p.guild_id);
+        let after = self.status(p.user_id);
+        let friend = self.is_friend(p.user_id);
+        let d = &mut self.presence_diag;
+        d.updates += 1;
+        d.friend_updates += u64::from(friend);
+        // Ids, statuses and counts only (no names, no activity text).
+        tracing::debug!(
+            user_id = %p.user_id,
+            guild_id = ?p.guild_id,
+            friend,
+            received = p.status.as_str(),
+            from = before.as_str(),
+            to = after.as_str(),
+            effect = ?effect,
+            total = d.updates,
+            friend_total = d.friend_updates,
+            removed_total = d.removed,
+            shadowed_total = d.shadowed,
+            "presence update"
+        );
+    }
+
+    /// READY / READY_SUPPLEMENTAL presences, with a summary of where friends stand.
+    fn apply_presence_batch(&mut self, event: &str, presences: &[Presence]) {
+        let (mut overall, mut guild, mut friend_overall, mut friend_guild) = (0, 0, 0, 0);
+        let (mut removed, mut shadowed) = (0, 0);
+        for p in presences {
+            let friend = self.is_friend(p.user_id);
+            match p.guild_id {
+                None => {
+                    overall += 1;
+                    friend_overall += usize::from(friend);
+                }
+                Some(_) => {
+                    guild += 1;
+                    friend_guild += usize::from(friend);
+                }
+            }
+            match self.set_presence(p, p.guild_id) {
+                PresenceEffect::Removed => removed += 1,
+                PresenceEffect::Shadowed => shadowed += 1,
+                PresenceEffect::Stored => {}
             }
         }
+        let friends: Vec<Snowflake> = self
+            .relationships
+            .values()
+            .filter(|r| r.kind == RelationshipKind::Friend)
+            .map(|r| r.id)
+            .collect();
+        let friends_shown_online = friends
+            .iter()
+            .filter(|id| self.status(**id).is_online())
+            .count();
+        let friends_overall_known = friends
+            .iter()
+            .filter(|id| self.presences.get(id).is_some_and(|e| e.overall.is_some()))
+            .count();
+        tracing::debug!(
+            event,
+            overall,
+            guild,
+            friend_overall,
+            friend_guild,
+            offline_not_stored = removed,
+            shadowed_by_overall = shadowed,
+            friends = friends.len(),
+            friends_shown_online,
+            friends_overall_known,
+            stored_users = self.presences.len(),
+            "presence batch applied"
+        );
     }
 
     fn relationship_add(&mut self, r: &Relationship) {
@@ -662,18 +862,25 @@ impl Store {
         if self.list_focus != Some(u.guild_id) {
             return;
         }
-        // Cache member data and presences carried by the items.
+        // Cache member data and presences carried by the items. List presences are
+        // per-guild (whatever their payload says), so they never override a friend's
+        // overall presence.
+        let scope = Some(u.guild_id);
         for item in member_list::op_items(&u.ops) {
             if let nixcord_model::MemberListItem::Member(m) = item {
                 self.cache_guild_member(u.guild_id, &m.member);
                 match &m.presence {
-                    Some(p) => self.set_presence(p),
-                    // A list member without a presence is offline.
+                    Some(p) => {
+                        self.set_presence(p, scope);
+                    }
+                    // A list member without a presence is offline in this guild.
                     None => {
                         if let Some(id) = m.member.id() {
-                            if !self.presence_pinned(id) {
-                                self.presences.remove(&id);
-                            }
+                            let offline = Presence {
+                                user_id: id,
+                                ..Default::default()
+                            };
+                            self.set_presence(&offline, scope);
                         }
                     }
                 }
@@ -705,8 +912,15 @@ impl Store {
         let me = self.me.as_ref().map(|u| u.id);
         let ids: Vec<Snowflake> = list.member_ids().collect();
         for id in &ids {
+            // Only this guild's copy: other scopes (and pinned users, whose per-guild
+            // presences Discord keeps sending) are untouched.
             if !self.presence_pinned(*id) {
-                self.presences.remove(id);
+                if let Some(e) = self.presences.get_mut(id) {
+                    e.guilds.retain(|(g, _)| *g != guild);
+                    if e.is_empty() {
+                        self.presences.remove(id);
+                    }
+                }
             }
             if Some(*id) != me {
                 self.members.remove(&(guild, *id));
@@ -900,6 +1114,12 @@ impl Store {
         self.guilds.remove(&id);
         self.guild_order.retain(|g| *g != id);
         self.members.retain(|&(g, _), _| g != id);
+        // Per-guild presence copies of a guild we left would never be updated again.
+        // Overall (friend) presences and other guilds' copies stay.
+        self.presences.retain(|_, e| {
+            e.guilds.retain(|(g, _)| *g != id);
+            !e.is_empty()
+        });
         for ch in self.guild_channel_ids.remove(&id).unwrap_or_default() {
             self.drop_channel_data(ch);
         }
@@ -1005,3 +1225,6 @@ fn cap(list: &mut Vec<Message>) {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod presence_tests;

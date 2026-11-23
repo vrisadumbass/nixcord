@@ -8,19 +8,19 @@
 
 use super::markdown::{self, MdClick, RenderCtx, StoreResolver};
 use super::{
-    bold, fmt_clock, fmt_day, fmt_size, fmt_stamp, hline, icon_button, id_color, member_name,
-    paint_app_badge, paint_icon, paint_search, prop, role_color, Action, Icon,
+    bold, emoji_picker, emoji_text, fmt_clock, fmt_day, fmt_size, fmt_stamp, hline, icon_button,
+    id_color, member_name, paint_app_badge, paint_icon, paint_plus, paint_search, prop, role_color,
+    Action, Icon,
 };
 use crate::app::{NixApp, RowKey, ScrollAnchor};
 use crate::media::MediaEmoji;
 use eframe::egui::{
-    self, text::LayoutJob, Align, Align2, Color32, CornerRadius, Frame, Id, Layout, Margin, Pos2,
-    Rect, RichText, Sense, Shape, Stroke, TextFormat, Ui, UiBuilder, Vec2,
+    self, Align, Align2, Color32, CornerRadius, Frame, Id, Layout, Margin, Pos2, Rect, RichText,
+    Sense, Shape, Stroke, Ui, UiBuilder, Vec2,
 };
 use nixcord_markdown::{Inline, Mention};
-use nixcord_model::{Attachment, ChannelKind, Embed, Emoji, Message, Reaction, Snowflake};
+use nixcord_model::{Attachment, ChannelKind, Embed, Message, Reaction, Snowflake};
 use nixcord_store::MAX_MESSAGES_PER_CHANNEL;
-use std::borrow::Cow;
 use std::collections::HashSet;
 
 /// Consecutive messages by the same author within this window are grouped.
@@ -32,20 +32,39 @@ const TOOLBAR_BTN: f32 = 30.0;
 /// Attachment previews and embed images fit in this box (Discord's size).
 const PREVIEW_MAX: Vec2 = Vec2::new(400.0, 300.0);
 const EMBED_MAX_W: f32 = 432.0;
-/// Quick reactions offered by the toolbar's react button.
-const QUICK_REACTIONS: [&str; 8] = [
-    "\u{1F44D}",
-    "\u{2764}\u{FE0F}",
-    "\u{1F602}",
-    "\u{1F62E}",
-    "\u{1F622}",
-    "\u{1F525}",
-    "\u{1F389}",
-    "\u{1F440}",
-];
 
 fn picker_id() -> Id {
     Id::unique("nixcord-react-picker")
+}
+
+/// The reaction picker: open for `message`, anchored at the button that opened it.
+#[derive(Clone, Copy, Debug)]
+struct ReactPicker {
+    message: Snowflake,
+    anchor: Rect,
+}
+
+fn react_picker_open(ctx: &egui::Context) -> Option<ReactPicker> {
+    ctx.data(|d| d.get_temp(picker_id()))
+}
+
+/// Open the reaction picker for `m` (or close it if it is already open for `m`).
+fn toggle_react_picker(ctx: &egui::Context, m: &Message, anchor: Rect) {
+    let open = react_picker_open(ctx).is_some_and(|p| p.message == m.id);
+    emoji_picker::reset(ctx);
+    ctx.data_mut(|d| {
+        if open {
+            d.remove::<ReactPicker>(picker_id());
+        } else {
+            d.insert_temp(
+                picker_id(),
+                ReactPicker {
+                    message: m.id,
+                    anchor,
+                },
+            );
+        }
+    });
 }
 
 // ---- header -------------------------------------------------------------------------
@@ -139,9 +158,7 @@ pub fn header(ui: &mut Ui, app: &mut NixApp, ch: Snowflake) {
                     );
                 }
             }
-            ui.add(
-                egui::Label::new(RichText::new(name).font(bold(16.0)).color(t.strong)).truncate(),
-            );
+            emoji_text::label_truncated(ui, &app.media, &name, bold(16.0), t.strong);
             if let Some(topic) = topic {
                 ui.add_space(4.0);
                 let (r, _) = ui.allocate_exact_size(Vec2::new(1.0, 24.0), Sense::hover());
@@ -283,16 +300,20 @@ fn member_row(ui: &mut Ui, app: &NixApp, m: &Message, guild: Option<Snowflake>) 
     let left = rect.left() + 52.0;
     let clip = Rect::from_min_max(Pos2::new(left, rect.top()), rect.right_bottom())
         .intersect(ui.clip_rect());
-    let g = ui.painter().layout_no_wrap(
-        member_name(&app.store, guild, u).to_string(),
+    let p = ui.painter().with_clip_rect(clip);
+    let g = emoji_text::layout(
+        &p,
+        member_name(&app.store, guild, u),
         prop(15.5),
         color,
+        f32::INFINITY,
+        0,
     );
     let w = g.size().x;
-    ui.painter().with_clip_rect(clip).galley(
+    g.paint(
+        &p,
         Pos2::new(left, rect.center().y - g.size().y / 2.0),
-        g,
-        color,
+        &app.media,
     );
     if u.bot && left + w + 40.0 < rect.right() {
         paint_app_badge(ui, Pos2::new(left + w + 5.0, rect.center().y));
@@ -458,7 +479,7 @@ pub fn messages(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<
         .filter(|p| ui.ctx().layer_id_at(*p).is_none_or(|l| l == layer));
     // While the react picker is open its message keeps the toolbar; otherwise the toolbar
     // stays with its owner while the pointer is on the toolbar itself.
-    let picker: Option<Snowflake> = ui.ctx().data(|d| d.get_temp(picker_id()));
+    let picker: Option<Snowflake> = react_picker_open(ui.ctx()).map(|p| p.message);
     let sticky_owner = picker.or_else(|| {
         app.chat
             .hover
@@ -539,7 +560,42 @@ pub fn messages(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<
             }
         }
     });
+    if app.chat.hover.map(|h| h.0) != new_owner.map(|h| h.0) {
+        // The "+" reaction pill follows the hovered message: show it this frame.
+        ui.ctx().request_repaint();
+    }
     app.chat.hover = new_owner;
+
+    // Reaction picker (from the toolbar's react button or a "+" pill).
+    if let Some(p) = react_picker_open(ui.ctx()) {
+        match msgs.iter().find(|m| m.id == p.message) {
+            Some(m) => {
+                let out = emoji_picker::show(ui.ctx(), app, p.anchor, false, actions);
+                if let Some(pick) = out.picked {
+                    let emoji = pick.reaction();
+                    let mine = m.reactions.iter().any(|r| r.me && r.emoji == emoji);
+                    let (channel, message) = (m.channel_id, m.id);
+                    actions.push(if mine {
+                        Action::Unreact {
+                            channel,
+                            message,
+                            emoji,
+                        }
+                    } else {
+                        Action::React {
+                            channel,
+                            message,
+                            emoji,
+                        }
+                    });
+                }
+                if out.close {
+                    ui.ctx().data_mut(|d| d.remove::<ReactPicker>(picker_id()));
+                }
+            }
+            None => ui.ctx().data_mut(|d| d.remove::<ReactPicker>(picker_id())),
+        }
+    }
     if !measured.is_empty() {
         // Positions below changed rows shift; lay out once more with the real heights.
         app.chat.heights.extend(measured);
@@ -603,10 +659,12 @@ fn top_row(
                 ui.painter()
                     .text(r.center(), Align2::CENTER_CENTER, "#", prop(40.0), t.strong);
                 ui.add_space(8.0);
-                ui.label(
-                    RichText::new(format!("Welcome to #{chan}!"))
-                        .font(bold(28.0))
-                        .color(t.strong),
+                emoji_text::label(
+                    ui,
+                    &app.media,
+                    &format!("Welcome to #{chan}!"),
+                    bold(28.0),
+                    t.strong,
                 );
                 ui.label(
                     RichText::new(format!("This is the start of the #{chan} channel."))
@@ -716,10 +774,12 @@ fn message_row(
         let name_color = role_color(&app.store, guild, m.author.id).unwrap_or(t.strong);
         child.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            ui.label(
-                RichText::new(member_name(&app.store, guild, &m.author))
-                    .font(bold(15.5))
-                    .color(name_color),
+            emoji_text::label(
+                ui,
+                &app.media,
+                member_name(&app.store, guild, &m.author),
+                bold(15.5),
+                name_color,
             );
             if m.author.bot {
                 let (r, _) = ui.allocate_exact_size(Vec2::new(30.0, 16.0), Sense::hover());
@@ -868,14 +928,20 @@ fn reply_preview(
     );
     x += 20.0;
     let name_color = role_color(&app.store, guild, r.author.id).unwrap_or(t.text);
-    let name = ui.painter().layout_no_wrap(
-        format!("@{}", member_name(&app.store, guild, &r.author)),
+    let name = emoji_text::layout(
+        ui.painter(),
+        &format!("@{}", member_name(&app.store, guild, &r.author)),
         bold(13.0),
         name_color,
+        f32::INFINITY,
+        0,
     );
     let nw = name.size().x;
-    ui.painter()
-        .galley(Pos2::new(x, yl - name.size().y / 2.0), name, name_color);
+    name.paint(
+        ui.painter(),
+        Pos2::new(x, yl - name.size().y / 2.0),
+        &app.media,
+    );
     x += nw + 6.0;
     let preview = if r.content.is_empty() {
         if r.attachments.is_empty() && r.embeds.is_empty() {
@@ -893,14 +959,12 @@ fn reply_preview(
             .to_string()
     };
     let max_w = (right - x).max(20.0);
-    let mut job = LayoutJob::single_section(preview, TextFormat::simple(prop(13.0), t.muted));
-    job.wrap.max_width = max_w;
-    job.wrap.max_rows = 1;
-    job.wrap.break_anywhere = true;
-    job.wrap.overflow_character = Some('…');
-    let g = ui.painter().layout_job(job);
-    ui.painter()
-        .galley(Pos2::new(x, yl - g.size().y / 2.0), g, t.muted);
+    let g = emoji_text::layout(ui.painter(), &preview, prop(13.0), t.muted, max_w, 1);
+    g.paint(
+        ui.painter(),
+        Pos2::new(x, yl - g.size().y / 2.0),
+        &app.media,
+    );
 }
 
 // ---- message content ----------------------------------------------------------------
@@ -940,6 +1004,28 @@ fn attachment(ui: &mut Ui, app: &NixApp, a: &Attachment) {
             .borrow_mut()
             .image(ui, &a.url, PREVIEW_MAX, a.width.zip(a.height))
             .on_hover_text(&a.filename);
+        return;
+    }
+    // Inline player (feature "video"); otherwise the poster below opens the browser.
+    if crate::video::attachment(ui, app, a, PREVIEW_MAX) {
+        return;
+    }
+    let video = a.content_type.as_deref().map_or_else(
+        || nixcord_media::anim_url::is_video(&a.url),
+        |ct| ct.starts_with("video/"),
+    );
+    if video && a.width.is_some() {
+        // Poster frame from Discord's media proxy; a click plays it in the browser.
+        let sep = if a.url.contains('?') { '&' } else { '?' };
+        let poster = format!("{}{sep}format=webp", a.url);
+        ui.add_space(2.0);
+        app.media.borrow_mut().video_poster(
+            ui,
+            Some(&poster),
+            &a.url,
+            PREVIEW_MAX,
+            a.width.zip(a.height),
+        );
         return;
     }
     // File card.
@@ -988,6 +1074,11 @@ fn embed_card(
     actions: &mut Vec<Action>,
 ) {
     let t = app.theme;
+    // gifv mp4s and bare video links play inline (`video::gifv_prefers_video` decides
+    // between the video player and the animated GIF / WebP below).
+    if crate::video::embed(ui, app, e, PREVIEW_MAX) {
+        return;
+    }
     // Bare image / gif links show just the media, like Discord.
     let bare = matches!(e.kind.as_deref(), Some("image" | "gifv"))
         && e.title.is_none()
@@ -995,12 +1086,26 @@ fn embed_card(
     if bare {
         if let Some(img) = e.thumbnail.as_ref().or(e.image.as_ref()) {
             ui.add_space(2.0);
-            app.media.borrow_mut().image(
-                ui,
-                embed_media_url(img),
-                PREVIEW_MAX,
-                img.width.zip(img.height),
-            );
+            let natural = img.width.zip(img.height);
+            let mut media = app.media.borrow_mut();
+            if e.kind.as_deref() == Some("gifv") {
+                // Tenor / Giphy send an mp4: play their animated WebP / GIF instead.
+                let video = e.video.as_ref().map(|v| v.url.as_str());
+                let anim = nixcord_media::anim_url::gifv_candidates(
+                    e.url.as_deref(),
+                    Some(&img.url),
+                    video,
+                );
+                if anim.is_empty() {
+                    let open = e.url.as_deref().or(video).unwrap_or(&img.url);
+                    let poster = Some(embed_media_url(img));
+                    media.video_poster(ui, poster, open, PREVIEW_MAX, natural);
+                } else {
+                    media.gifv(ui, embed_media_url(img), &anim, PREVIEW_MAX, natural);
+                }
+            } else {
+                media.image(ui, embed_media_url(img), PREVIEW_MAX, natural);
+            }
         }
         return;
     }
@@ -1028,7 +1133,15 @@ fn embed_card(
         .show(ui, |ui| {
             ui.set_max_width(card_w - 32.0);
             ui.spacing_mut().item_spacing.y = 6.0;
-            let thumb = e.thumbnail.as_ref().filter(|_| e.image.is_none());
+            // Video embeds (YouTube, ...) show a large poster with a play button instead.
+            let video = e
+                .video
+                .as_ref()
+                .filter(|_| e.kind.as_deref() == Some("video"));
+            let thumb = e
+                .thumbnail
+                .as_ref()
+                .filter(|_| e.image.is_none() && video.is_none());
             let text_w = if thumb.is_some() {
                 card_w - 32.0 - 96.0
             } else {
@@ -1050,6 +1163,22 @@ fn embed_card(
                     );
                 }
             });
+            if let (Some(v), None) = (video, &e.image) {
+                ui.add_space(4.0);
+                let max = Vec2::new(PREVIEW_MAX.x.min(card_w - 32.0), PREVIEW_MAX.y);
+                if !crate::video::embed_in_card(ui, app, e, max) {
+                    let poster = e.thumbnail.as_ref();
+                    let natural = poster.and_then(|p| p.width.zip(p.height));
+                    let open = e.url.as_deref().unwrap_or(&v.url);
+                    app.media.borrow_mut().video_poster(
+                        ui,
+                        poster.map(embed_media_url),
+                        open,
+                        max,
+                        natural.or(v.width.zip(v.height)),
+                    );
+                }
+            }
             if let Some(img) = &e.image {
                 ui.add_space(4.0);
                 let max = Vec2::new(PREVIEW_MAX.x.min(card_w - 32.0), PREVIEW_MAX.y);
@@ -1180,19 +1309,14 @@ fn embed_markdown(
 
 // ---- reactions ----------------------------------------------------------------------
 
-/// Unicode emoji without the VS16 selector (the monochrome emoji font has no glyph for it).
-fn emoji_text(s: &str) -> Cow<'_, str> {
-    if s.contains('\u{FE0F}') {
-        Cow::Owned(s.replace('\u{FE0F}', ""))
-    } else {
-        Cow::Borrowed(s)
-    }
-}
-
 fn reactions_row(ui: &mut Ui, app: &NixApp, m: &Message, actions: &mut Vec<Action>) {
     if m.reactions.is_empty() {
         return;
     }
+    let t = app.theme;
+    // The "+" pill shows while the message is hovered (or its picker is open).
+    let show_add = app.chat.hover.is_some_and(|(id, _)| id == m.id)
+        || react_picker_open(ui.ctx()).is_some_and(|p| p.message == m.id);
     ui.add_space(2.0);
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
@@ -1213,6 +1337,35 @@ fn reactions_row(ui: &mut Ui, app: &NixApp, m: &Message, actions: &mut Vec<Actio
                     }
                 });
             }
+        }
+        // Add-reaction pill (space always reserved so the row doesn't reflow on hover).
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(34.0, 26.0), Sense::click());
+        if show_add {
+            let hot = resp.hovered();
+            ui.painter().rect(
+                rect,
+                CornerRadius::same(8),
+                if hot { t.selected } else { t.hover },
+                Stroke::new(1.0, Color32::TRANSPARENT),
+                egui::StrokeKind::Inside,
+            );
+            let c = rect.center();
+            super::paint_icon(
+                ui,
+                Icon::Smile,
+                Rect::from_center_size(c - Vec2::new(2.0, 0.0), Vec2::splat(26.0)),
+                if hot { t.strong } else { t.muted },
+            );
+            paint_plus(
+                ui,
+                c + Vec2::new(8.0, -6.0),
+                6.0,
+                if hot { t.strong } else { t.muted },
+            );
+            if resp.clicked() {
+                toggle_react_picker(ui.ctx(), m, rect);
+            }
+            resp.on_hover_text("Add Reaction");
         }
     });
 }
@@ -1252,13 +1405,7 @@ fn reaction_pill(ui: &mut Ui, app: &NixApp, r: &Reaction) -> egui::Response {
                 .emoji(&mut child, id, r.emoji.animated, 18.0);
         }
         (None, Some(name)) => {
-            ui.painter().text(
-                emoji_rect.center(),
-                Align2::CENTER_CENTER,
-                emoji_text(name),
-                prop(16.0),
-                t.strong,
-            );
+            emoji_text::paint_emoji_ui(ui, emoji_rect, name, &app.media, t.strong);
         }
         (None, None) => {}
     }
@@ -1272,7 +1419,10 @@ fn reaction_pill(ui: &mut Ui, app: &NixApp, r: &Reaction) -> egui::Response {
     );
     let tip = match &r.emoji.name {
         Some(n) if r.emoji.id.is_some() => format!(":{n}:"),
-        Some(n) => n.clone(),
+        Some(n) => match nixcord_emoji::find(n) {
+            Some(e) => format!(":{}:", e.shortcode()),
+            None => n.clone(),
+        },
         None => String::new(),
     };
     resp.on_hover_text(tip)
@@ -1333,27 +1483,14 @@ fn toolbar(
     child.add_space(4.0);
     child.spacing_mut().item_spacing.x = 0.0;
     let shift = child.input(|i| i.modifiers.shift);
-    let mut react_btn = None;
     for (icon, tip, what) in buttons {
         let resp = icon_button(&mut child, t, icon, TOOLBAR_BTN, tip);
         if what == Tool::Delete && resp.hovered() {
             paint_icon(&child, icon, resp.rect, t.danger);
         }
-        if what == Tool::React {
-            react_btn = Some(resp.rect);
-        }
         if resp.clicked() {
             match what {
-                Tool::React => {
-                    let open: Option<Snowflake> = ui.ctx().data(|d| d.get_temp(picker_id()));
-                    ui.ctx().data_mut(|d| {
-                        if open == Some(m.id) {
-                            d.remove::<Snowflake>(picker_id());
-                        } else {
-                            d.insert_temp(picker_id(), m.id);
-                        }
-                    });
-                }
+                Tool::React => toggle_react_picker(ui.ctx(), m, resp.rect),
                 Tool::Edit => actions.push(Action::StartEdit {
                     message: m.id,
                     content: m.content.clone(),
@@ -1371,103 +1508,7 @@ fn toolbar(
             }
         }
     }
-    let mut covered = rect.union(row);
-    let open: Option<Snowflake> = ui.ctx().data(|d| d.get_temp(picker_id()));
-    if open == Some(m.id) {
-        if let Some(anchor) = react_btn {
-            covered = covered.union(react_picker(ui, app, m, anchor, actions));
-        }
-    }
-    covered
-}
-
-/// Small popup of common emoji under the toolbar's react button.
-fn react_picker(
-    ui: &mut Ui,
-    app: &NixApp,
-    m: &Message,
-    anchor: Rect,
-    actions: &mut Vec<Action>,
-) -> Rect {
-    let t = app.theme;
-    let ctx = ui.ctx().clone();
-    let area = egui::Area::new(Id::unique(("react-picker", m.id.0)))
-        .order(egui::Order::Foreground)
-        .fixed_pos(Pos2::new(
-            anchor.right() - 8.0 * 36.0 - 12.0,
-            anchor.bottom() + 6.0,
-        ))
-        .show(&ctx, |ui| {
-            Frame::new()
-                .fill(t.elevated.to_opaque())
-                .stroke(Stroke::new(1.0, t.divider))
-                .corner_radius(CornerRadius::same(8))
-                .inner_margin(Margin::same(6))
-                .shadow(egui::Shadow {
-                    offset: [0, 4],
-                    blur: 12,
-                    spread: 0,
-                    color: Color32::from_black_alpha(90),
-                })
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 0.0;
-                        for e in QUICK_REACTIONS {
-                            let (r, resp) =
-                                ui.allocate_exact_size(Vec2::splat(36.0), Sense::click());
-                            if resp.hovered() {
-                                ui.painter().rect_filled(r, CornerRadius::same(6), t.hover);
-                            }
-                            ui.painter().text(
-                                r.center(),
-                                Align2::CENTER_CENTER,
-                                emoji_text(e),
-                                prop(22.0),
-                                t.strong,
-                            );
-                            if resp.clicked() {
-                                let mine = m.reactions.iter().any(|x| {
-                                    x.me && x.emoji.id.is_none()
-                                        && x.emoji.name.as_deref() == Some(e)
-                                });
-                                let emoji = Emoji {
-                                    id: None,
-                                    name: Some(e.to_string()),
-                                    animated: false,
-                                };
-                                let (channel, message) = (m.channel_id, m.id);
-                                actions.push(if mine {
-                                    Action::Unreact {
-                                        channel,
-                                        message,
-                                        emoji,
-                                    }
-                                } else {
-                                    Action::React {
-                                        channel,
-                                        message,
-                                        emoji,
-                                    }
-                                });
-                                ui.ctx().data_mut(|d| d.remove::<Snowflake>(picker_id()));
-                            }
-                        }
-                    });
-                });
-        });
-    let rect = area.response.rect;
-    // Click anywhere else (or Escape) closes it.
-    let close = ctx.input(|i| {
-        i.key_pressed(egui::Key::Escape)
-            || (i.pointer.any_pressed()
-                && i.pointer
-                    .interact_pos()
-                    .is_some_and(|p| !rect.contains(p) && !anchor.contains(p)))
-    });
-    if close {
-        ctx.data_mut(|d| d.remove::<Snowflake>(picker_id()));
-    }
-    rect
+    rect.union(row)
 }
 
 // ---- delete confirmation ------------------------------------------------------------

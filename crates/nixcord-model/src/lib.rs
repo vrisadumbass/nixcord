@@ -303,6 +303,47 @@ pub struct Guild {
     /// its member cache and does not keep them on the guild.
     #[serde(default, deserialize_with = "de_lenient_vec")]
     pub members: Vec<GuildMember>,
+    /// The server's custom emoji (READY / GUILD_CREATE `emojis`, replaced by
+    /// GUILD_EMOJIS_UPDATE). Entries without a name are dropped.
+    #[serde(default, deserialize_with = "de_lenient_vec")]
+    pub emojis: Vec<CustomEmoji>,
+}
+
+/// A guild's custom emoji. Shown in the picker and used by autocomplete; sent as
+/// `<:name:id>` / `<a:name:id>`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CustomEmoji {
+    pub id: Snowflake,
+    pub name: String,
+    #[serde(default)]
+    pub animated: bool,
+    /// `false` when the emoji is locked (e.g. the server lost the boost level for it).
+    #[serde(default = "yes")]
+    pub available: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl CustomEmoji {
+    /// Message markup: `<:name:id>` or `<a:name:id>`.
+    pub fn markup(&self) -> String {
+        format!(
+            "<{}:{}:{}>",
+            if self.animated { "a" } else { "" },
+            self.name,
+            self.id
+        )
+    }
+
+    pub fn as_emoji(&self) -> Emoji {
+        Emoji {
+            id: Some(self.id),
+            name: Some(self.name.clone()),
+            animated: self.animated,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -412,6 +453,9 @@ pub struct Embed {
     pub thumbnail: Option<EmbedMedia>,
     #[serde(default)]
     pub image: Option<EmbedMedia>,
+    /// Video of "video" / "gifv" embeds (mp4; for gifv we play an animated image instead).
+    #[serde(default)]
+    pub video: Option<EmbedMedia>,
     #[serde(default)]
     pub provider: Option<EmbedAuthor>,
 }
@@ -518,15 +562,25 @@ pub enum Status {
 }
 
 impl Status {
-    /// Unknown strings (including "unknown") map to `Offline`.
+    /// Unknown strings (including "unknown") map to `Offline`. Case and surrounding
+    /// whitespace are ignored.
     pub fn parse(s: &str) -> Self {
-        match s {
-            "online" => Self::Online,
-            "idle" => Self::Idle,
-            "dnd" => Self::Dnd,
-            "invisible" => Self::Invisible,
-            _ => Self::Offline,
-        }
+        Self::parse_known(s).unwrap_or(Self::Offline)
+    }
+
+    /// Like [`Status::parse`], but `None` for anything that is not a known status
+    /// ("unknown", garbage). "offline" is known.
+    pub fn parse_known(s: &str) -> Option<Self> {
+        let s = s.trim();
+        [
+            Self::Online,
+            Self::Idle,
+            Self::Dnd,
+            Self::Offline,
+            Self::Invisible,
+        ]
+        .into_iter()
+        .find(|k| s.eq_ignore_ascii_case(k.as_str()))
     }
 
     pub fn as_str(self) -> &'static str {
@@ -688,6 +742,9 @@ pub struct ClientStatus {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Presence {
     pub user_id: Snowflake,
+    /// The presence's scope: `None` is the overall user presence (sent for friends and
+    /// implicit relationships), `Some` a per-guild presence. A per-guild "offline" only
+    /// means the user left that scope, not that they are offline everywhere.
     #[serde(default)]
     pub guild_id: Option<Snowflake>,
     #[serde(default)]
@@ -841,8 +898,8 @@ pub struct MemberListUpdate {
     pub ops: Vec<MemberListOp>,
 }
 
-/// READY_SUPPLEMENTAL, flattened: every presence from `merged_presences` (friends and
-/// per-guild).
+/// READY_SUPPLEMENTAL, flattened: every presence from `merged_presences`. Friend
+/// presences (overall) have `guild_id: None`; per-guild ones carry their guild id.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ReadySupplemental {
     pub presences: Vec<Presence>,
@@ -934,6 +991,11 @@ pub enum GatewayEvent {
         guild_id: Snowflake,
         member: Box<GuildMember>,
     },
+    /// GUILD_EMOJIS_UPDATE: the guild's full custom emoji list.
+    GuildEmojisUpdate {
+        guild_id: Snowflake,
+        emojis: Vec<CustomEmoji>,
+    },
 }
 
 /// Discord CDN URL helpers. `size` should be a power of two (16..=4096).
@@ -1011,6 +1073,10 @@ mod tests {
     fn status_and_activity_labels() {
         assert_eq!(Status::parse("dnd"), Status::Dnd);
         assert_eq!(Status::parse("unknown"), Status::Offline);
+        assert_eq!(Status::parse(" Online "), Status::Online);
+        assert_eq!(Status::parse("DND"), Status::Dnd);
+        assert_eq!(Status::parse_known("unknown"), None);
+        assert_eq!(Status::parse_known("offline"), Some(Status::Offline));
         let s: Status = serde_json::from_str("42").unwrap();
         assert_eq!(s, Status::Offline);
         let a: Activity = serde_json::from_str(r#"{"type":0,"name":"Factorio"}"#).unwrap();

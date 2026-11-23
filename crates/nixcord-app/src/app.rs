@@ -29,6 +29,13 @@ pub struct Prefs {
     pub clock_24h: bool,
     /// `None` = automatic (shown when the window is wide enough).
     pub show_members: Option<bool>,
+    /// Emoji skin tone: 0 = default, 1..=5 light to dark.
+    pub skin_tone: u8,
+    /// Emoji picks, most used first: (unicode emoji or `<:name:id>`, count). The picker's
+    /// "Frequently Used" shows the top 27.
+    pub emoji_usage: Vec<(String, u32)>,
+    /// Play GIFs / animated images inline; when off they play on hover.
+    pub autoplay_gifs: bool,
 }
 
 impl Default for Prefs {
@@ -38,6 +45,9 @@ impl Default for Prefs {
             zoom: 1.0,
             clock_24h: false,
             show_members: None,
+            skin_tone: 0,
+            emoji_usage: Vec::new(),
+            autoplay_gifs: true,
         }
     }
 }
@@ -65,6 +75,11 @@ pub struct ComposerState {
     pub want_focus: bool,
     /// Put the cursor at the end of the text on the next frame (after starting an edit).
     pub cursor_to_end: bool,
+    /// The emoji picker is open, anchored at this button rect.
+    pub picker: Option<Rect>,
+    /// Emoji autocomplete: selected row, and the query the user dismissed with Escape.
+    pub ac_selected: usize,
+    pub ac_dismissed: Option<String>,
 }
 
 /// Key for the virtualized chat list's row-height cache.
@@ -438,6 +453,8 @@ impl NixApp {
             Action::Copy(text) => ctx.copy_text(text),
             Action::Typing(channel) => self.send(Command::Typing { channel }),
             Action::OpenSettings => self.settings_open = true,
+            Action::EmojiUsed(key) => ui::emoji_picker::count_use(&mut self.prefs.emoji_usage, key),
+            Action::SetSkinTone(tone) => self.prefs.skin_tone = tone.min(5),
             Action::Toast(msg) => self.toast(msg),
         }
     }
@@ -697,6 +714,9 @@ impl eframe::App for NixApp {
         }
 
         theme::paint_background(&ctx, self.theme);
+        self.media
+            .borrow_mut()
+            .set_autoplay(self.prefs.autoplay_gifs);
 
         let mut actions = Vec::new();
         match self.screen {

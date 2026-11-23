@@ -1,8 +1,8 @@
 //! Guild rail, channel column (guild channels or DM list) and the user panel.
 
 use super::{
-    bold, icon_button, initials, paint_chevron, paint_plus, paint_search, paint_status_dot, prop,
-    Action, Icon,
+    bold, emoji_text, icon_button, initials, paint_chevron, paint_plus, paint_search,
+    paint_status_dot, prop, Action, Icon,
 };
 use crate::app::NixApp;
 use eframe::egui::{
@@ -179,12 +179,13 @@ pub fn column(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
             if resp.hovered() {
                 ui.painter().rect_filled(header_rect, 0.0, t.hover);
             }
-            let galley = ui.painter().layout_no_wrap(name, bold(15.5), t.strong);
+            let p = ui.painter().with_clip_rect(inner);
+            let galley = emoji_text::layout(&p, &name, bold(15.5), t.strong, f32::INFINITY, 0);
             let w = galley.size().x.min(inner.width() - 24.0);
-            ui.painter().with_clip_rect(inner).galley(
+            galley.paint(
+                &p,
                 Pos2::new(inner.left(), inner.center().y - galley.size().y / 2.0),
-                galley,
-                t.strong,
+                &app.media,
             );
             paint_chevron(
                 ui,
@@ -253,10 +254,11 @@ fn guild_channels(ui: &mut Ui, app: &NixApp, gid: Snowflake, actions: &mut Vec<A
                 ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::click());
             let color = if resp.hovered() { t.text } else { t.muted };
             let label = ch.label();
-            let galley = ui.painter().layout_no_wrap(label, prop(14.0), color);
+            let galley =
+                emoji_text::layout(ui.painter(), &label, prop(14.0), color, f32::INFINITY, 0);
             let text_pos = Pos2::new(rect.left() + 8.0, rect.center().y - galley.size().y / 2.0);
             let chev_x = text_pos.x + galley.size().x + 9.0;
-            ui.painter().galley(text_pos, galley, color);
+            galley.paint(ui.painter(), text_pos, &app.media);
             paint_chevron(
                 ui,
                 Pos2::new(chev_x, rect.center().y),
@@ -334,17 +336,18 @@ fn channel_row(ui: &mut Ui, app: &NixApp, ch: &Channel, actions: &mut Vec<Action
         Pos2::new(rect.left() + 34.0, rect.top()),
         Pos2::new(rect.right() - 8.0, rect.bottom()),
     );
-    let galley = ui.painter().layout_no_wrap(ch.label(), name_font, color);
-    ui.painter()
-        .with_clip_rect(text_rect.intersect(ui.clip_rect()))
-        .galley(
-            Pos2::new(
-                text_rect.left(),
-                text_rect.center().y - galley.size().y / 2.0,
-            ),
-            galley,
-            color,
-        );
+    let p = ui
+        .painter()
+        .with_clip_rect(text_rect.intersect(ui.clip_rect()));
+    let galley = emoji_text::layout(&p, &ch.label(), name_font, color, f32::INFINITY, 0);
+    galley.paint(
+        &p,
+        Pos2::new(
+            text_rect.left(),
+            text_rect.center().y - galley.size().y / 2.0,
+        ),
+        &app.media,
+    );
     if resp.clicked() && textual {
         actions.push(Action::SelectChannel(ch.id));
     }
@@ -429,7 +432,8 @@ fn dm_list(ui: &mut Ui, app: &NixApp, actions: &mut Vec<Action>) {
         )
         .intersect(ui.clip_rect());
         let name_font = if unread { bold(15.5) } else { prop(15.5) };
-        let name = ui.painter().layout_no_wrap(label, name_font, color);
+        let p = ui.painter().with_clip_rect(clip);
+        let name = emoji_text::layout(&p, &label, name_font, color, f32::INFINITY, 0);
         // Second line: member count for groups, custom status / activity for DMs.
         let sub_text = match (ch.kind, other) {
             (ChannelKind::GroupDm, _) => Some(format!("{} Members", ch.recipients.len() + 1)),
@@ -437,17 +441,16 @@ fn dm_list(ui: &mut Ui, app: &NixApp, actions: &mut Vec<Action>) {
             _ => None,
         };
         if let Some(sub_text) = sub_text {
-            let sub = ui.painter().layout_no_wrap(sub_text, prop(12.0), t.muted);
+            let sub = emoji_text::layout(&p, &sub_text, prop(12.0), t.muted, f32::INFINITY, 0);
             let top = rect.center().y - (name.size().y + sub.size().y) / 2.0;
-            let p = ui.painter().with_clip_rect(clip);
             let name_h = name.size().y;
-            p.galley(Pos2::new(text_left, top), name, color);
-            p.galley(Pos2::new(text_left, top + name_h), sub, t.muted);
+            name.paint(&p, Pos2::new(text_left, top), &app.media);
+            sub.paint(&p, Pos2::new(text_left, top + name_h), &app.media);
         } else {
-            ui.painter().with_clip_rect(clip).galley(
+            name.paint(
+                &p,
                 Pos2::new(text_left, rect.center().y - name.size().y / 2.0),
-                name,
-                color,
+                &app.media,
             );
         }
         if resp.clicked() {
@@ -546,17 +549,20 @@ fn user_panel(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
             let left = area.left() + 44.0;
             let clip = Rect::from_min_max(Pos2::new(left, area.top()), area.right_bottom())
                 .intersect(ui.clip_rect());
-            let name =
-                ui.painter()
-                    .layout_no_wrap(me.display_name().to_string(), bold(14.0), t.strong);
-            let sub = ui
-                .painter()
-                .layout_no_wrap(status.to_string(), prop(12.0), t.muted);
+            let p = ui.painter().with_clip_rect(clip);
+            let name = emoji_text::layout(
+                &p,
+                me.display_name(),
+                bold(14.0),
+                t.strong,
+                f32::INFINITY,
+                0,
+            );
+            let sub = emoji_text::layout(&p, status, prop(12.0), t.muted, f32::INFINITY, 0);
             let name_h = name.size().y;
             let top = area.center().y - (name_h + sub.size().y) / 2.0;
-            let p = ui.painter().with_clip_rect(clip);
-            p.galley(Pos2::new(left, top), name, t.strong);
-            p.galley(Pos2::new(left, top + name_h), sub, t.muted);
+            name.paint(&p, Pos2::new(left, top), &app.media);
+            sub.paint(&p, Pos2::new(left, top + name_h), &app.media);
             if dot.is_some() {
                 super::presence::status_menu(&resp, app);
             }

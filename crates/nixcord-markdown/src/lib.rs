@@ -266,7 +266,8 @@ impl Document {
         hit
     }
 
-    /// Only custom emoji (and whitespace), at most 30 of them: Discord shows these large.
+    /// Only emoji (custom or unicode) and whitespace, at most 30 of them: Discord shows
+    /// these large.
     pub fn is_emoji_only(&self) -> bool {
         let [Block::Paragraph(inl)] = self.blocks.as_slice() else {
             return false;
@@ -275,7 +276,10 @@ impl Document {
         for i in inl {
             match i {
                 Inline::CustomEmoji { .. } => n += 1,
-                Inline::Text(t) if t.trim().is_empty() => {}
+                Inline::Text(t) => match nixcord_emoji::count_emoji_only(t) {
+                    Some(k) => n += k,
+                    None => return false,
+                },
                 _ => return false,
             }
         }

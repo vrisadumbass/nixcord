@@ -467,6 +467,10 @@ fn media_cell(
         return;
     }
     if media.is_video() {
+        // Inline player (feature "video"); otherwise a placeholder that opens the browser.
+        if crate::video::gallery_cell(ui, cx.app, rect, media) {
+            return;
+        }
         ui.painter()
             .rect_filled(rect, CornerRadius::same(radius), faint);
         let c = rect.center();

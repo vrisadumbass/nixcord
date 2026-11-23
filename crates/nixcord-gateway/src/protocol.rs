@@ -268,8 +268,18 @@ pub fn decode_dispatch(t: &str, d: &str) -> Result<Option<GatewayEvent>, JsonErr
         }
         "PRESENCE_UPDATE" => {
             let v: Value = serde_json::from_str(d)?;
-            let presence = presence_from_value(&v, None)
-                .ok_or_else(|| JsonError::custom("presence without user id"))?;
+            let Some(presence) = presence_from_value(&v, None) else {
+                tracing::debug!(reason = "no user id", "PRESENCE_UPDATE dropped");
+                return Err(JsonError::custom("presence without user id"));
+            };
+            // Counts / ids only: never names or activity text.
+            tracing::debug!(
+                user_id = %presence.user_id,
+                guild_id = ?presence.guild_id,
+                status = presence.status.as_str(),
+                activities = presence.activities.len(),
+                "PRESENCE_UPDATE"
+            );
             // The user object may be very partial; only refresh the cache from a full one.
             let user = v
                 .get("user")
@@ -286,9 +296,20 @@ pub fn decode_dispatch(t: &str, d: &str) -> Result<Option<GatewayEvent>, JsonErr
         }
         "READY_SUPPLEMENTAL" => {
             let v: Value = serde_json::from_str(d)?;
-            GatewayEvent::ReadySupplemental(Box::new(ReadySupplemental {
-                presences: merged_presences(&v, &[]),
-            }))
+            // `merged_presences.guilds` is parallel to this event's own `guilds` array
+            // (supplemental guilds always carry `id`, even when unavailable).
+            let guild_ids: Vec<Option<Snowflake>> = v
+                .get("guilds")
+                .and_then(Value::as_array)
+                .map(|gs| gs.iter().map(|g| g.get("id").and_then(snowflake)).collect())
+                .unwrap_or_default();
+            let mut counts = PresenceCounts::default();
+            let presences = v
+                .get("merged_presences")
+                .map(|mp| merged_presences(mp, &guild_ids, &mut counts))
+                .unwrap_or_default();
+            counts.log("READY_SUPPLEMENTAL");
+            GatewayEvent::ReadySupplemental(Box::new(ReadySupplemental { presences }))
         }
         "RELATIONSHIP_ADD" => {
             GatewayEvent::RelationshipAdd(Box::new(serde_json::from_str::<Relationship>(d)?))
@@ -321,6 +342,24 @@ pub fn decode_dispatch(t: &str, d: &str) -> Result<Option<GatewayEvent>, JsonErr
             GatewayEvent::GuildMemberUpdate {
                 guild_id: g.guild_id,
                 member: Box::new(member),
+            }
+        }
+        // `{ guild_id, emojis: [emoji] }`: the full list. Odd entries are skipped.
+        "GUILD_EMOJIS_UPDATE" => {
+            #[derive(Deserialize)]
+            struct EmojisUpdate {
+                guild_id: Snowflake,
+                #[serde(default)]
+                emojis: Vec<Value>,
+            }
+            let u: EmojisUpdate = serde_json::from_str(d)?;
+            GatewayEvent::GuildEmojisUpdate {
+                guild_id: u.guild_id,
+                emojis: u
+                    .emojis
+                    .into_iter()
+                    .filter_map(|v| serde_json::from_value::<nixcord_model::CustomEmoji>(v).ok())
+                    .collect(),
             }
         }
         _ => return Ok(None),
@@ -385,21 +424,26 @@ pub fn decode_ready(d: &str) -> Result<Ready, JsonError> {
     }
 
     /// Presence / relationship / settings parts of READY, decoded separately and
-    /// leniently so they can never break the essential decode above.
+    /// leniently so they can never break the essential decode above. Every field is a
+    /// raw `Value`, so a `null` or an unexpected type in one of them cannot take the
+    /// others (friend presences in particular) down with it.
     #[derive(Deserialize, Default)]
     struct Extras {
         #[serde(default)]
-        presences: Vec<Value>,
+        presences: Value,
         #[serde(default)]
         merged_presences: Option<Value>,
         #[serde(default)]
-        merged_members: Vec<Value>,
+        merged_members: Value,
         #[serde(default)]
-        relationships: Vec<Value>,
+        relationships: Value,
         #[serde(default)]
         user_settings: Option<Value>,
         #[serde(default)]
         sessions: Option<Value>,
+    }
+    fn array(v: &Value) -> &[Value] {
+        v.as_array().map_or(&[], Vec::as_slice)
     }
 
     let raw: RawReady<'_> = serde_json::from_str(d)?;
@@ -417,12 +461,15 @@ pub fn decode_ready(d: &str) -> Result<Ready, JsonError> {
     let mut guild_ids = Vec::with_capacity(raw.guilds.len());
     let mut guilds = Vec::with_capacity(raw.guilds.len());
     let mut presences = Vec::new();
+    let mut counts = PresenceCounts::default();
     for (i, g) in raw.guilds.iter().enumerate() {
         let mut guild = match decode_guild(g.get()) {
             Ok(g) => g,
             Err(e) => {
                 tracing::warn!(error = %e, "skipping undecodable guild in READY");
                 guild_ids.push(None);
+                // Its per-guild presences have no usable scope; count them as dropped.
+                counts.dropped_unknown_guild += guild_presences(g.get()).len();
                 continue;
             }
         };
@@ -432,32 +479,24 @@ pub fn decode_ready(d: &str) -> Result<Ready, JsonError> {
                 .members
                 .extend(list.iter().filter_map(|m| GuildMember::deserialize(m).ok()));
         }
-        #[derive(Deserialize)]
-        struct GuildPresences {
-            #[serde(default)]
-            presences: Vec<Value>,
-        }
-        if let Ok(gp) = serde_json::from_str::<GuildPresences>(g.get()) {
-            presences.extend(
-                gp.presences
-                    .iter()
-                    .filter_map(|p| presence_from_value(p, Some(guild.id))),
-            );
-        }
+        // Without capabilities: friends' and DM recipients' per-guild presences.
+        let gp = guild_presences(g.get());
+        let (kept, dropped) = collect_presences(&gp, Some(guild.id), &mut presences);
+        counts.guild += kept;
+        counts.dropped_no_user += dropped;
         guilds.push(guild);
     }
-    presences.extend(
-        extras
-            .presences
-            .iter()
-            .filter_map(|p| presence_from_value(p, None)),
-    );
+    // Without capabilities: the overall presences of non-offline friends.
+    let (kept, dropped) = collect_presences(array(&extras.presences), None, &mut presences);
+    counts.overall += kept;
+    counts.dropped_no_user += dropped;
+    // With DEDUPE_USER_OBJECTS (and without PRIORITIZED_READY_PAYLOAD).
     if let Some(mp) = &extras.merged_presences {
-        presences.extend(merged_presences_inner(mp, &guild_ids));
+        presences.extend(merged_presences(mp, &guild_ids, &mut counts));
     }
+    counts.log("READY");
 
-    let relationships = extras
-        .relationships
+    let relationships = array(&extras.relationships)
         .iter()
         .filter_map(|r| {
             let mut rel = Relationship::deserialize(r).ok()?;
@@ -524,10 +563,7 @@ pub fn presence_from_value(v: &Value, guild_id: Option<Snowflake>) -> Option<Pre
         .and_then(|u| u.get("id"))
         .or_else(|| v.get("user_id"))
         .and_then(snowflake)?;
-    let status = v
-        .get("status")
-        .and_then(Value::as_str)
-        .map_or(Status::Offline, Status::parse);
+    let status = effective_status(v);
     let activities = v
         .get("activities")
         .and_then(Value::as_array)
@@ -550,27 +586,171 @@ pub fn presence_from_value(v: &Value, guild_id: Option<Snowflake>) -> Option<Pre
     })
 }
 
-/// `merged_presences` of READY / READY_SUPPLEMENTAL:
-/// `{"friends":[presence...],"guilds":[[presence...], ...]}`, `guilds` parallel to READY's
-/// `guilds` array (ids unknown in READY_SUPPLEMENTAL, so `guild_ids` may be empty).
-fn merged_presences(v: &Value, guild_ids: &[Option<Snowflake>]) -> Vec<Presence> {
-    v.get("merged_presences")
-        .map(|mp| merged_presences_inner(mp, guild_ids))
-        .unwrap_or_default()
+/// The status of a presence object: `status` (any case), unless it is missing, unknown
+/// or offline while `client_status` shows an active session (e.g. a user online on
+/// mobile only, whose payload lacks a usable `status`). Platforms of offline / invisible
+/// users are absent from `client_status`, so invisible users stay offline. Among
+/// platforms, dnd > online > idle (idle is per-session AFK; the account status wins).
+fn effective_status(v: &Value) -> Status {
+    let top = v
+        .get("status")
+        .and_then(Value::as_str)
+        .and_then(Status::parse_known)
+        .unwrap_or(Status::Offline);
+    if top.is_online() {
+        return top;
+    }
+    let rank = |s: &Status| match s {
+        Status::Dnd => 3,
+        Status::Online => 2,
+        Status::Idle => 1,
+        _ => 0,
+    };
+    v.get("client_status")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|o| o.values())
+        .filter_map(Value::as_str)
+        .map(Status::parse)
+        .filter(|s| s.is_online())
+        .max_by_key(rank)
+        .unwrap_or(top)
 }
 
-fn merged_presences_inner(mp: &Value, guild_ids: &[Option<Snowflake>]) -> Vec<Presence> {
+/// Where the presences of one READY / READY_SUPPLEMENTAL came from, for the debug log
+/// (`NIXCORD_LOG=nixcord_gateway=debug`). Counts only.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PresenceCounts {
+    /// Top-level `presences` (overall presences of friends / implicit relationships).
+    pub overall: usize,
+    /// `guilds[].presences` (per-guild).
+    pub guild: usize,
+    /// `merged_presences.friends` (overall).
+    pub merged_friends: usize,
+    /// `merged_presences.guilds` (per-guild).
+    pub merged_guild: usize,
+    /// Entries without any user id.
+    pub dropped_no_user: usize,
+    /// Per-guild entries whose guild could not be identified (a per-guild presence must
+    /// never be mistaken for an overall one).
+    pub dropped_unknown_guild: usize,
+}
+
+impl PresenceCounts {
+    fn log(&self, event: &str) {
+        tracing::debug!(
+            event,
+            overall = self.overall,
+            guild = self.guild,
+            merged_friends = self.merged_friends,
+            merged_guild = self.merged_guild,
+            dropped_no_user = self.dropped_no_user,
+            dropped_unknown_guild = self.dropped_unknown_guild,
+            "presences decoded"
+        );
+    }
+}
+
+/// A guild's inline `presences` array (READY / GUILD_CREATE gateway guild objects).
+fn guild_presences(guild: &str) -> Vec<Value> {
+    #[derive(Deserialize)]
+    struct GuildPresences {
+        #[serde(default)]
+        presences: Value,
+    }
+    match serde_json::from_str::<GuildPresences>(guild) {
+        Ok(GuildPresences {
+            presences: Value::Array(list),
+        }) => list,
+        _ => Vec::new(),
+    }
+}
+
+/// Decode a presence list into `out`. Returns (kept, dropped for lack of a user id).
+fn collect_presences(
+    list: &[Value],
+    guild_id: Option<Snowflake>,
+    out: &mut Vec<Presence>,
+) -> (usize, usize) {
+    let before = out.len();
+    out.extend(list.iter().filter_map(|p| presence_from_value(p, guild_id)));
+    let kept = out.len() - before;
+    (kept, list.len() - kept)
+}
+
+/// `merged_presences` of READY / READY_SUPPLEMENTAL:
+/// `{"friends":[presence...],"guilds":[[presence...], ...]}`, `guilds` parallel to the
+/// event's `guilds` array, whose ids are given in `guild_ids`. Entries use `user_id`
+/// (deduplicated) or `user`.
+fn merged_presences(
+    mp: &Value,
+    guild_ids: &[Option<Snowflake>],
+    counts: &mut PresenceCounts,
+) -> Vec<Presence> {
     let mut out = Vec::new();
     if let Some(friends) = mp.get("friends").and_then(Value::as_array) {
-        out.extend(friends.iter().filter_map(|p| presence_from_value(p, None)));
+        // Overall presences: a stray guild_id inside an entry must not re-scope them.
+        let before = out.len();
+        out.extend(
+            friends
+                .iter()
+                .filter_map(|p| presence_from_value(p, None))
+                .map(|mut p| {
+                    p.guild_id = None;
+                    p
+                }),
+        );
+        counts.merged_friends += out.len() - before;
+        counts.dropped_no_user += friends.len() - (out.len() - before);
     }
     if let Some(guilds) = mp.get("guilds").and_then(Value::as_array) {
         for (i, list) in guilds.iter().enumerate() {
-            let gid = guild_ids.get(i).copied().flatten();
-            if let Some(list) = list.as_array() {
-                out.extend(list.iter().filter_map(|p| presence_from_value(p, gid)));
+            let list = list.as_array().map_or(&[][..], Vec::as_slice);
+            match guild_ids.get(i).copied().flatten() {
+                Some(gid) => {
+                    let (kept, dropped) = collect_presences(list, Some(gid), &mut out);
+                    counts.merged_guild += kept;
+                    counts.dropped_no_user += dropped;
+                }
+                None => counts.dropped_unknown_guild += list.len(),
             }
         }
+    }
+    out
+}
+
+/// Presences carried by events other than PRESENCE_UPDATE, to be applied as presence
+/// updates after the event itself:
+/// - GUILD_CREATE (a guild that was unavailable in READY, or newly joined): its inline
+///   `presences`, scoped to the guild.
+/// - PRESENCES_REPLACE (not documented by Userdoccers; handled by discord.py-self's
+///   `parse_presences_replace`): an array of presence objects.
+pub fn dispatch_presences(t: &str, d: &str) -> Vec<Presence> {
+    let mut out = Vec::new();
+    match t {
+        "GUILD_CREATE" => {
+            #[derive(Deserialize)]
+            struct Id {
+                id: Snowflake,
+            }
+            let Ok(Id { id }) = serde_json::from_str::<Id>(d) else {
+                return out;
+            };
+            let list = guild_presences(d);
+            let (kept, dropped) = collect_presences(&list, Some(id), &mut out);
+            if !list.is_empty() {
+                tracing::debug!(guild_id = %id, kept, dropped_no_user = dropped, "GUILD_CREATE presences");
+            }
+        }
+        "PRESENCES_REPLACE" => {
+            let list = match serde_json::from_str::<Value>(d) {
+                Ok(Value::Array(list)) => list,
+                _ => return out,
+            };
+            let (kept, dropped) = collect_presences(&list, None, &mut out);
+            tracing::debug!(kept, dropped_no_user = dropped, "PRESENCES_REPLACE");
+        }
+        _ => {}
     }
     out
 }
@@ -1115,11 +1295,15 @@ mod tests {
         );
         assert_eq!(decode_dispatch("SESSIONS_REPLACE", "[]").unwrap(), None);
         let sup = r#"{"merged_presences":{"friends":[{"user_id":"5","status":"online"}],
-            "guilds":[[{"user_id":"6","status":"idle"}],[]]},"guilds":[]}"#;
+            "guilds":[[{"user_id":"6","status":"idle"}],[]]},"guilds":[{"id":"70"},{"id":"71"}]}"#;
         match decode_dispatch("READY_SUPPLEMENTAL", sup).unwrap().unwrap() {
             GatewayEvent::ReadySupplemental(r) => {
-                let ids: Vec<u64> = r.presences.iter().map(|p| p.user_id.0).collect();
-                assert_eq!(ids, vec![5, 6]);
+                let ids: Vec<(u64, Option<Snowflake>)> = r
+                    .presences
+                    .iter()
+                    .map(|p| (p.user_id.0, p.guild_id))
+                    .collect();
+                assert_eq!(ids, vec![(5, None), (6, Some(Snowflake(70)))]);
             }
             e => panic!("{e:?}"),
         }
@@ -1220,5 +1404,238 @@ mod tests {
         assert_eq!(r.private_channels[1].kind, ChannelKind::GroupDm);
         assert_eq!(r.private_channels[1].label(), "bob, carol");
         assert!(r.resume_gateway_url.is_none());
+    }
+
+    // ---- presence fixtures (shapes per Userdoccers gateway-events / presence docs) ----
+
+    fn scoped(r: &[Presence]) -> Vec<(u64, Option<u64>, Status)> {
+        let mut v: Vec<_> = r
+            .iter()
+            .map(|p| (p.user_id.0, p.guild_id.map(|g| g.0), p.status))
+            .collect();
+        v.sort_by_key(|x| (x.0, x.1));
+        v
+    }
+
+    /// READY as sent to an identify without capabilities (what nixcord sends): full user
+    /// objects everywhere, top-level `presences` = overall presences of non-offline
+    /// friends, `guilds[].presences` = per-guild presences of friends / DM recipients.
+    const READY_NO_CAPS: &str = r#"{
+        "v":10,"user":{"id":"1","username":"me","global_name":null,"avatar":null},
+        "session_id":"s1","resume_gateway_url":"wss://gateway-us-east1-b.discord.gg",
+        "user_settings":{"status":"online","custom_status":null},
+        "relationships":[
+          {"id":"20","type":1,"nickname":null,"since":"2021-01-01T00:00:00+00:00",
+           "user":{"id":"20","username":"bob","global_name":"Bob","avatar":null,"discriminator":"0"}},
+          {"id":"21","type":1,"nickname":"cc",
+           "user":{"id":"21","username":"carol","global_name":null,"avatar":"abc"}},
+          {"id":"22","type":1,"nickname":null,"user":{"id":"22","username":"dave"}}
+        ],
+        "presences":[
+          {"user":{"id":"20"},"status":"online","last_modified":1700000000000,
+           "client_status":{"desktop":"online"},"activities":[]},
+          {"user":{"id":"21","username":"carol"},"status":"idle",
+           "client_status":{"mobile":"idle"},
+           "activities":[{"type":4,"name":"Custom Status","state":"zzz","created_at":1}]}
+        ],
+        "guilds":[
+          {"id":"100","name":"G","channels":[],"roles":[],"members":[],
+           "presences":[{"user":{"id":"20"},"status":"online","client_status":{"desktop":"online"},"activities":[]},
+                        {"user":{"id":"30"},"status":"dnd","client_status":{"web":"dnd"},"activities":[]}]},
+          {"id":"101","unavailable":true}
+        ],
+        "private_channels":[{"id":"500","type":1,"recipients":[{"id":"30","username":"erin"}],"last_message_id":null}]
+    }"#;
+
+    #[test]
+    fn fixture_ready_without_capabilities() {
+        let r = decode_ready(READY_NO_CAPS).unwrap();
+        assert_eq!(r.relationships.len(), 3);
+        assert_eq!(
+            scoped(&r.presences),
+            vec![
+                (20, None, Status::Online),
+                (20, Some(100), Status::Online),
+                (21, None, Status::Idle),
+                (30, Some(100), Status::Dnd),
+            ]
+        );
+        assert_eq!(r.private_channels[0].recipients[0].id, Snowflake(30));
+    }
+
+    /// READY with DEDUPE_USER_OBJECTS but not PRIORITIZED_READY_PAYLOAD:
+    /// `merged_presences` (entries with `user_id`) replaces `presences` and each guild's
+    /// `presences`; users only in `users`; relationships with `user_id`.
+    #[test]
+    fn fixture_ready_deduped_merged_presences() {
+        let d = r#"{
+            "user":{"id":"1","username":"me"},"session_id":"s2",
+            "users":[{"id":"20","username":"bob"},{"id":"30","username":"erin"}],
+            "relationships":[{"id":"20","type":1,"user_id":"20","nickname":null}],
+            "guilds":[{"id":"bad"},{"id":"100","name":"G","channels":[]}],
+            "merged_members":[[],[{"user_id":"1","roles":[]}]],
+            "merged_presences":{
+              "friends":[{"user_id":"20","status":"dnd","client_status":{"desktop":"dnd"},"activities":[]},
+                         {"status":"online"}],
+              "guilds":[[{"user_id":"40","status":"online"}],
+                        [{"user_id":"30","status":"online","client_status":{"mobile":"online"},"activities":[]}]]},
+            "private_channels":[{"id":"500","type":1,"recipient_ids":["30"]}]
+        }"#;
+        let r = decode_ready(d).unwrap();
+        assert_eq!(r.relationships[0].user.as_ref().unwrap().username, "bob");
+        // 40 sat in the undecodable guild: dropped, never mistaken for an overall one.
+        assert_eq!(
+            scoped(&r.presences),
+            vec![(20, None, Status::Dnd), (30, Some(100), Status::Online)]
+        );
+        assert_eq!(r.private_channels[0].recipients[0].username, "erin");
+    }
+
+    #[test]
+    fn fixture_ready_null_extras_keep_the_rest() {
+        let d = r#"{"user":{"id":"1","username":"me"},"session_id":"s",
+            "merged_members":null,"presences":null,
+            "relationships":[{"id":"20","type":1,"user":{"id":"20","username":"bob"}}],
+            "guilds":[{"id":"100","name":"G","presences":null}],
+            "merged_presences":{"friends":[{"user_id":"20","status":"online"}],"guilds":null}}"#;
+        let r = decode_ready(d).unwrap();
+        assert_eq!(
+            r.relationships.len(),
+            1,
+            "a null field no longer drops friends"
+        );
+        assert_eq!(scoped(&r.presences), vec![(20, None, Status::Online)]);
+    }
+
+    /// READY_SUPPLEMENTAL (DEDUPE_USER_OBJECTS + PRIORITIZED_READY_PAYLOAD), both entry
+    /// shapes (`user_id` and `user`).
+    #[test]
+    fn fixture_ready_supplemental() {
+        let d = r#"{
+            "guilds":[{"id":"100","voice_states":[],"activity_instances":[]},{"id":"101"},{}],
+            "merged_members":[[],[],[]],
+            "merged_presences":{
+              "friends":[{"user_id":"20","status":"online","client_status":{"desktop":"online"},"activities":[]},
+                         {"user":{"id":"21"},"status":"idle","guild_id":"100","activities":[]}],
+              "guilds":[[{"user_id":"30","status":"dnd","activities":[]}],
+                        [{"user":{"id":"31"},"status":"online"},{"user_id":"20","status":"online"}],
+                        [{"user_id":"32","status":"online"}]]},
+            "lazy_private_channels":[],"disclose":[],"game_invites":[]
+        }"#;
+        let GatewayEvent::ReadySupplemental(r) =
+            decode_dispatch("READY_SUPPLEMENTAL", d).unwrap().unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            scoped(&r.presences),
+            vec![
+                (20, None, Status::Online),
+                (20, Some(101), Status::Online),
+                (21, None, Status::Idle),
+                (30, Some(100), Status::Dnd),
+                (31, Some(101), Status::Online),
+            ],
+            "friends stay overall; 32 has no guild id and is dropped"
+        );
+    }
+
+    #[test]
+    fn fixture_presence_update_shapes() {
+        let decode = |d: &str| match decode_dispatch("PRESENCE_UPDATE", d).unwrap().unwrap() {
+            GatewayEvent::PresenceUpdate { presence, user } => (*presence, user),
+            e => panic!("{e:?}"),
+        };
+        // Friend, overall presence: no guild_id, user with only an id.
+        let (p, u) = decode(
+            r#"{"user":{"id":"20"},"status":"online","client_status":{"desktop":"online"},
+                "activities":[],"last_modified":1700000000000}"#,
+        );
+        assert_eq!(
+            (p.user_id, p.guild_id, p.status),
+            (Snowflake(20), None, Status::Online)
+        );
+        assert!(u.is_none());
+        // Per-guild, full user object.
+        let (p, u) = decode(
+            r#"{"user":{"id":"20","username":"bob","global_name":"Bob","avatar":null},
+                "guild_id":"100","status":"dnd","client_status":{"web":"dnd"},"activities":[]}"#,
+        );
+        assert_eq!(p.guild_id, Some(Snowflake(100)));
+        assert_eq!(p.status, Status::Dnd);
+        assert_eq!(u.unwrap().username, "bob");
+        // Mobile only.
+        let (p, _) = decode(
+            r#"{"user":{"id":"20"},"status":"online","client_status":{"mobile":"online"},"activities":[]}"#,
+        );
+        assert_eq!(p.status, Status::Online);
+        // Status missing / unknown / odd case: client_status counts.
+        let (p, _) = decode(r#"{"user":{"id":"20"},"client_status":{"mobile":"idle"}}"#);
+        assert_eq!(p.status, Status::Idle);
+        let (p, _) = decode(
+            r#"{"user":{"id":"20"},"status":"unknown","client_status":{"mobile":"idle","desktop":"dnd"}}"#,
+        );
+        assert_eq!(p.status, Status::Dnd);
+        let (p, _) = decode(r#"{"user":{"id":"20"},"status":"Online","client_status":{}}"#);
+        assert_eq!(p.status, Status::Online);
+        let (p, _) = decode(
+            r#"{"user":{"id":"20"},"status":"online","client_status":{"embedded":"online"}}"#,
+        );
+        assert_eq!(p.status, Status::Online);
+        // Offline / invisible: no platforms.
+        let (p, _) =
+            decode(r#"{"user":{"id":"20"},"status":"offline","client_status":{},"activities":[]}"#);
+        assert_eq!(p.status, Status::Offline);
+        // Deduplicated shape (user_id).
+        let (p, _) = decode(r#"{"user_id":"20","status":"idle"}"#);
+        assert_eq!((p.user_id, p.status), (Snowflake(20), Status::Idle));
+    }
+
+    #[test]
+    fn fixture_guild_create_and_presences_replace_presences() {
+        let gc = r#"{"id":"100","name":"G","channels":[],"roles":[],"members":[],
+            "presences":[{"user":{"id":"20"},"status":"online","activities":[]},{"status":"idle"}]}"#;
+        assert_eq!(
+            scoped(&dispatch_presences("GUILD_CREATE", gc)),
+            vec![(20, Some(100), Status::Online)]
+        );
+        let pr = r#"[{"user":{"id":"20"},"status":"idle","activities":[]},
+                     {"user":{"id":"21"},"guild_id":"100","status":"online"}]"#;
+        assert_eq!(
+            scoped(&dispatch_presences("PRESENCES_REPLACE", pr)),
+            vec![(20, None, Status::Idle), (21, Some(100), Status::Online)]
+        );
+        assert!(dispatch_presences("MESSAGE_CREATE", "{}").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod emoji_tests {
+    use super::*;
+
+    #[test]
+    fn decodes_guild_emojis() {
+        let d = r#"{"guild_id":"7","emojis":[
+            {"id":"1","name":"ferris","animated":false,"available":true,"roles":[]},
+            {"id":"2","name":"party","animated":true},
+            {"id":"3","name":null},
+            {"id":"4","name":"locked","available":false}]}"#;
+        match decode_dispatch("GUILD_EMOJIS_UPDATE", d).unwrap().unwrap() {
+            GatewayEvent::GuildEmojisUpdate { guild_id, emojis } => {
+                assert_eq!(guild_id, Snowflake(7));
+                let names: Vec<&str> = emojis.iter().map(|e| e.name.as_str()).collect();
+                assert_eq!(names, ["ferris", "party", "locked"]);
+                assert!(emojis[1].animated && emojis[1].available);
+                assert!(!emojis[2].available);
+                assert_eq!(emojis[1].markup(), "<a:party:2>");
+            }
+            other => panic!("{other:?}"),
+        }
+        // GUILD_CREATE carries them on the guild.
+        let g = r#"{"id":"7","name":"G","emojis":[{"id":"1","name":"ferris"}]}"#;
+        match decode_dispatch("GUILD_CREATE", g).unwrap().unwrap() {
+            GatewayEvent::GuildCreate(g) => assert_eq!(g.emojis[0].name, "ferris"),
+            other => panic!("{other:?}"),
+        }
     }
 }
