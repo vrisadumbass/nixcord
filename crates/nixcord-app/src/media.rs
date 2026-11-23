@@ -509,7 +509,20 @@ impl Media {
         max_size: Vec2,
         natural: Option<(u32, u32)>,
     ) -> Response {
-        self.image_with(ui, url, &[], max_size, natural)
+        self.image_with(ui, url, &[], max_size, natural, true)
+            .expect("interactive image always returns a Response")
+    }
+
+    /// Non-interactive image preview (e.g. inside picker buttons): paints into the allocated
+    /// space without claiming clicks/hover or opening the image viewer.
+    pub fn image_preview(
+        &mut self,
+        ui: &mut Ui,
+        url: &str,
+        max_size: Vec2,
+        natural: Option<(u32, u32)>,
+    ) {
+        self.image_with(ui, url, &[], max_size, natural, false);
     }
 
     /// A `gifv` embed: plays the first loadable of `anim` (animated GIF / WebP URLs, see
@@ -522,7 +535,21 @@ impl Media {
         max_size: Vec2,
         natural: Option<(u32, u32)>,
     ) -> Response {
-        self.image_with(ui, poster, anim, max_size, natural)
+        self.image_with(ui, poster, anim, max_size, natural, true)
+            .expect("interactive gifv always returns a Response")
+    }
+
+    /// Non-interactive `gifv` preview (e.g. inside the GIF picker): plays animations on
+    /// pointer hover without claiming clicks/hover or opening the image viewer.
+    pub fn gifv_preview(
+        &mut self,
+        ui: &mut Ui,
+        poster: &str,
+        anim: &[String],
+        max_size: Vec2,
+        natural: Option<(u32, u32)>,
+    ) {
+        self.image_with(ui, poster, anim, max_size, natural, false);
     }
 
     /// A still for the video player (`crate::video`): `url` decoded into a `px` box. Paints
@@ -547,7 +574,8 @@ impl Media {
         alt: &[String],
         max_size: Vec2,
         natural: Option<(u32, u32)>,
-    ) -> Response {
+        interactive: bool,
+    ) -> Option<Response> {
         self.begin_pass();
         let ppp = self.ctx.pixels_per_point();
         let max = (max_size.x.max(1.0), max_size.y.max(1.0));
@@ -633,7 +661,13 @@ impl Media {
             }
             _ => Vec2::new(w, h),
         };
-        let (rect, resp) = ui.allocate_exact_size(shown, Sense::click());
+        let (rect, resp) = if interactive {
+            let (rect, resp) = ui.allocate_exact_size(shown, Sense::click());
+            (rect, Some(resp))
+        } else {
+            let (_, rect) = ui.allocate_space(shown);
+            (rect, None)
+        };
         let rounding = CornerRadius::same(IMAGE_RADIUS);
         let v = ui.visuals();
         match got {
@@ -658,6 +692,7 @@ impl Media {
             }
         }
 
+        let resp = resp?;
         let group = gallery_group(ui.stack());
         let img = ViewImage {
             url: url.to_owned(),
@@ -680,7 +715,7 @@ impl Media {
             self.open = Some((group, img.clone()));
         }
         self.drawn.push((group, img));
-        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+        Some(resp.on_hover_cursor(egui::CursorIcon::PointingHand))
     }
 
     // ---- viewer -----------------------------------------------------------------------
@@ -1374,5 +1409,89 @@ mod tests {
         assert_eq!(media.stats(), (0, 0));
         media.close_viewer();
         assert_eq!(media.viewer_bytes(), 0);
+    }
+
+    #[test]
+    fn preview_does_not_steal_clicks_or_open_viewer() {
+        let ctx = egui::Context::default();
+        let mut media = Media::new(&ctx, true);
+        let cell_a = Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::splat(80.0));
+        let cell_b = Rect::from_min_size(Pos2::new(110.0, 10.0), Vec2::splat(80.0));
+        let anim = vec!["https://example.com/a.gif".to_string()];
+
+        let draw = |ctx: &egui::Context,
+                    input: egui::RawInput,
+                    media: &mut Media|
+         -> (bool, bool, bool, bool) {
+            let mut out = (false, false, false, false);
+            let mut full = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let ra = ui.interact(cell_a, ui.scope_id().with("cell_a"), Sense::click());
+                    let mut ca = ui.new_child(egui::UiBuilder::new().max_rect(cell_a));
+                    media.image_preview(
+                        &mut ca,
+                        "https://example.com/sticker.png",
+                        cell_a.size(),
+                        Some((160, 160)),
+                    );
+
+                    let rb = ui.interact(cell_b, ui.scope_id().with("cell_b"), Sense::click());
+                    let mut cb = ui.new_child(egui::UiBuilder::new().max_rect(cell_b));
+                    media.gifv_preview(
+                        &mut cb,
+                        "https://example.com/poster.png",
+                        &anim,
+                        cell_b.size(),
+                        Some((160, 160)),
+                    );
+
+                    out = (ra.hovered(), ra.clicked(), rb.hovered(), rb.clicked());
+                });
+            });
+            full.textures_delta.clear();
+            out
+        };
+
+        let click_at = |pos: Pos2, media: &mut Media| -> (bool, bool, bool, bool) {
+            let mut input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 200.0))),
+                ..Default::default()
+            };
+            input.events.push(egui::Event::PointerMoved(pos));
+            draw(&ctx, input.clone(), media);
+
+            input.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            });
+            draw(&ctx, input.clone(), media);
+
+            let release = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 200.0))),
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            };
+            draw(&ctx, release, media)
+        };
+
+        let (ha, ca, _, _) = click_at(cell_a.center(), &mut media);
+        assert!(ha && ca, "outer sticker cell must receive hover and click");
+        assert!(media.take_open_request().is_none());
+        assert!(media.drawn.is_empty());
+
+        let (_, _, hb, cb) = click_at(cell_b.center(), &mut media);
+        assert!(hb && cb, "outer GIF cell must receive hover and click");
+        assert!(media.take_open_request().is_none());
+        assert!(media.drawn.is_empty());
     }
 }

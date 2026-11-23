@@ -519,7 +519,12 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
             reply_to,
         } => match http.send_sticker(channel, sticker_id, reply_to).await {
             Ok(m) => events.send(AppEvent::Sent(Box::new(m))),
-            Err(HttpError::Forbidden) => events.send(AppEvent::Forbidden { channel }),
+            // A 403 here is commonly Nitro-gated cross-server stickers or missing
+            // USE_EXTERNAL_STICKERS, not a read-only channel: toast instead of locking it.
+            Err(HttpError::Forbidden) => events.send(AppEvent::Error(
+                "Couldn't send sticker: you don't have permission to use this sticker here."
+                    .to_string(),
+            )),
             Err(e) => events.send(AppEvent::Error(format!("Couldn't send sticker: {e}"))),
         },
         Command::LoadHistoryAround { channel, around } => {

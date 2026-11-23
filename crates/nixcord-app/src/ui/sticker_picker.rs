@@ -255,7 +255,7 @@ fn grid_ui(
                     match s.item().url(STICKER_PX) {
                         Some(url) => {
                             let mut c = ui.new_child(UiBuilder::new().max_rect(inner));
-                            app.media.borrow_mut().image(
+                            app.media.borrow_mut().image_preview(
                                 &mut c,
                                 &url,
                                 inner.size(),

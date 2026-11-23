@@ -299,7 +299,7 @@ fn grid_ui(ui: &mut Ui, app: &NixApp, grid: Rect) -> Option<String> {
                     Some(&g.src),
                 );
                 let mut cell = ui.new_child(UiBuilder::new().max_rect(r));
-                app.media.borrow_mut().gifv(
+                app.media.borrow_mut().gifv_preview(
                     &mut cell,
                     poster,
                     &anim,
