@@ -8,11 +8,11 @@
 //! member list answered per subscription like Discord's GUILD_MEMBER_LIST_UPDATE, and
 //! channel permissions (a read-only channel and hidden channels).
 
-use crate::backend::{AppEvent, Command, EventTx, HISTORY_PAGE};
+use crate::backend::{AppEvent, AppVoiceEvent, Command, EventTx, VoiceControl, HISTORY_PAGE};
 use crate::demo_assets::{avatar_hash, icon_hash, pool_avatar};
 use crate::ui::search::SearchScope;
 use nixcord_gateway::GatewayCommand;
-use nixcord_model::permissions::{SEND_MESSAGES, VIEW_CHANNEL};
+use nixcord_model::permissions::{CONNECT, SEND_MESSAGES, SPEAK, VIEW_CHANNEL};
 use nixcord_model::CustomEmoji;
 use nixcord_model::{
     Activity, ActivityKind, Attachment, Channel, ChannelKind, Embed, EmbedAuthor, EmbedField,
@@ -20,6 +20,7 @@ use nixcord_model::{
     MemberListGroup, MemberListItem, MemberListOp, MemberListUpdate, Message, MessageReference,
     MessageUpdate, Overwrite, OverwriteKind, PartialMember, Presence, Reaction, ReadState, Ready,
     Relationship, RelationshipKind, Role, Snowflake, Status, ThreadMetadata, User,
+    VoiceServerUpdate, VoiceState,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -186,7 +187,7 @@ fn guild(id: u64, name: &str, channels: Vec<Channel>) -> Guild {
                 name: "@everyone".into(),
                 color: 0,
                 position: 0,
-                permissions: VIEW_CHANNEL | SEND_MESSAGES,
+                permissions: VIEW_CHANNEL | SEND_MESSAGES | CONNECT | SPEAK,
             },
             role(ROLE_HELPER, "helper", 0x2ECC71, 1),
             role(ROLE_DEV, "dev", 0xF1C40F, 2),
@@ -399,6 +400,25 @@ fn ready() -> Ready {
     });
     nix.channels
         .push(chan(110, t(10), Text, "__hidden__", t(101), 3, None));
+    // Two invented demo participants already in Hearth's #Lounge voice channel (108):
+    // Sol (speaking) and Quill (muted).
+    nix.voice_states = vec![
+        VoiceState {
+            guild_id: Some(Snowflake(10)),
+            channel_id: Some(Snowflake(108)),
+            user_id: Snowflake(1002),
+            session_id: "demo-sol".into(),
+            ..Default::default()
+        },
+        VoiceState {
+            guild_id: Some(Snowflake(10)),
+            channel_id: Some(Snowflake(108)),
+            user_id: Snowflake(1003),
+            session_id: "demo-quill".into(),
+            self_mute: true,
+            ..Default::default()
+        },
+    ];
     // Active threads under #general (102) and #💡-suggestions (103).
     nix.threads = vec![
         Channel {
@@ -1574,6 +1594,10 @@ pub async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx
     events.send(AppEvent::Gateway(GatewayEvent::Connecting));
     tokio::time::sleep(Duration::from_millis(150)).await;
     events.send(AppEvent::Gateway(GatewayEvent::Ready(Box::new(ready()))));
+    events.send(AppEvent::Voice(AppVoiceEvent::Speaking {
+        user_id: Snowflake(1002),
+        speaking: true,
+    }));
 
     // A little later, activity elsewhere: shows unread channels, DMs and servers.
     {
@@ -1613,6 +1637,10 @@ pub async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx
             Command::Login(_) => {
                 events.send(AppEvent::LoginOk(people[0].clone()));
                 events.send(AppEvent::Gateway(GatewayEvent::Ready(Box::new(ready()))));
+                events.send(AppEvent::Voice(AppVoiceEvent::Speaking {
+                    user_id: Snowflake(1002),
+                    speaking: true,
+                }));
             }
             Command::Logout => {}
             Command::LoadHistory { channel, before } => {
@@ -2055,7 +2083,7 @@ pub async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx
                 self_deaf,
             }) => {
                 events.send(AppEvent::Gateway(GatewayEvent::VoiceStateUpdate(
-                    nixcord_model::VoiceState {
+                    VoiceState {
                         guild_id,
                         channel_id,
                         user_id: Snowflake(ME),
@@ -2065,6 +2093,51 @@ pub async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx
                         ..Default::default()
                     },
                 )));
+                if channel_id.is_some() {
+                    events.send(AppEvent::Gateway(GatewayEvent::VoiceServerUpdate(
+                        VoiceServerUpdate {
+                            token: "demo-voice-token".into(),
+                            guild_id: guild_id.unwrap_or(Snowflake(10)),
+                            endpoint: Some("demo-voice.nixcord.local:443".into()),
+                        },
+                    )));
+                } else {
+                    events.send(AppEvent::Voice(AppVoiceEvent::Disconnected {
+                        reason: None,
+                    }));
+                }
+            }
+            Command::ConnectVoice(params) => {
+                events.send(AppEvent::Voice(AppVoiceEvent::Connecting {
+                    guild_id: Some(params.guild_id),
+                    channel_id: params.channel_id,
+                }));
+                let events = events.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                    events.send(AppEvent::Voice(AppVoiceEvent::Connected {
+                        guild_id: Some(params.guild_id),
+                        channel_id: params.channel_id,
+                        endpoint: params.endpoint,
+                    }));
+                    events.send(AppEvent::Voice(AppVoiceEvent::Ping(24)));
+                    if params.channel_id == Snowflake(108) {
+                        events.send(AppEvent::Voice(AppVoiceEvent::Speaking {
+                            user_id: Snowflake(1002),
+                            speaking: true,
+                        }));
+                    }
+                });
+            }
+            Command::Voice(ctrl) => {
+                if matches!(ctrl, VoiceControl::SetMute(true)) {
+                    events.send(AppEvent::Voice(AppVoiceEvent::SelfSpeaking(false)));
+                }
+            }
+            Command::DisconnectVoice => {
+                events.send(AppEvent::Voice(AppVoiceEvent::Disconnected {
+                    reason: None,
+                }));
             }
         }
     }

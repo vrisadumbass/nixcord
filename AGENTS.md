@@ -127,6 +127,10 @@ then calls `request_repaint()`. The UI sends `Command`s to the backend. UI code 
   - Friends home view (Online, All, Pending, Blocked, Add Friend) with accept/decline/remove/block/DM actions.
 - **Permissions:** channels you can't view are hidden; read-only channels show the notice
   up front.
+- **Voice Calls (feature `voice`, default on):**
+  - Voice signaling (Op 4 `UpdateVoiceState`, `VOICE_STATE_UPDATE`, `VOICE_SERVER_UPDATE`), Voice Gateway WebSocket, UDP IP discovery, AEAD RTP transport, Opus codec abstraction, RMS VAD, multi-speaker mixer, and `cpal` audio capture/playback (`nixcord-voice`).
+  - Sidebar voice channel join/leave, participant rows (24px avatars, speaking rings, mute/deaf badges, profile popouts), compact "Voice Connected" bar with signal/ping tooltip and disconnect, wired Mute/Deafen controls, and Voice & Audio settings (cached device lists, gain, volume, VAD threshold).
+  - Full interactive simulation in `--demo`.
 - **UI:**
   - Graphite (default) and Onyx themes, plus 12 gradient themes.
   - Settings modal.
@@ -156,9 +160,11 @@ demo mode only:
 - GIF search (`/gifs/search`, `/gifs/trending-gifs`), sending stickers, `GUILD_STICKERS_UPDATE`, and
   thread membership (`member`, `THREAD_LIST_SYNC.members`, `THREAD_MEMBER(S)_UPDATE`) that decides
   which threads the sidebar lists.
+- Live voice calls against real Discord voice servers (Op 4 signaling, Voice Gateway, UDP/AEAD RTP,
+  and live audio capture/playback).
 
 Not built yet:
-- Voice and video calls, screen share.
+- Video calls and screen share.
 - Native OS desktop notifications (in-app mention toasts, mention badges, unread counts and
   window title badges are built).
 - Modals for bot interactions (buttons, string selects, and entity select menus are interactive).

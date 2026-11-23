@@ -21,6 +21,7 @@ pub mod settings;
 pub mod sidebar;
 pub mod sticker_picker;
 pub mod viewer;
+pub mod voice;
 
 use crate::theme::Theme;
 use chrono::{Datelike, Local, TimeZone};
@@ -156,6 +157,22 @@ pub enum Action {
         custom_id: String,
         values: Vec<String>,
     },
+    /// Join a voice or stage channel.
+    JoinVoice {
+        guild_id: Option<Snowflake>,
+        channel_id: Snowflake,
+    },
+    /// Disconnect from the active voice channel.
+    LeaveVoice,
+    /// Toggle local microphone mute (syncs Op 4 and active voice engine).
+    ToggleMute,
+    /// Toggle local deafen (implies mute; syncs Op 4 and active voice engine).
+    ToggleDeafen,
+    SetVoiceInputDevice(Option<String>),
+    SetVoiceOutputDevice(Option<String>),
+    SetVoiceInputGain(f32),
+    SetVoiceOutputVolume(f32),
+    SetVoiceVadThreshold(f32),
     /// Short notice at the bottom of the window.
     Toast(String),
 }

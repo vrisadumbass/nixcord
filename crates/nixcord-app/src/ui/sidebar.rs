@@ -1743,6 +1743,19 @@ pub fn column(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
         .frame(Frame::new().inner_margin(Margin::same(6)))
         .show(ui, |ui| user_panel(ui, app, actions));
 
+    if app.view.voice.is_active() {
+        egui::Panel::bottom("voice_connected_bar")
+            .exact_size(52.0)
+            .show_separator_line(false)
+            .frame(Frame::new().inner_margin(Margin {
+                left: 6,
+                right: 6,
+                top: 4,
+                bottom: 0,
+            }))
+            .show(ui, |ui| super::voice::connected_bar(ui, app, actions));
+    }
+
     // Header (48px).
     let header_rect =
         Rect::from_min_size(ui.max_rect().min, Vec2::new(ui.max_rect().width(), 48.0));
@@ -1816,9 +1829,13 @@ pub fn column(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
         });
 }
 
+fn is_voice_channel(kind: ChannelKind) -> bool {
+    matches!(kind, ChannelKind::Voice | ChannelKind::Other(13))
+}
+
 fn channel_glyph(kind: ChannelKind) -> &'static str {
     match kind {
-        ChannelKind::Voice => "🔊",
+        ChannelKind::Voice | ChannelKind::Other(13) => "🔊",
         ChannelKind::Announcement => "📢",
         ChannelKind::Forum => "💬",
         _ => "#",
@@ -1865,12 +1882,16 @@ fn guild_channels(ui: &mut Ui, app: &NixApp, gid: Snowflake, actions: &mut Vec<A
         let threads = app.store.channel_threads(ch.id);
         let collapsed_cat = current_cat.is_some_and(|c| app.view.collapsed.contains(&c));
         let active_in_branch = app.view.channel == Some(ch.id)
+            || app.view.voice.channel_id == Some(ch.id)
             || threads.iter().any(|th| app.view.channel == Some(th.id));
         let hidden = collapsed_cat && !active_in_branch;
         if hidden {
             continue;
         }
         channel_row(ui, app, ch, actions);
+        if is_voice_channel(ch.kind) {
+            super::voice::participants(ui, app, ch.id, actions);
+        }
         // Like Discord: only threads you've joined (or have open) are listed.
         let visible_threads: Vec<&Channel> = threads
             .into_iter()
@@ -1889,12 +1910,15 @@ fn guild_channels(ui: &mut Ui, app: &NixApp, gid: Snowflake, actions: &mut Vec<A
 fn channel_row(ui: &mut Ui, app: &NixApp, ch: &Channel, actions: &mut Vec<Action>) {
     let t = app.theme;
     let openable = ch.kind.is_openable();
+    let is_voice = is_voice_channel(ch.kind);
+    let clickable = openable || is_voice;
     let is_forum = ch.kind == ChannelKind::Forum;
-    let selected = app.view.channel == Some(ch.id);
+    let selected =
+        app.view.channel == Some(ch.id) || (is_voice && app.view.voice.channel_id == Some(ch.id));
     let row_w = ui.available_width();
     let (outer, resp) = ui.allocate_exact_size(Vec2::new(row_w, 32.0), Sense::click());
     let rect = outer.shrink2(Vec2::new(8.0, 1.0));
-    let hovered = resp.hovered() && openable;
+    let hovered = resp.hovered() && clickable;
     if selected {
         ui.painter()
             .rect_filled(rect, CornerRadius::same(4), t.selected);
@@ -1930,7 +1954,7 @@ fn channel_row(ui: &mut Ui, app: &NixApp, ch: &Channel, actions: &mut Vec<Action
         ui.painter()
             .rect_filled(dot, CornerRadius::same(4), t.strong);
     }
-    let color = if !openable {
+    let color = if !clickable {
         t.muted.gamma_multiply(0.55)
     } else if selected || hovered || unread {
         t.strong
@@ -1972,12 +1996,25 @@ fn channel_row(ui: &mut Ui, app: &NixApp, ch: &Channel, actions: &mut Vec<Action
             t,
         );
     }
-    if resp.clicked() && openable {
-        actions.push(Action::SelectChannel(ch.id));
+    if resp.clicked() {
+        if is_voice {
+            if app.store.can_connect(ch.id) {
+                actions.push(Action::JoinVoice {
+                    guild_id: ch.guild_id,
+                    channel_id: ch.id,
+                });
+            } else {
+                actions.push(Action::Toast(
+                    "You don't have permission to connect to this voice channel.".into(),
+                ));
+            }
+        } else if openable {
+            actions.push(Action::SelectChannel(ch.id));
+        }
     }
     let items = channel_context_items(ch.id, raw_unread);
     show_context_menu(&resp, t, &items, actions);
-    if !openable {
+    if !clickable {
         resp.on_hover_text("Not supported in nixcord yet");
     }
 }
@@ -2282,7 +2319,7 @@ fn user_panel(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
             strike(ui, deaf.rect, t.danger);
         }
         if deaf.clicked() {
-            app.view.deafened = !app.view.deafened;
+            actions.push(Action::ToggleDeafen);
         }
         let mic = icon_button(
             ui,
@@ -2295,7 +2332,7 @@ fn user_panel(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
             strike(ui, mic.rect, t.danger);
         }
         if mic.clicked() {
-            app.view.mic_muted = !app.view.mic_muted;
+            actions.push(Action::ToggleMute);
         }
 
         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {

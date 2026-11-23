@@ -1,12 +1,15 @@
 //! The eframe `App`: owns the `Store`, drains backend events, lays out the screens and
 //! applies the `Action`s they emit.
 
-use crate::backend::{self, AppEvent, Backend, Command, HISTORY_PAGE};
+use crate::backend::{
+    self, AppEvent, AppVoiceEvent, Backend, Command, VoiceConnectParams, VoiceControl, HISTORY_PAGE,
+};
 use crate::media::Media;
 use crate::theme::{self, Theme};
 use crate::token;
 use crate::ui::{self, Action};
 use eframe::egui::{self, Color32, CornerRadius, CursorIcon, Frame, Id, Margin, Rect, Sense};
+use nixcord_gateway::GatewayCommand;
 use nixcord_model::components::ComponentInteraction;
 use nixcord_model::{Channel, ChannelKind, GatewayEvent, Message, Snowflake};
 use nixcord_store::{ConnectionState, Store};
@@ -211,6 +214,7 @@ pub struct ViewState {
     pub gifs: ui::gif_picker::GifState,
     pub mic_muted: bool,
     pub deafened: bool,
+    pub voice: ui::voice::VoiceViewState,
     pub confirm_delete: Option<(Snowflake, Snowflake)>,
     pub member_sub: ui::presence::SubState,
     pub profile_popout: Option<ui::profile::ProfilePopout>,
@@ -223,6 +227,17 @@ pub struct ViewState {
     pub custom_status_modal: Option<ui::presence::CustomStatusModal>,
     pub rail_drag: Option<ui::sidebar::RailDrag>,
     pub folder_modal: Option<ui::sidebar::FolderModal>,
+}
+
+/// Tracks the two-part Discord voice handshake (`VOICE_STATE_UPDATE` + `VOICE_SERVER_UPDATE`).
+#[derive(Default)]
+struct PendingVoiceJoin {
+    guild_id: Snowflake,
+    channel_id: Snowflake,
+    session_id: Option<String>,
+    endpoint: Option<String>,
+    token: Option<String>,
+    dispatched: bool,
 }
 
 struct Toast {
@@ -260,6 +275,8 @@ pub struct NixApp {
     /// Last total mention count applied to the OS window title.
     last_title_mentions: Option<u32>,
     toast: Option<Toast>,
+    /// Pending voice join waiting for both VOICE_STATE_UPDATE and VOICE_SERVER_UPDATE.
+    pending_voice: Option<PendingVoiceJoin>,
     /// Token + remember flag of the login in flight. Dropped once it resolves.
     pending_login: Option<(String, bool)>,
     token_source: Option<token::Source>,
@@ -302,6 +319,7 @@ impl NixApp {
             session_id: String::new(),
             last_title_mentions: None,
             toast: None,
+            pending_voice: None,
             pending_login: None,
             token_source: None,
         };
@@ -436,6 +454,63 @@ impl NixApp {
                         self.toast_mention(text, m.channel_id);
                     }
                 }
+                match ev {
+                    GatewayEvent::VoiceStateUpdate(ref vs) => {
+                        if self.store.me().is_some_and(|me| me.id == vs.user_id) {
+                            match vs.channel_id {
+                                None => {
+                                    self.pending_voice = None;
+                                    if self.view.voice.is_active() {
+                                        self.send(Command::DisconnectVoice);
+                                        self.view.voice.disconnect(None);
+                                    }
+                                }
+                                Some(cid) => {
+                                    if let Some(pending) = self.pending_voice.as_mut() {
+                                        if vs.guild_id == Some(pending.guild_id) {
+                                            pending.channel_id = cid;
+                                            if !vs.session_id.is_empty() {
+                                                pending.session_id = Some(vs.session_id.clone());
+                                            }
+                                            self.maybe_connect_voice();
+                                        }
+                                    } else if self.view.voice.is_active()
+                                        && self.view.voice.guild_id == vs.guild_id
+                                    {
+                                        // Moved to another voice channel in the same guild.
+                                        self.view.voice.channel_id = Some(cid);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    GatewayEvent::VoiceServerUpdate(ref vsu) => {
+                        if let Some(pending) = self.pending_voice.as_mut() {
+                            if pending.guild_id == vsu.guild_id {
+                                if let Some(ep) = &vsu.endpoint {
+                                    pending.endpoint = Some(ep.clone());
+                                    pending.token = Some(vsu.token.clone());
+                                    pending.dispatched = false;
+                                    self.maybe_connect_voice();
+                                } else {
+                                    // Discord is reallocating a voice server; stay connecting.
+                                    pending.endpoint = None;
+                                    pending.dispatched = false;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            AppEvent::Voice(vev) => {
+                if let AppVoiceEvent::Disconnected {
+                    reason: Some(ref msg),
+                } = vev
+                {
+                    self.toast_err(format!("Voice disconnected: {msg}"));
+                }
+                self.view.voice.apply_event(&vev);
             }
             AppEvent::History {
                 channel,
@@ -600,6 +675,7 @@ impl NixApp {
         self.acked.clear();
         self.session_id.clear();
         self.last_title_mentions = None;
+        self.pending_voice = None;
         self.view = ViewState::default();
         self.composer = ComposerState::default();
         self.chat.reset();
@@ -624,6 +700,7 @@ impl NixApp {
                 self.send(Command::Login(token));
             }
             Action::Logout => {
+                self.send(Command::DisconnectVoice);
                 self.send(Command::Logout);
                 token::clear();
                 self.token_source = None;
@@ -743,7 +820,10 @@ impl NixApp {
             }
             Action::Copy(text) => ctx.copy_text(text),
             Action::Typing(channel) => self.send(Command::Typing { channel }),
-            Action::OpenSettings => self.settings_open = true,
+            Action::OpenSettings => {
+                self.settings_open = true;
+                self.view.voice.refresh_devices();
+            }
             Action::EmojiUsed(key) => ui::emoji_picker::count_use(&mut self.prefs.emoji_usage, key),
             Action::SetSkinTone(tone) => self.prefs.skin_tone = tone.min(5),
             Action::OpenProfile {
@@ -1006,8 +1086,138 @@ impl NixApp {
                     values,
                 }));
             }
+            Action::JoinVoice {
+                guild_id,
+                channel_id,
+            } => {
+                if self.view.voice.is_active() && self.view.voice.channel_id == Some(channel_id) {
+                    return;
+                }
+                if self.view.voice.is_active() {
+                    self.send(Command::DisconnectVoice);
+                }
+                self.view.voice.start_connecting(guild_id, channel_id);
+                self.pending_voice = guild_id.map(|gid| PendingVoiceJoin {
+                    guild_id: gid,
+                    channel_id,
+                    ..PendingVoiceJoin::default()
+                });
+                self.send(Command::Gateway(GatewayCommand::UpdateVoiceState {
+                    guild_id,
+                    channel_id: Some(channel_id),
+                    self_mute: self.view.mic_muted,
+                    self_deaf: self.view.deafened,
+                }));
+            }
+            Action::LeaveVoice => {
+                let guild_id = self.view.voice.guild_id;
+                self.send(Command::DisconnectVoice);
+                if guild_id.is_some() {
+                    self.send(Command::Gateway(GatewayCommand::UpdateVoiceState {
+                        guild_id,
+                        channel_id: None,
+                        self_mute: self.view.mic_muted,
+                        self_deaf: self.view.deafened,
+                    }));
+                }
+                self.pending_voice = None;
+                self.view.voice.disconnect(None);
+            }
+            Action::ToggleMute => {
+                if self.view.deafened && self.view.mic_muted {
+                    self.view.mic_muted = false;
+                    self.view.deafened = false;
+                } else {
+                    self.view.mic_muted = !self.view.mic_muted;
+                }
+                self.sync_voice_mute_deaf();
+            }
+            Action::ToggleDeafen => {
+                self.view.deafened = !self.view.deafened;
+                self.view.mic_muted = self.view.deafened;
+                self.sync_voice_mute_deaf();
+            }
+            Action::SetVoiceInputDevice(dev) => {
+                self.view.voice.input_device = dev.clone();
+                if self.view.voice.is_active() {
+                    self.send(Command::Voice(VoiceControl::SetInputDevice(dev)));
+                }
+            }
+            Action::SetVoiceOutputDevice(dev) => {
+                self.view.voice.output_device = dev.clone();
+                if self.view.voice.is_active() {
+                    self.send(Command::Voice(VoiceControl::SetOutputDevice(dev)));
+                }
+            }
+            Action::SetVoiceInputGain(gain) => {
+                self.view.voice.input_gain = gain;
+                if self.view.voice.is_active() {
+                    self.send(Command::Voice(VoiceControl::SetInputGain(gain)));
+                }
+            }
+            Action::SetVoiceOutputVolume(vol) => {
+                self.view.voice.output_volume = vol;
+                if self.view.voice.is_active() {
+                    self.send(Command::Voice(VoiceControl::SetOutputVolume(vol)));
+                }
+            }
+            Action::SetVoiceVadThreshold(db) => {
+                self.view.voice.vad_threshold_db = db;
+                if self.view.voice.is_active() {
+                    self.send(Command::Voice(VoiceControl::SetVadThreshold(db)));
+                }
+            }
             Action::Toast(msg) => self.toast(msg),
         }
+    }
+
+    fn maybe_connect_voice(&mut self) {
+        let Some(me_id) = self.store.me().map(|u| u.id) else {
+            return;
+        };
+        let Some(pending) = self.pending_voice.as_mut() else {
+            return;
+        };
+        if pending.dispatched {
+            return;
+        }
+        let (Some(session_id), Some(endpoint), Some(token)) = (
+            pending.session_id.clone(),
+            pending.endpoint.clone(),
+            pending.token.clone(),
+        ) else {
+            return;
+        };
+        pending.dispatched = true;
+        let params = VoiceConnectParams {
+            guild_id: pending.guild_id,
+            channel_id: pending.channel_id,
+            user_id: me_id,
+            session_id,
+            token,
+            endpoint,
+            self_mute: self.view.mic_muted,
+            self_deaf: self.view.deafened,
+            input_device: self.view.voice.input_device.clone(),
+            output_device: self.view.voice.output_device.clone(),
+            input_gain: self.view.voice.input_gain,
+            output_volume: self.view.voice.output_volume,
+        };
+        self.send(Command::ConnectVoice(params));
+    }
+
+    fn sync_voice_mute_deaf(&self) {
+        if !self.view.voice.is_active() {
+            return;
+        }
+        self.send(Command::Gateway(GatewayCommand::UpdateVoiceState {
+            guild_id: self.view.voice.guild_id,
+            channel_id: self.view.voice.channel_id,
+            self_mute: self.view.mic_muted,
+            self_deaf: self.view.deafened,
+        }));
+        self.send(Command::Voice(VoiceControl::SetMute(self.view.mic_muted)));
+        self.send(Command::Voice(VoiceControl::SetDeaf(self.view.deafened)));
     }
 
     fn select_channel(&mut self, ch: Option<Snowflake>) {

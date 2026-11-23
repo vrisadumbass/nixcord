@@ -22,10 +22,81 @@ use tokio::sync::{mpsc, watch};
 /// How many messages one history page requests.
 pub const HISTORY_PAGE: u8 = 50;
 
+/// Voice events forwarded from the voice engine (or demo simulator) to the UI.
+/// Defined app-locally so `--no-default-features` compiles cleanly without `nixcord-voice`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppVoiceEvent {
+    Connecting {
+        guild_id: Option<Snowflake>,
+        channel_id: Snowflake,
+    },
+    Connected {
+        guild_id: Option<Snowflake>,
+        channel_id: Snowflake,
+        endpoint: String,
+    },
+    Speaking {
+        user_id: Snowflake,
+        speaking: bool,
+    },
+    Ping(u32),
+    SelfSpeaking(bool),
+    Disconnected {
+        reason: Option<String>,
+    },
+}
+
+/// Runtime control commands sent to an active voice session.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::enum_variant_names)]
+pub enum VoiceControl {
+    SetMute(bool),
+    SetDeaf(bool),
+    SetInputGain(f32),
+    SetOutputVolume(f32),
+    SetInputDevice(Option<String>),
+    SetOutputDevice(Option<String>),
+    SetVadThreshold(f32),
+}
+
+/// Parameters required to start a voice gateway session. `Debug` redacts `token`.
+#[derive(Clone)]
+#[cfg_attr(not(feature = "voice"), allow(dead_code))]
+pub struct VoiceConnectParams {
+    pub guild_id: Snowflake,
+    pub channel_id: Snowflake,
+    pub user_id: Snowflake,
+    pub session_id: String,
+    pub token: String,
+    pub endpoint: String,
+    pub self_mute: bool,
+    pub self_deaf: bool,
+    pub input_device: Option<String>,
+    pub output_device: Option<String>,
+    pub input_gain: f32,
+    pub output_volume: f32,
+}
+
+impl std::fmt::Debug for VoiceConnectParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VoiceConnectParams")
+            .field("guild_id", &self.guild_id)
+            .field("channel_id", &self.channel_id)
+            .field("user_id", &self.user_id)
+            .field("session_id", &self.session_id)
+            .field("token", &"<redacted>")
+            .field("endpoint", &self.endpoint)
+            .field("self_mute", &self.self_mute)
+            .field("self_deaf", &self.self_deaf)
+            .finish()
+    }
+}
+
 /// Backend -> UI.
 #[derive(Debug)]
 pub enum AppEvent {
     Gateway(GatewayEvent),
+    Voice(AppVoiceEvent),
     /// A history page. `before` echoes the request: `None` is the newest page
     /// (`Store::insert_history`), `Some` an older page (`Store::insert_older_history`).
     History {
@@ -195,6 +266,12 @@ pub enum Command {
         archived: Option<bool>,
         locked: Option<bool>,
     },
+    /// Connect the voice gateway + transport once both VOICE_STATE_UPDATE and VOICE_SERVER_UPDATE arrive.
+    ConnectVoice(VoiceConnectParams),
+    /// Control an active voice session (mute, deaf, volume, devices).
+    Voice(VoiceControl),
+    /// Stop the active voice session.
+    DisconnectVoice,
     Logout,
 }
 
@@ -268,12 +345,130 @@ impl Session {
     }
 }
 
+#[cfg(feature = "voice")]
+struct VoiceHandle {
+    commands: mpsc::UnboundedSender<nixcord_voice::VoiceCommand>,
+}
+
+#[cfg(feature = "voice")]
+impl VoiceHandle {
+    fn spawn(params: VoiceConnectParams, events: EventTx) -> Self {
+        let (vcmd_tx, vcmd_rx) = mpsc::unbounded_channel();
+        let (vev_tx, mut vev_rx) = mpsc::unbounded_channel();
+        let (_out_tx, out_rx) = mpsc::unbounded_channel();
+        let (in_tx, mut in_rx) = mpsc::unbounded_channel();
+
+        let _ = vcmd_tx.send(nixcord_voice::VoiceCommand::SetMute(params.self_mute));
+        let _ = vcmd_tx.send(nixcord_voice::VoiceCommand::SetDeaf(params.self_deaf));
+        let _ = vcmd_tx.send(nixcord_voice::VoiceCommand::SetInputGain(params.input_gain));
+        let _ = vcmd_tx.send(nixcord_voice::VoiceCommand::SetOutputVolume(
+            params.output_volume,
+        ));
+        if params.input_device.is_some() {
+            let _ = vcmd_tx.send(nixcord_voice::VoiceCommand::SetInputDevice(
+                params.input_device.clone(),
+            ));
+        }
+        if params.output_device.is_some() {
+            let _ = vcmd_tx.send(nixcord_voice::VoiceCommand::SetOutputDevice(
+                params.output_device.clone(),
+            ));
+        }
+
+        let join = nixcord_voice::VoiceJoinInfo {
+            guild_id: params.guild_id,
+            channel_id: params.channel_id,
+            user_id: params.user_id,
+            session_id: params.session_id,
+            token: params.token,
+            endpoint: params.endpoint,
+        };
+
+        tokio::spawn(async move { while in_rx.recv().await.is_some() {} });
+
+        let ev_out = events.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = vev_rx.recv().await {
+                ev_out.send(AppEvent::Voice(map_voice_event(ev)));
+            }
+        });
+
+        tokio::spawn(async move {
+            if let Err(e) = nixcord_voice::gateway::run(join, vcmd_rx, vev_tx, out_rx, in_tx).await
+            {
+                tracing::warn!("voice gateway stopped: {e}");
+            }
+        });
+
+        Self { commands: vcmd_tx }
+    }
+
+    fn send(&self, ctrl: VoiceControl) {
+        if let Some(cmd) = map_voice_control(ctrl) {
+            let _ = self.commands.send(cmd);
+        }
+    }
+
+    fn stop(self) {
+        let _ = self.commands.send(nixcord_voice::VoiceCommand::Disconnect);
+    }
+}
+
+#[cfg(feature = "voice")]
+fn map_voice_event(ev: nixcord_voice::VoiceEvent) -> AppVoiceEvent {
+    match ev {
+        nixcord_voice::VoiceEvent::Connecting {
+            guild_id,
+            channel_id,
+        } => AppVoiceEvent::Connecting {
+            guild_id,
+            channel_id,
+        },
+        nixcord_voice::VoiceEvent::Connected {
+            guild_id,
+            channel_id,
+            endpoint,
+        } => AppVoiceEvent::Connected {
+            guild_id,
+            channel_id,
+            endpoint,
+        },
+        nixcord_voice::VoiceEvent::Speaking {
+            user_id, speaking, ..
+        } => AppVoiceEvent::Speaking { user_id, speaking },
+        nixcord_voice::VoiceEvent::Ping(ms) => AppVoiceEvent::Ping(ms),
+        nixcord_voice::VoiceEvent::SelfSpeaking(s) => AppVoiceEvent::SelfSpeaking(s),
+        nixcord_voice::VoiceEvent::Disconnected { reason } => {
+            AppVoiceEvent::Disconnected { reason }
+        }
+    }
+}
+
+#[cfg(feature = "voice")]
+fn map_voice_control(ctrl: VoiceControl) -> Option<nixcord_voice::VoiceCommand> {
+    match ctrl {
+        VoiceControl::SetMute(m) => Some(nixcord_voice::VoiceCommand::SetMute(m)),
+        VoiceControl::SetDeaf(d) => Some(nixcord_voice::VoiceCommand::SetDeaf(d)),
+        VoiceControl::SetInputGain(g) => Some(nixcord_voice::VoiceCommand::SetInputGain(g)),
+        VoiceControl::SetOutputVolume(v) => Some(nixcord_voice::VoiceCommand::SetOutputVolume(v)),
+        VoiceControl::SetInputDevice(d) => Some(nixcord_voice::VoiceCommand::SetInputDevice(d)),
+        VoiceControl::SetOutputDevice(d) => Some(nixcord_voice::VoiceCommand::SetOutputDevice(d)),
+        VoiceControl::SetVadThreshold(_) => None,
+    }
+}
+
 async fn worker(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx) {
     let mut session: Option<Session> = None;
+    #[cfg(feature = "voice")]
+    let mut voice_session: Option<VoiceHandle> = None;
 
     while let Some(cmd) = commands.recv().await {
         match cmd {
             Command::Login(token) => {
+                #[cfg(feature = "voice")]
+                if let Some(old_v) = voice_session.take() {
+                    old_v.stop();
+                }
                 if let Some(old) = session.take() {
                     old.stop();
                 }
@@ -295,7 +490,42 @@ async fn worker(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx)
                     let _ = s.gateway.send(cmd);
                 }
             }
+            Command::ConnectVoice(params) => {
+                #[cfg(feature = "voice")]
+                {
+                    if let Some(old_v) = voice_session.take() {
+                        old_v.stop();
+                    }
+                    voice_session = Some(VoiceHandle::spawn(params, events.clone()));
+                }
+                #[cfg(not(feature = "voice"))]
+                {
+                    let _ = params;
+                    events.send(AppEvent::Voice(AppVoiceEvent::Disconnected {
+                        reason: Some("Voice support is disabled in this build.".into()),
+                    }));
+                }
+            }
+            Command::Voice(ctrl) => {
+                #[cfg(feature = "voice")]
+                if let Some(v) = &voice_session {
+                    v.send(ctrl);
+                }
+                #[cfg(not(feature = "voice"))]
+                let _ = ctrl;
+            }
+            Command::DisconnectVoice =>
+            {
+                #[cfg(feature = "voice")]
+                if let Some(old_v) = voice_session.take() {
+                    old_v.stop();
+                }
+            }
             Command::Logout => {
+                #[cfg(feature = "voice")]
+                if let Some(old_v) = voice_session.take() {
+                    old_v.stop();
+                }
                 if let Some(old) = session.take() {
                     old.stop();
                 }
@@ -314,6 +544,10 @@ async fn worker(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx)
                 tokio::spawn(rest(s.http.clone(), cmd, events.clone()));
             }
         }
+    }
+    #[cfg(feature = "voice")]
+    if let Some(old_v) = voice_session.take() {
+        old_v.stop();
     }
     if let Some(old) = session.take() {
         old.stop();
@@ -581,7 +815,12 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
             Ok(ch) => events.send(AppEvent::Gateway(GatewayEvent::ThreadUpdate(Box::new(ch)))),
             Err(e) => events.send(AppEvent::Error(format!("Couldn't update thread: {e}"))),
         },
-        Command::Login(_) | Command::Logout | Command::Gateway(_) => {}
+        Command::Login(_)
+        | Command::Logout
+        | Command::Gateway(_)
+        | Command::ConnectVoice(_)
+        | Command::Voice(_)
+        | Command::DisconnectVoice => {}
     }
 }
 

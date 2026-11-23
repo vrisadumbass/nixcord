@@ -14,13 +14,15 @@ enum Page {
     #[default]
     Appearance,
     Chat,
+    Voice,
     Account,
     About,
 }
 
-const PAGES: [(Page, &str); 4] = [
+const PAGES: [(Page, &str); 5] = [
     (Page::Appearance, "Appearance"),
     (Page::Chat, "Chat"),
+    (Page::Voice, "Voice & Audio"),
     (Page::Account, "My Account"),
     (Page::About, "About"),
 ];
@@ -206,6 +208,7 @@ pub fn window(ctx: &egui::Context, app: &mut NixApp, actions: &mut Vec<Action>) 
                         .show(ui, |ui| match page {
                             Page::Appearance => appearance(ui, app),
                             Page::Chat => chat_prefs(ui, app),
+                            Page::Voice => super::voice::settings_section(ui, app, actions),
                             Page::Account => account(ui, app, actions),
                             Page::About => about(ui, app),
                         });
@@ -214,6 +217,7 @@ pub fn window(ctx: &egui::Context, app: &mut NixApp, actions: &mut Vec<Action>) 
     ctx.data_mut(|d| d.insert_temp(page_id(), page));
     if close || resp.should_close() {
         app.settings_open = false;
+        app.view.voice.devices_loaded = false;
     }
 }
 
