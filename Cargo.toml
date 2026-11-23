@@ -6,7 +6,7 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/nixxane/nixcord"
+repository = "https://github.com/vrisadumbass/nixcord"
 
 [workspace.dependencies]
 nixcord-model = { path = "crates/nixcord-model" }

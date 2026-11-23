@@ -115,7 +115,10 @@ impl From<ChannelKind> for u8 {
 impl ChannelKind {
     /// Can the user read/send messages here in this client?
     pub fn is_textual(self) -> bool {
-        matches!(self, Self::Text | Self::Dm | Self::GroupDm | Self::Announcement)
+        matches!(
+            self,
+            Self::Text | Self::Dm | Self::GroupDm | Self::Announcement
+        )
     }
 }
 
@@ -253,20 +256,31 @@ pub enum GatewayEvent {
     Connecting,
     Ready(Box<Ready>),
     Resumed,
-    Disconnected { reason: String, will_retry: bool },
+    Disconnected {
+        reason: String,
+        will_retry: bool,
+    },
     /// Token rejected (close code 4004). App should return to the login screen.
     AuthFailed,
 
     GuildCreate(Box<Guild>),
     GuildUpdate(Box<Guild>),
-    GuildDelete { id: Snowflake },
+    GuildDelete {
+        id: Snowflake,
+    },
     ChannelCreate(Box<Channel>),
     ChannelUpdate(Box<Channel>),
     ChannelDelete(Box<Channel>),
     MessageCreate(Box<Message>),
     MessageUpdate(Box<MessageUpdate>),
-    MessageDelete { id: Snowflake, channel_id: Snowflake },
-    TypingStart { channel_id: Snowflake, user_id: Snowflake },
+    MessageDelete {
+        id: Snowflake,
+        channel_id: Snowflake,
+    },
+    TypingStart {
+        channel_id: Snowflake,
+        user_id: Snowflake,
+    },
 }
 
 #[cfg(test)]
@@ -284,7 +298,8 @@ mod tests {
     #[test]
     fn channel_kind_roundtrip() {
         let c: Channel =
-            serde_json::from_str(r#"{"id":"1","type":4,"name":"cat","unknown_field":true}"#).unwrap();
+            serde_json::from_str(r#"{"id":"1","type":4,"name":"cat","unknown_field":true}"#)
+                .unwrap();
         assert_eq!(c.kind, ChannelKind::Category);
         let c: Channel = serde_json::from_str(r#"{"id":"1","type":99}"#).unwrap();
         assert_eq!(c.kind, ChannelKind::Other(99));

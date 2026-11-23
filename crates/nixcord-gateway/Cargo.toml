@@ -8,7 +8,12 @@ license.workspace = true
 [dependencies]
 nixcord-model.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+# tokio-tungstenite builds rustls with no crypto provider; pick `ring` (no cmake/nasm needed
+# on Windows) and install it as the process default at startup.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
