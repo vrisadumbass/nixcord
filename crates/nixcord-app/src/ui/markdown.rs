@@ -442,7 +442,8 @@ enum RunKind<'d> {
     Emoji {
         tex: Option<egui::TextureId>,
         size: f32,
-        glyph: &'d str,
+        glyph: Cow<'d, str>,
+        color: Color32,
     },
     Timestamp {
         tooltip: String,
@@ -919,7 +920,7 @@ impl<'a> Renderer<'_, 'a> {
                         });
                     }
                 }
-                Inline::Mention(m) => self.mention(b, m, st),
+                Inline::Mention(m) => self.mention(ui, b, m, st),
                 Inline::CustomEmoji { name, id, animated } => {
                     let size = if self.jumbo {
                         48.0
@@ -941,7 +942,8 @@ impl<'a> Renderer<'_, 'a> {
                                     kind: RunKind::Emoji {
                                         tex: Some(tex),
                                         size,
-                                        glyph: "",
+                                        glyph: Cow::Borrowed(""),
+                                        color: st.color,
                                     },
                                     chars,
                                 });
@@ -1005,7 +1007,8 @@ impl<'a> Renderer<'_, 'a> {
                             kind: RunKind::Emoji {
                                 tex,
                                 size,
-                                glyph: e,
+                                glyph: Cow::Borrowed(e),
+                                color: st.color,
                             },
                             chars,
                         });
@@ -1015,7 +1018,7 @@ impl<'a> Renderer<'_, 'a> {
         }
     }
 
-    fn mention(&mut self, b: &mut Builder<'_>, m: &Mention, st: Style) {
+    fn mention<'d>(&mut self, ui: &Ui, b: &mut Builder<'d>, m: &Mention, st: Style) {
         let t = self.t();
         let r = self.ctx.resolver;
         let me = match m {
@@ -1054,8 +1057,45 @@ impl<'a> Renderer<'_, 'a> {
         } else {
             base.lerp_to_gamma(Color32::BLACK, 0.25)
         };
+        let pill_st = Style { color: fg, ..st };
         b.pad += 2.0;
-        let chars = b.push(&text, self.fmt(&Style { color: fg, ..st }));
+        let start = b.chars;
+        match self.ctx.emoji {
+            Some(images) if !pill_st.mono => {
+                let size = (pill_st.size * emoji_text::LABEL_SCALE).round();
+                let lh = Some(pill_st.line_height.max(size));
+                for run in nixcord_emoji::emoji_runs(&text) {
+                    match run {
+                        nixcord_emoji::TextOrEmoji::Text(seg) => {
+                            b.push(seg, self.fmt(&pill_st));
+                        }
+                        nixcord_emoji::TextOrEmoji::Emoji(e) => {
+                            let tex = if pill_st.hidden {
+                                None
+                            } else {
+                                images.unicode(ui.ctx(), e, size)
+                            };
+                            let chars = b.push_emoji(size, lh);
+                            if !pill_st.hidden {
+                                b.runs.push(Run {
+                                    kind: RunKind::Emoji {
+                                        tex,
+                                        size,
+                                        glyph: Cow::Owned(e.to_owned()),
+                                        color: fg,
+                                    },
+                                    chars,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                b.push(&text, self.fmt(&pill_st));
+            }
+        }
+        let chars = start..b.chars;
         b.pad = 2.0;
         if !st.hidden {
             b.runs.push(Run {
@@ -1185,7 +1225,12 @@ impl<'a> Renderer<'_, 'a> {
         // Foreground: emoji images, link hover underline.
         for &(ri, r) in &rects {
             match &runs[ri].kind {
-                RunKind::Emoji { tex, size, glyph } => {
+                RunKind::Emoji {
+                    tex,
+                    size,
+                    glyph,
+                    color,
+                } => {
                     let img = Rect::from_center_size(r.center(), Vec2::splat(*size));
                     match tex {
                         Some(tex) => {
@@ -1196,15 +1241,10 @@ impl<'a> Renderer<'_, 'a> {
                                 Color32::WHITE,
                             );
                         }
-                        None => {
-                            p.text(
-                                img.center(),
-                                Align2::CENTER_CENTER,
-                                emoji_text::glyph(glyph),
-                                FontId::proportional((*size * 0.8).round()),
-                                t.text,
-                            );
+                        None if !glyph.is_empty() => {
+                            emoji_text::paint_fallback(p, img, glyph, *color);
                         }
+                        None => {}
                     }
                 }
                 RunKind::Link { .. } if hovered == Some(ri) => {
@@ -1363,5 +1403,61 @@ mod tests {
         assert!(!tip.is_empty());
         let (text, _) = format_timestamp(i64::MAX, TimestampStyle::ShortTime, false);
         assert!(text.starts_with("<t:"));
+    }
+
+    #[test]
+    fn mention_pills_render_color_twemoji() {
+        use std::cell::RefCell;
+
+        struct EmojiNames;
+        impl Resolver for EmojiNames {
+            fn user(&self, _: u64) -> Option<MentionInfo<'_>> {
+                Some(MentionInfo {
+                    name: "Ferris \u{1F980}".into(),
+                    color: None,
+                })
+            }
+            fn role(&self, _: u64) -> Option<MentionInfo<'_>> {
+                None
+            }
+            fn channel(&self, _: u64) -> Option<MentionInfo<'_>> {
+                Some(MentionInfo {
+                    name: "\u{1F4A1}-suggestions".into(),
+                    color: None,
+                })
+            }
+        }
+
+        struct RecordingEmoji(RefCell<Vec<String>>);
+        impl EmojiImages for RecordingEmoji {
+            fn texture(
+                &self,
+                _: &egui::Context,
+                _: u64,
+                _: bool,
+                _: f32,
+            ) -> Option<egui::TextureId> {
+                None
+            }
+            fn unicode(&self, _: &egui::Context, emoji: &str, _: f32) -> Option<egui::TextureId> {
+                self.0.borrow_mut().push(emoji.to_owned());
+                Some(egui::TextureId::default())
+            }
+        }
+
+        let ctx = egui_ctx();
+        let theme = crate::theme::by_name("Graphite");
+        let rec = RecordingEmoji(RefCell::new(Vec::new()));
+        let doc = parse("check <#4> with <@1>");
+        frame(&ctx, &mut |ui| {
+            ui.set_max_width(400.0);
+            let mut rc = RenderCtx::new(theme, &EmojiNames, Id::unique("mention-emoji"));
+            rc.emoji = Some(&rec);
+            render(ui, &doc, &rc);
+        });
+        assert_eq!(
+            *rec.0.borrow(),
+            vec!["\u{1F4A1}".to_string(), "\u{1F980}".to_string()]
+        );
     }
 }

@@ -56,18 +56,95 @@ pub(crate) fn append_placeholder(
     job.append(PLACEHOLDER, (size - 0.6).max(1.0), f);
 }
 
-/// The emoji as the font can draw it: without U+FE0F, which the monochrome emoji font has
-/// no glyph for.
+fn is_fallback_strip(c: char) -> bool {
+    c == '\u{FE0F}' || ('\u{1F3FB}'..='\u{1F3FF}').contains(&c)
+}
+
+/// The emoji as the monochrome fallback font can draw it: takes the first ZWJ component and
+/// strips U+FE0F and skin-tone modifiers, which the bundled monochrome emoji font lacks.
 pub fn glyph(emoji: &str) -> Cow<'_, str> {
-    if emoji.contains('\u{FE0F}') {
-        Cow::Owned(emoji.replace('\u{FE0F}', ""))
-    } else {
+    let base = emoji.split('\u{200D}').next().unwrap_or(emoji);
+    if base.len() == emoji.len() && !base.chars().any(is_fallback_strip) {
         Cow::Borrowed(emoji)
+    } else if !base.chars().any(is_fallback_strip) {
+        Cow::Borrowed(base)
+    } else {
+        Cow::Owned(base.chars().filter(|&c| !is_fallback_strip(c)).collect())
     }
 }
 
-/// Paint `emoji` into `rect`: the Twemoji texture, or the font glyph in `color` while it
-/// loads (or if it can't).
+/// Two-letter ASCII country code for a regional-indicator flag pair (`🇯🇵` -> `b"JP"`).
+pub fn flag_code(emoji: &str) -> Option<[u8; 2]> {
+    let mut it = emoji.chars();
+    let a = it.next()?;
+    let b = it.next()?;
+    if it.next().is_some() {
+        return None;
+    }
+    let to_ascii = |c: char| {
+        ('\u{1F1E6}'..='\u{1F1FF}')
+            .contains(&c)
+            .then(|| b'A' + (c as u32 - 0x1F1E6) as u8)
+    };
+    Some([to_ascii(a)?, to_ascii(b)?])
+}
+
+/// Whether the loaded font family has real glyphs for every character in `s` (never tofu).
+pub fn has_font_glyphs(ctx: &egui::Context, font: &FontId, s: &str) -> bool {
+    !s.is_empty() && ctx.fonts_mut(|f| f.has_glyphs(font, s))
+}
+
+/// Paint a non-texture fallback for `emoji` into `rect` without ever drawing tofu boxes:
+/// 2-letter flag badge for regional-indicator pairs, monochrome font glyph when covered, or
+/// a clean rounded badge otherwise.
+pub fn paint_fallback(painter: &Painter, rect: Rect, emoji: &str, color: Color32) {
+    let size = rect.width().min(rect.height());
+    if let Some(code) = flag_code(emoji) {
+        let text = std::str::from_utf8(&code).unwrap_or("");
+        let badge = Rect::from_center_size(rect.center(), Vec2::new(size, (size * 0.78).max(4.0)));
+        painter.rect_filled(
+            badge,
+            CornerRadius::same((size * 0.16).round().clamp(1.0, 255.0) as u8),
+            color.gamma_multiply(0.14),
+        );
+        painter.text(
+            badge.center(),
+            Align2::CENTER_CENTER,
+            text,
+            FontId::proportional((size * 0.54).max(6.0)),
+            color,
+        );
+        return;
+    }
+    let g = glyph(emoji);
+    let font = FontId::proportional((size * 0.8).max(6.0));
+    if has_font_glyphs(painter.ctx(), &font, &g) {
+        painter.text(rect.center(), Align2::CENTER_CENTER, g, font, color);
+    } else {
+        let badge = Rect::from_center_size(rect.center(), Vec2::splat((size * 0.86).max(4.0)));
+        painter.rect_filled(
+            badge,
+            CornerRadius::same((size * 0.22).round().clamp(1.0, 255.0) as u8),
+            color.gamma_multiply(0.14),
+        );
+        if let Some(ch) = nixcord_emoji::find(emoji)
+            .and_then(|e| e.shortcode().chars().find(|c| c.is_ascii_alphanumeric()))
+        {
+            let mut buf = [0u8; 4];
+            let s = ch.to_ascii_uppercase().encode_utf8(&mut buf);
+            painter.text(
+                badge.center(),
+                Align2::CENTER_CENTER,
+                s,
+                FontId::proportional((size * 0.54).max(6.0)),
+                color.gamma_multiply(0.85),
+            );
+        }
+    }
+}
+
+/// Paint `emoji` into `rect`: the Twemoji texture, or a non-tofu fallback in `color` while
+/// it loads (or if it can't).
 pub fn paint_emoji(
     painter: &Painter,
     rect: Rect,
@@ -91,15 +168,7 @@ pub fn paint_emoji(
                     .with_texture(t.id, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))),
             );
         }
-        None => {
-            painter.text(
-                rect.center(),
-                Align2::CENTER_CENTER,
-                glyph(emoji),
-                FontId::proportional((size * 0.8).max(6.0)),
-                color,
-            );
-        }
+        None => paint_fallback(painter, rect, emoji, color),
     }
 }
 
@@ -277,5 +346,31 @@ mod tests {
         });
         out.textures_delta.clear();
         assert_eq!(glyph("\u{2764}\u{FE0F}"), "\u{2764}");
+        assert_eq!(glyph("\u{1F44D}\u{1F3FD}"), "\u{1F44D}");
+        assert_eq!(glyph("\u{2764}\u{FE0F}\u{200D}\u{1F525}"), "\u{2764}");
+        assert_eq!(flag_code("\u{1F1EF}\u{1F1F5}"), Some(*b"JP"));
+        assert_eq!(flag_code("\u{1F980}"), None);
+        assert_eq!(flag_code("JP"), None);
+    }
+
+    #[test]
+    fn fallback_never_paints_tofu_for_missing_glyphs() {
+        let ctx = egui::Context::default();
+        let mut missing_crab = false;
+        let mut has_thumbs = false;
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let font = FontId::proportional(14.0);
+                missing_crab = !has_font_glyphs(ui.ctx(), &font, "\u{1F980}");
+                has_thumbs = has_font_glyphs(ui.ctx(), &font, &glyph("\u{1F44D}\u{1F3FD}"));
+                let rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(18.0));
+                paint_fallback(ui.painter(), rect, "\u{1F980}", Color32::WHITE);
+                paint_fallback(ui.painter(), rect, "\u{1F1EF}\u{1F1F5}", Color32::WHITE);
+                paint_fallback(ui.painter(), rect, "\u{1F44D}\u{1F3FD}", Color32::WHITE);
+            });
+            out.textures_delta.clear();
+        }
+        assert!(missing_crab, "default egui fonts lack U+1F980 crab");
+        assert!(has_thumbs, "default egui fonts cover U+1F44D thumbsup");
     }
 }

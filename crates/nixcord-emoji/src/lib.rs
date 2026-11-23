@@ -56,9 +56,39 @@ pub fn twemoji_name(emoji: &str) -> String {
             return "1f441-200d-1f5e8".into();
         }
     }
-    let keep_vs = emoji.contains(ZWJ);
-    let mut out = String::with_capacity(emoji.len() * 3);
-    for c in emoji.chars() {
+    // If an unqualified ZWJ sequence arrives (e.g. a Discord reaction missing U+FE0F like
+    // 🏳‍🌈), restore its canonical U+FE0F-qualified form (preserving skin tones) so
+    // Twemoji's file name matches.
+    let canonical: Cow<'_, str> = if emoji.contains(ZWJ) {
+        match find(emoji) {
+            Some(e) => {
+                let mut tones = emoji.chars().filter(|&c| is_tone(c));
+                let first_tone = tones.next();
+                let mixed = first_tone.is_some_and(|t| tones.any(|o| o != t));
+                if mixed {
+                    Cow::Borrowed(emoji)
+                } else {
+                    let tone = first_tone.map_or(0, |c| (c as u32 - 0x1F3FA) as u8);
+                    let cand = e.with_skin_tone(tone);
+                    if cand
+                        .chars()
+                        .filter(|&c| is_tone(c))
+                        .eq(emoji.chars().filter(|&c| is_tone(c)))
+                    {
+                        cand
+                    } else {
+                        Cow::Borrowed(emoji)
+                    }
+                }
+            }
+            None => Cow::Borrowed(emoji),
+        }
+    } else {
+        Cow::Borrowed(emoji)
+    };
+    let keep_vs = canonical.contains(ZWJ);
+    let mut out = String::with_capacity(canonical.len() * 3);
+    for c in canonical.chars() {
         if c == VS16 && !keep_vs {
             continue;
         }
@@ -434,9 +464,10 @@ fn starts_with_ci(s: &str, prefix: &str) -> bool {
 }
 
 /// Search like Discord's picker and autocomplete: exact shortcode first, then shortcode
-/// prefix, then a word inside a shortcode, then keywords and name words. Ties go to the
-/// shorter shortcode, then table order. Returns at most `limit` results with how each
-/// one matched.
+/// prefix, then a word inside a shortcode, then keywords and name words. Within a tier,
+/// primary shortcodes outrank secondary aliases, shorter shortcodes win (with a slight
+/// preference for `Category::People` smileys/hearts/gestures), then table order. Returns at
+/// most `limit` results with how each one matched.
 pub fn search(query: &str, limit: usize) -> Vec<(Emoji, MatchKind)> {
     let q = query
         .trim()
@@ -446,13 +477,24 @@ pub fn search(query: &str, limit: usize) -> Vec<(Emoji, MatchKind)> {
     if q.is_empty() || limit == 0 {
         return Vec::new();
     }
-    let mut hits: Vec<(MatchKind, usize, Emoji)> = Vec::new();
+    let mut hits: Vec<(MatchKind, bool, usize, Emoji)> = Vec::new();
     for e in all() {
-        let mut best: Option<(MatchKind, usize)> = None;
-        for n in e.shortcodes() {
+        let people_bonus = if e.category() == Category::People {
+            2
+        } else {
+            0
+        };
+        let mut best: Option<(MatchKind, bool, usize)> = None;
+        for (i, n) in e.shortcodes().enumerate() {
             if let Some(k) = match_name(n, &q) {
-                if best.is_none_or(|b| (k, n.len()) < b) {
-                    best = Some((k, n.len()));
+                let alias = i > 0;
+                let score = match k {
+                    MatchKind::Exact => n.len(),
+                    _ => n.len().saturating_sub(people_bonus),
+                };
+                let key = (k, alias, score);
+                if best.is_none_or(|b| key < b) {
+                    best = Some(key);
                 }
             }
         }
@@ -462,14 +504,18 @@ pub fn search(query: &str, limit: usize) -> Vec<(Emoji, MatchKind)> {
                     .split([' ', '-', ':', ','])
                     .any(|w| starts_with_ci(w, &q));
             if kw {
-                best = Some((MatchKind::Keyword, e.shortcode().len()));
+                best = Some((
+                    MatchKind::Keyword,
+                    false,
+                    e.shortcode().len().saturating_sub(people_bonus),
+                ));
             }
         }
-        if let Some((k, l)) = best {
-            hits.push((k, l, e));
+        if let Some((k, alias, score)) = best {
+            hits.push((k, alias, score, e));
         }
     }
-    hits.sort_by_key(|&(k, l, e)| (k, l, e.0));
+    hits.sort_by_key(|&(k, alias, score, e)| (k, alias, score, e.0));
     hits.truncate(limit);
-    hits.into_iter().map(|(k, _, e)| (e, k)).collect()
+    hits.into_iter().map(|(k, _, _, e)| (e, k)).collect()
 }

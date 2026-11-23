@@ -198,7 +198,8 @@ fn emoji_guilds(app: &NixApp) -> Vec<&nixcord_model::Guild> {
 }
 
 /// Unicode and custom emoji matching `q` (lowercase, no colons), best first: both kinds
-/// ranked by the same tiers (exact, prefix, word, keyword), custom first within a tier.
+/// ranked by the same tiers (exact, prefix, word, keyword) and shortcode length, custom
+/// first on ties.
 fn search_cells<'a>(app: &'a NixApp, q: &str, limit: usize) -> Vec<Cell<'a>> {
     let mut custom: Vec<(nixcord_emoji::MatchKind, usize, Cell<'a>)> = Vec::new();
     for g in emoji_guilds(app) {
@@ -214,7 +215,14 @@ fn search_cells<'a>(app: &'a NixApp, q: &str, limit: usize) -> Vec<Cell<'a>> {
     let (mut ci, mut ui) = (0, 0);
     while cells.len() < limit && (ci < custom.len() || ui < uni.len()) {
         let take_custom = match (custom.get(ci), uni.get(ui)) {
-            (Some(c), Some(u)) => c.0 <= u.1,
+            (Some(c), Some(u)) => {
+                let u_len =
+                    u.0.shortcodes()
+                        .filter_map(|n| nixcord_emoji::match_name(n, q).map(|k| (k, n.len())))
+                        .min()
+                        .map_or(u.0.shortcode().len(), |(_, l)| l);
+                (c.0, c.1) <= (u.1, u_len)
+            }
             (Some(_), None) => true,
             _ => false,
         };
