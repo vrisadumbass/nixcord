@@ -397,10 +397,10 @@ fn ready() -> Ready {
 const LINES: &[&str] = &[
     "Does the client remember which channel I had open after a restart?",
     "Pretty sure it does, the last channel is saved with the theme.",
-    "Does the client remember which channel I had open after a restart?",
+    "not yet. right now it opens the DM list first, but restoring the last channel is on the list.",
     "would be a one-line change in the prefs struct honestly",
     "For some reason my scroll position jumps when an image loads. Am I doing something wrong?",
-    "check settings -> chat, there is a toggle for that.",
+    "check settings -> chat. there is a toggle for reserving image space.",
     "also make sure you are on the latest build, that got fixed last week",
     "lol",
     "ok that fixed it, thanks!",
