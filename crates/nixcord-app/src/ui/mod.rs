@@ -126,6 +126,16 @@ pub enum Action {
         message: Option<String>,
         applied_tags: Vec<Snowflake>,
     },
+    /// Archive/unarchive or lock/unlock a thread (`PATCH /channels/{thread_id}`).
+    UpdateThread {
+        thread_id: Snowflake,
+        archived: Option<bool>,
+        locked: Option<bool>,
+    },
+    /// Locally mark a channel or thread read (and send a best-effort REST `ack`).
+    MarkChannelRead(Snowflake),
+    /// Locally mark every channel and thread in a guild read.
+    MarkGuildRead(Snowflake),
     /// Trigger a Discord type-3 message component interaction (button or select menu).
     Interact {
         channel_id: Snowflake,

@@ -15,9 +15,9 @@
 //! [`Store::guild_channels`] instead.
 
 use nixcord_model::{
-    permissions as perm, Channel, ChannelKind, Emoji, GatewayEvent, Guild, GuildMember, Message,
-    MessageUpdate, OverwriteKind, PartialMember, Presence, Reaction, Relationship,
-    RelationshipKind, Role, Snowflake, Status, User,
+    permissions as perm, Channel, ChannelKind, CustomStatus, Emoji, GatewayEvent, Guild,
+    GuildMember, Message, MessageUpdate, OverwriteKind, PartialMember, Presence, Reaction,
+    Relationship, RelationshipKind, Role, Snowflake, Status, User,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -149,6 +149,7 @@ pub struct Store {
     /// target user -> relationship (friends, blocked, requests).
     relationships: HashMap<Snowflake, Relationship>,
     my_status: Status,
+    my_custom_status: Option<CustomStatus>,
     /// Member list of the focused guild only (see `set_member_list_focus`).
     member_list: Option<(Snowflake, MemberList)>,
     list_focus: Option<Snowflake>,
@@ -508,8 +509,27 @@ impl Store {
     }
 
     /// Locally mark `channel_id` read up to its newest known message and clear its
-    /// mention count.
+    /// mention count. If `channel_id` is a Forum channel, also marks its child threads read.
     pub fn mark_read(&mut self, channel_id: Snowflake) {
+        self.mark_single_channel_read(channel_id);
+        let is_forum = self
+            .channels
+            .get(&channel_id)
+            .is_some_and(|c| c.kind == ChannelKind::Forum);
+        if is_forum {
+            let child_ids: Vec<Snowflake> = self
+                .channels
+                .values()
+                .filter(|c| c.parent_id == Some(channel_id))
+                .map(|c| c.id)
+                .collect();
+            for tid in child_ids {
+                self.mark_single_channel_read(tid);
+            }
+        }
+    }
+
+    fn mark_single_channel_read(&mut self, channel_id: Snowflake) {
         let target = self
             .channels
             .get(&channel_id)
@@ -527,6 +547,24 @@ impl Store {
             }
         }
         entry.mention_count = 0;
+    }
+
+    /// Locally mark every channel and thread in `guild_id` read up to their newest known
+    /// message and clear all mention counts in that guild.
+    pub fn mark_guild_read(&mut self, guild_id: Snowflake) {
+        let ch_ids = self
+            .guild_channel_ids
+            .get(&guild_id)
+            .cloned()
+            .unwrap_or_default();
+        let th_ids = self
+            .guild_thread_ids
+            .get(&guild_id)
+            .cloned()
+            .unwrap_or_default();
+        for cid in ch_ids.into_iter().chain(th_ids) {
+            self.mark_single_channel_read(cid);
+        }
     }
 
     /// Locally mark `channel_id` read up to `message_id` (monotonic) and clear its
@@ -886,6 +924,11 @@ impl Store {
 
     /// Custom status or activity line for a user.
     pub fn status_text(&self, user: Snowflake) -> Option<String> {
+        if self.me.as_ref().is_some_and(|m| m.id == user) {
+            if let Some(label) = self.my_custom_status_text() {
+                return Some(label);
+            }
+        }
         self.presence(user)?.status_text()
     }
 
@@ -898,6 +941,21 @@ impl Store {
     /// PRESENCE_UPDATE; SESSIONS_REPLACE may follow).
     pub fn set_my_status(&mut self, status: Status) {
         self.my_status = status;
+    }
+
+    /// My own custom status, if set.
+    pub fn my_custom_status(&self) -> Option<&CustomStatus> {
+        self.my_custom_status.as_ref()
+    }
+
+    /// Formatted one-line custom status for myself (`"<emoji> <text>"`), if set.
+    pub fn my_custom_status_text(&self) -> Option<String> {
+        self.my_custom_status.as_ref()?.label()
+    }
+
+    /// Optimistically set or clear my custom status after sending op 3.
+    pub fn set_my_custom_status(&mut self, custom: Option<CustomStatus>) {
+        self.my_custom_status = custom.and_then(|c| c.normalized());
     }
 
     pub fn relationship(&self, user: Snowflake) -> Option<&Relationship> {
@@ -1598,7 +1656,10 @@ impl Store {
             None
         };
 
-        if th.is_archived() && !self.history_loaded.contains(&th.id) {
+        if th.is_archived()
+            && !self.history_loaded.contains(&th.id)
+            && !self.channels.contains_key(&th.id)
+        {
             self.remove_thread(th.id, prev_guild.or(th.guild_id));
             return;
         }

@@ -4,9 +4,10 @@
 use std::collections::HashMap;
 
 use nixcord_model::{
-    Activity, Channel, ClientStatus, Emoji, GatewayEvent, Guild, GuildMember, ListMember,
-    MemberListGroup, MemberListItem, MemberListOp, MemberListUpdate, Message, MessageUpdate,
-    Presence, ReadState, Ready, ReadySupplemental, Relationship, Snowflake, Status, User,
+    Activity, Channel, ClientStatus, CustomStatus, Emoji, GatewayEvent, Guild, GuildMember,
+    ListMember, MemberListGroup, MemberListItem, MemberListOp, MemberListUpdate, Message,
+    MessageUpdate, Presence, ReadState, Ready, ReadySupplemental, Relationship, Snowflake, Status,
+    User,
 };
 use serde::de::{DeserializeOwned, Error as _};
 use serde::Deserialize;
@@ -90,20 +91,44 @@ pub fn heartbeat_payload(seq: Option<u64>) -> String {
 /// {"op":3,"d":{"status":"dnd","since":0,"activities":[],"afk":false}}
 /// ```
 ///
-/// We send no activities (nixcord has no rich presence). Discord merges this session
-/// with the user's other sessions into the overall presence.
-pub fn presence_payload(status: Status) -> String {
+/// Includes an optional type-4 `"Custom Status"` activity when `custom` is non-empty.
+pub fn presence_payload(status: Status, custom: Option<&CustomStatus>) -> String {
     let status = match status {
         // `offline` can only be received; the sendable equivalent is `invisible`.
         Status::Offline => Status::Invisible,
         s => s,
     };
+    let activities: Vec<Value> = custom
+        .and_then(CustomStatus::normalized)
+        .map(|c| {
+            let mut obj = serde_json::Map::new();
+            obj.insert("type".into(), json!(4));
+            obj.insert("name".into(), json!("Custom Status"));
+            if let Some(state) = c.text {
+                obj.insert("state".into(), json!(state));
+            }
+            if let Some(emoji) = c.emoji {
+                let mut em = serde_json::Map::new();
+                if let Some(id) = emoji.id {
+                    em.insert("id".into(), json!(id));
+                }
+                if let Some(name) = emoji.name {
+                    em.insert("name".into(), json!(name));
+                }
+                if emoji.animated {
+                    em.insert("animated".into(), json!(true));
+                }
+                obj.insert("emoji".into(), Value::Object(em));
+            }
+            vec![Value::Object(obj)]
+        })
+        .unwrap_or_default();
     json!({
         "op": OP_PRESENCE_UPDATE,
         "d": {
             "status": status.as_str(),
             "since": 0,
-            "activities": [],
+            "activities": activities,
             "afk": false,
         },
     })
@@ -1483,7 +1508,7 @@ mod tests {
             )
         );
         assert_eq!(
-            v(&presence_payload(Status::Online))["d"]["status"],
+            v(&presence_payload(Status::Online, None))["d"]["status"],
             "online"
         );
     }

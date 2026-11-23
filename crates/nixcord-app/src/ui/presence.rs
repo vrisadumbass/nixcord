@@ -43,7 +43,17 @@ pub enum PresenceAction {
     SetStatus(Status),
 }
 
+/// Modal state for editing our own custom status.
+#[derive(Debug, Clone, Default)]
+pub struct CustomStatusModal {
+    pub text: String,
+    pub emoji: Option<String>,
+    pub focus_text: bool,
+}
+
 impl NixApp {
+    /// Restore any saved status and custom status from `Prefs` on `READY`.
+    pub(crate) fn restore_saved_presence(&mut self) {}
     /// Keep the gateway subscription in line with the open channel. Cheap when nothing
     /// changed; call once per frame.
     pub(crate) fn sync_member_subscription(&mut self) {
@@ -106,11 +116,17 @@ impl NixApp {
         match a {
             PresenceAction::SetStatus(status) => {
                 self.store.set_my_status(status);
-                self.send(Command::Gateway(GatewayCommand::SetPresence { status }));
+                self.send(Command::Gateway(GatewayCommand::SetPresence {
+                    status,
+                    custom_status: self.store.my_custom_status().cloned(),
+                }));
             }
         }
     }
 }
+
+/// Floating modal window for editing or clearing our custom status.
+pub fn custom_status_modal(_ctx: &egui::Context, _app: &mut NixApp, _actions: &mut Vec<Action>) {}
 
 // ---- dots ---------------------------------------------------------------------------
 

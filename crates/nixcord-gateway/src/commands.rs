@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use nixcord_model::{Snowflake, Status};
+use nixcord_model::{CustomStatus, Snowflake, Status};
 
 use crate::protocol::{self, GuildSubscription};
 
@@ -30,15 +30,18 @@ pub enum GatewayCommand {
         channel_id: Snowflake,
         ranges: Vec<(u32, u32)>,
     },
-    /// Set our own status (op 3).
-    SetPresence { status: Status },
+    /// Set our own status and optional custom status (op 3).
+    SetPresence {
+        status: Status,
+        custom_status: Option<CustomStatus>,
+    },
 }
 
 #[derive(Debug, Default)]
 pub struct Outbox {
     subs: BTreeMap<Snowflake, GuildSubscription>,
-    presence: Option<Status>,
-    last_presence: Option<Status>,
+    presence: Option<(Status, Option<CustomStatus>)>,
+    last_presence: Option<(Status, Option<CustomStatus>)>,
     sub_sent: Option<Instant>,
     presence_sent: Option<Instant>,
 }
@@ -61,9 +64,13 @@ impl Outbox {
                 self.subs
                     .insert(guild_id, GuildSubscription { channel_id, ranges });
             }
-            GatewayCommand::SetPresence { status } => {
-                self.presence = Some(status);
-                self.last_presence = Some(status);
+            GatewayCommand::SetPresence {
+                status,
+                custom_status,
+            } => {
+                let norm = custom_status.and_then(|c| c.normalized());
+                self.presence = Some((status, norm.clone()));
+                self.last_presence = Some((status, norm));
             }
         }
     }
@@ -72,7 +79,7 @@ impl Outbox {
     /// RESUMED.
     pub fn on_session_start(&mut self, fresh: bool) {
         if fresh && self.presence.is_none() {
-            self.presence = self.last_presence;
+            self.presence = self.last_presence.clone();
         }
     }
 
@@ -104,8 +111,8 @@ impl Outbox {
             self.sub_sent = Some(now);
         }
         if self.presence.is_some() && ready(self.presence_sent, PRESENCE_INTERVAL) {
-            if let Some(status) = self.presence.take() {
-                out.push(protocol::presence_payload(status));
+            if let Some((status, custom)) = self.presence.take() {
+                out.push(protocol::presence_payload(status, custom.as_ref()));
                 self.presence_sent = Some(now);
             }
         }
@@ -181,6 +188,7 @@ mod tests {
         let mut o = Outbox::new();
         o.push(GatewayCommand::SetPresence {
             status: Status::Dnd,
+            custom_status: None,
         });
         let sent = o.take_due(t0);
         assert_eq!(
@@ -189,9 +197,11 @@ mod tests {
         );
         o.push(GatewayCommand::SetPresence {
             status: Status::Idle,
+            custom_status: None,
         });
         o.push(GatewayCommand::SetPresence {
             status: Status::Offline,
+            custom_status: None,
         });
         assert!(o.take_due(t0 + Duration::from_secs(1)).is_empty());
         let sent = o.take_due(t0 + PRESENCE_INTERVAL);

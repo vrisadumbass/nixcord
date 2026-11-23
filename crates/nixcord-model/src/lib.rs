@@ -798,6 +798,65 @@ impl Activity {
     }
 }
 
+/// Custom status activity payload (`type: 4, name: "Custom Status"`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CustomStatus {
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub emoji: Option<Emoji>,
+}
+
+impl CustomStatus {
+    pub const MAX_CHARS: usize = 128;
+
+    /// Trim text, clamp to 128 characters, and normalize empty text/emoji to `None`.
+    pub fn normalized(&self) -> Option<Self> {
+        let text = self
+            .text
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.chars().take(Self::MAX_CHARS).collect::<String>());
+        let emoji = self
+            .emoji
+            .as_ref()
+            .filter(|e| {
+                e.id.is_some()
+                    || e.name
+                        .as_deref()
+                        .map(str::trim)
+                        .is_some_and(|n| !n.is_empty())
+            })
+            .cloned();
+        if text.is_none() && emoji.is_none() {
+            None
+        } else {
+            Some(Self { text, emoji })
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.normalized().is_none()
+    }
+
+    pub fn to_activity(&self) -> Option<Activity> {
+        let norm = self.normalized()?;
+        Some(Activity {
+            kind: ActivityKind::Custom,
+            name: "Custom Status".into(),
+            state: norm.text,
+            details: None,
+            emoji: norm.emoji,
+            url: None,
+        })
+    }
+
+    pub fn label(&self) -> Option<String> {
+        self.to_activity()?.label()
+    }
+}
+
 /// Per-platform status. Missing platforms are offline.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ClientStatus {

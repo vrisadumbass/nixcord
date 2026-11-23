@@ -39,6 +39,10 @@ pub struct Prefs {
     pub emoji_usage: Vec<(String, u32)>,
     /// Play GIFs / animated images inline; when off they play on hover.
     pub autoplay_gifs: bool,
+    /// Saved status override across restarts ("online", "idle", "dnd", "invisible").
+    pub saved_status: Option<String>,
+    /// Saved custom status across restarts.
+    pub custom_status: Option<nixcord_model::CustomStatus>,
 }
 
 impl Default for Prefs {
@@ -51,6 +55,8 @@ impl Default for Prefs {
             skin_tone: 0,
             emoji_usage: Vec::new(),
             autoplay_gifs: true,
+            saved_status: None,
+            custom_status: None,
         }
     }
 }
@@ -160,6 +166,7 @@ pub struct ViewState {
     pub search: ui::search::SearchState,
     pub forum: ui::forum::ForumState,
     pub create_thread: Option<ui::forum::CreateThreadModal>,
+    pub custom_status_modal: Option<ui::presence::CustomStatusModal>,
 }
 
 struct Toast {
@@ -360,6 +367,9 @@ impl NixApp {
                     self.seen_dirty = true;
                 }
                 self.store.apply(&ev);
+                if matches!(ev, GatewayEvent::Ready(_)) {
+                    self.restore_saved_presence();
+                }
                 if let GatewayEvent::MessageCreate(ref m) = ev {
                     if self.store.should_notify(m, self.view.channel) {
                         let text = format_mention_toast(&self.store, m);
@@ -808,6 +818,60 @@ impl NixApp {
                     message,
                     applied_tags,
                 });
+            }
+            Action::UpdateThread {
+                thread_id,
+                archived,
+                locked,
+            } => {
+                self.send(Command::UpdateThread {
+                    thread_id,
+                    archived,
+                    locked,
+                });
+            }
+            Action::MarkChannelRead(cid) => {
+                let info = self.store.channel(cid).map(|c| {
+                    let unread = self.is_unread(c) || self.store.channel_mention_count(c.id) > 0;
+                    (c.last_message_id, unread)
+                });
+                self.store.mark_read(cid);
+                if let Some((Some(last), was_unread)) = info {
+                    self.seen.insert(cid, last);
+                    if !self.demo && was_unread && self.acked.get(&cid) != Some(&last) {
+                        self.acked.insert(cid, last);
+                        self.send(Command::Ack {
+                            channel: cid,
+                            message: last,
+                        });
+                    }
+                }
+            }
+            Action::MarkGuildRead(gid) => {
+                let to_ack: Vec<(Snowflake, Option<Snowflake>, bool)> = self
+                    .store
+                    .guild_channels(gid)
+                    .into_iter()
+                    .chain(self.store.guild_threads(gid))
+                    .map(|c| {
+                        let unread =
+                            self.is_unread(c) || self.store.channel_mention_count(c.id) > 0;
+                        (c.id, c.last_message_id, unread)
+                    })
+                    .collect();
+                self.store.mark_guild_read(gid);
+                for (cid, last, was_unread) in to_ack {
+                    if let Some(last) = last {
+                        self.seen.insert(cid, last);
+                        if !self.demo && was_unread && self.acked.get(&cid) != Some(&last) {
+                            self.acked.insert(cid, last);
+                            self.send(Command::Ack {
+                                channel: cid,
+                                message: last,
+                            });
+                        }
+                    }
+                }
             }
             Action::Interact {
                 channel_id,
@@ -1263,6 +1327,7 @@ impl eframe::App for NixApp {
                 self.main_ui(ui, &mut actions);
                 ui::profile::show(&ctx, self, &mut actions);
                 ui::forum::create_modal(&ctx, self, &mut actions);
+                ui::presence::custom_status_modal(&ctx, self, &mut actions);
                 ui::settings::window(&ctx, self, &mut actions);
                 ui::chat::delete_modal(&ctx, self, &mut actions);
                 ui::viewer::show(&ctx, self);

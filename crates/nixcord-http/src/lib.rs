@@ -198,6 +198,24 @@ impl Route {
         r
     }
 
+    /// PATCH /channels/{thread_id} — archive/unarchive or lock/unlock a thread.
+    pub fn update_thread(
+        thread_id: Snowflake,
+        archived: Option<bool>,
+        locked: Option<bool>,
+    ) -> Self {
+        let mut r = Self::new(Method::Patch, format!("/channels/{thread_id}"));
+        let mut body = serde_json::Map::new();
+        if let Some(a) = archived {
+            body.insert("archived".into(), serde_json::Value::Bool(a));
+        }
+        if let Some(l) = locked {
+            body.insert("locked".into(), serde_json::Value::Bool(l));
+        }
+        r.body = Some(serde_json::Value::Object(body));
+        r
+    }
+
     /// `enforce_nonce` makes Discord dedupe retried sends with the same nonce. A reply
     /// adds `message_reference` and pings the replied-to author (`replied_user: true`).
     pub fn send_message(
@@ -727,6 +745,17 @@ impl Http {
         req: &CreateThreadRequest,
     ) -> Result<Channel> {
         self.json(Route::create_thread(parent_id, req)).await
+    }
+
+    /// PATCH /channels/{thread_id} — archive/unarchive or lock/unlock a thread.
+    pub async fn update_thread(
+        &self,
+        thread_id: Snowflake,
+        archived: Option<bool>,
+        locked: Option<bool>,
+    ) -> Result<Channel> {
+        self.json(Route::update_thread(thread_id, archived, locked))
+            .await
     }
 
     /// POST /channels/{id}/messages with optional multipart file attachments.

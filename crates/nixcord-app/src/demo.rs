@@ -1226,6 +1226,22 @@ fn vote_buttons(id: Snowflake, channel: Snowflake, bot: &User, t: u64) -> Messag
                 ..Default::default()
             })],
         }),
+        Component::ActionRow(ActionRow {
+            components: vec![Component::Select(SelectMenu {
+                kind: SelectKind::User,
+                custom_id: Some("assign_reviewer".into()),
+                placeholder: Some("Assign a reviewer".into()),
+                ..Default::default()
+            })],
+        }),
+        Component::ActionRow(ActionRow {
+            components: vec![Component::Select(SelectMenu {
+                kind: SelectKind::Channel,
+                custom_id: Some("announce_channel".into()),
+                placeholder: Some("Pick an announcement channel".into()),
+                ..Default::default()
+            })],
+        }),
     ];
     m
 }
@@ -1813,6 +1829,37 @@ pub async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx
                 }
                 events.send(AppEvent::ThreadCreated(Box::new(thread)));
             }
+            Command::UpdateThread {
+                thread_id,
+                archived,
+                locked,
+            } => {
+                let demo_ready = ready();
+                let mut ch = demo_ready
+                    .guilds
+                    .into_iter()
+                    .flat_map(|g| g.threads.into_iter())
+                    .find(|t| t.id == thread_id)
+                    .unwrap_or_else(|| Channel {
+                        id: thread_id,
+                        kind: ChannelKind::PublicThread,
+                        guild_id: Some(Snowflake(10)),
+                        name: Some(format!("thread-{thread_id}")),
+                        parent_id: Some(Snowflake(SHOWCASE_CHANNEL)),
+                        ..Default::default()
+                    });
+                let meta = ch.thread_metadata.get_or_insert(ThreadMetadata {
+                    archived: false,
+                    locked: false,
+                });
+                if let Some(a) = archived {
+                    meta.archived = a;
+                }
+                if let Some(l) = locked {
+                    meta.locked = l;
+                }
+                events.send(AppEvent::Gateway(GatewayEvent::ThreadUpdate(Box::new(ch))));
+            }
             Command::Interact(ix) => {
                 let events = events.clone();
                 let summary = if ix.values.is_empty() {
@@ -1857,7 +1904,7 @@ pub async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx
             }
             // The store already shows the new status; Discord would echo it through
             // SESSIONS_REPLACE.
-            Command::Gateway(GatewayCommand::SetPresence { status }) => {
+            Command::Gateway(GatewayCommand::SetPresence { status, .. }) => {
                 events.send(AppEvent::Gateway(GatewayEvent::OwnStatus(status)));
             }
         }

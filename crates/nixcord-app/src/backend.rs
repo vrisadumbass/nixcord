@@ -168,6 +168,11 @@ pub enum Command {
         message: Option<String>,
         applied_tags: Vec<Snowflake>,
     },
+    UpdateThread {
+        thread_id: Snowflake,
+        archived: Option<bool>,
+        locked: Option<bool>,
+    },
     Logout,
 }
 
@@ -517,6 +522,14 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
                 ))),
             }
         }
+        Command::UpdateThread {
+            thread_id,
+            archived,
+            locked,
+        } => match http.update_thread(thread_id, archived, locked).await {
+            Ok(ch) => events.send(AppEvent::Gateway(GatewayEvent::ThreadUpdate(Box::new(ch)))),
+            Err(e) => events.send(AppEvent::Error(format!("Couldn't update thread: {e}"))),
+        },
         Command::Login(_) | Command::Logout | Command::Gateway(_) => {}
     }
 }
