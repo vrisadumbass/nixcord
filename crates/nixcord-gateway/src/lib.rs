@@ -17,6 +17,7 @@
 //! `true` does not stop the gateway.
 
 pub mod commands;
+pub mod inflate;
 pub mod protocol;
 pub mod session;
 
@@ -35,7 +36,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use session::{Action, Backoff, CloseAction, RetryDelay, Session};
 
-pub const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
+pub const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json&compress=zlib-stream";
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -195,6 +196,7 @@ where
 {
     let emit = io.emit;
     let (mut sink, mut stream) = ws.split();
+    let mut inflater = inflate::Inflater::new();
     let mut heartbeat: Option<Interval> = None;
     // Commands are only sent once READY / RESUMED arrived on this connection.
     let mut ready = false;
@@ -244,6 +246,18 @@ where
                 .collect(),
             msg = stream.next() => match msg {
                 Some(Ok(Message::Text(text))) => session.handle_text(text.as_str()),
+                Some(Ok(Message::Binary(bytes))) => match inflater.push(bytes.as_ref()) {
+                    Ok(Some(text)) => session.handle_text(&text),
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "zlib-stream decode failed; reconnecting");
+                        close(&mut sink, CloseCode::Library(4000)).await;
+                        return Ok(ConnEnd::Retry {
+                            reason: format!("zlib-stream decode failed: {e}"),
+                            delay: RetryDelay::Backoff,
+                        });
+                    }
+                },
                 Some(Ok(Message::Close(frame))) => {
                     let code = frame.as_ref().map(|f| u16::from(f.code));
                     return Ok(match session.on_close(code) {
@@ -258,7 +272,7 @@ where
                         },
                     });
                 }
-                // Binary (no compression in v0.1), ping/pong (handled by tungstenite).
+                // Ping/pong (handled by tungstenite) and frame continuations.
                 Some(Ok(_)) => continue,
                 Some(Err(e)) => {
                     return Ok(ConnEnd::Retry { reason: format!("websocket error: {e}"), delay: RetryDelay::Backoff });

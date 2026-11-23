@@ -340,7 +340,7 @@ mod tests {
         assert_eq!(s.seq(), Some(1));
         assert_eq!(
             s.connect_url(),
-            "wss://resume.discord.gg/?v=10&encoding=json"
+            "wss://resume.discord.gg/?v=10&encoding=json&compress=zlib-stream"
         );
 
         // op 7 -> reconnect, session kept

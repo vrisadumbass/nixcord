@@ -2348,6 +2348,7 @@ dependencies = [
 name = "nixcord-gateway"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "futures-util",
  "nixcord-model",
  "rustls",

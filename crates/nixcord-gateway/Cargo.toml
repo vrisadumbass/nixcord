@@ -18,3 +18,4 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["c
 # reqwest's `rustls` feature uses, so only one crypto backend is compiled; it is installed
 # as the process default at startup.
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }

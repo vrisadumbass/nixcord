@@ -7,7 +7,8 @@
 //! which is pure data and can be unit-tested without a network. [`Http`] turns a `Route`
 //! into a reqwest request, sends it, and maps the response with [`map_error_status`].
 
-use nixcord_model::{Channel, Emoji, Message, Snowflake, User};
+use nixcord_model::components::ComponentInteraction;
+use nixcord_model::{Channel, Emoji, Message, RelationshipKind, Snowflake, User};
 use reqwest::header::{
     HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER, USER_AGENT,
 };
@@ -69,6 +70,45 @@ impl Method {
             Method::Delete => reqwest::Method::DELETE,
         }
     }
+}
+
+/// Query parameters for guild or channel message search.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MessageSearchQuery {
+    pub content: Option<String>,
+    pub author_id: Option<Snowflake>,
+    /// Used by guild message search; ignored by channel message search.
+    pub channel_id: Option<Snowflake>,
+    pub offset: Option<u32>,
+}
+
+impl MessageSearchQuery {
+    fn append_params(&self, query: &mut Vec<(&'static str, String)>, include_channel: bool) {
+        if let Some(c) = self.content.as_deref().filter(|s| !s.is_empty()) {
+            query.push(("content", c.to_owned()));
+        }
+        if let Some(a) = self.author_id {
+            query.push(("author_id", a.to_string()));
+        }
+        if include_channel {
+            if let Some(ch) = self.channel_id {
+                query.push(("channel_id", ch.to_string()));
+            }
+        }
+        if let Some(off) = self.offset.filter(|&o| o > 0) {
+            query.push(("offset", off.to_string()));
+        }
+    }
+}
+
+/// Response from `GET /guilds/{id}/messages/search` or `GET /channels/{id}/messages/search`.
+/// Each inner `Vec<Message>` is a hit together with its surrounding context messages.
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+pub struct MessageSearchResult {
+    #[serde(default)]
+    pub total_results: u32,
+    #[serde(default)]
+    pub messages: Vec<Vec<Message>>,
 }
 
 /// A fully described request, independent of any client. Pure data.
@@ -168,6 +208,91 @@ impl Route {
 
     pub fn guild_channels(guild_id: Snowflake) -> Self {
         Self::new(Method::Get, format!("/guilds/{guild_id}/channels"))
+    }
+
+    /// POST /interactions (type 3: MESSAGE_COMPONENT, buttons & select menus).
+    pub fn send_component_interaction(ix: &ComponentInteraction, nonce: &str) -> Self {
+        let mut r = Self::new(Method::Post, "/interactions".into());
+        let mut data = serde_json::json!({
+            "component_type": ix.component_type,
+            "custom_id": ix.custom_id,
+        });
+        // Button interactions (component_type == 2) omit `values`; select menus include it.
+        if ix.component_type != 2 {
+            data["values"] = serde_json::json!(ix.values);
+        }
+        let mut body = serde_json::json!({
+            "type": 3,
+            "nonce": nonce,
+            "channel_id": ix.channel_id,
+            "message_flags": ix.message_flags,
+            "message_id": ix.message_id,
+            "application_id": ix.application_id,
+            "session_id": ix.session_id,
+            "data": data,
+        });
+        if let Some(gid) = ix.guild_id {
+            body["guild_id"] = serde_json::json!(gid);
+        }
+        r.body = Some(body);
+        r
+    }
+
+    /// POST /channels/{cid}/messages/{mid}/ack.
+    pub fn ack_message(channel_id: Snowflake, message_id: Snowflake) -> Self {
+        let mut r = Self::new(
+            Method::Post,
+            format!("/channels/{channel_id}/messages/{message_id}/ack"),
+        );
+        r.body = Some(serde_json::json!({ "token": serde_json::Value::Null }));
+        r
+    }
+
+    /// PUT /users/@me/relationships/{user_id}.
+    /// `None` sends `{}` (accept incoming friend request / add by id); `Some(kind)` sets `{"type": n}`
+    /// (e.g. `RelationshipKind::Blocked` to block).
+    pub fn put_relationship(user_id: Snowflake, kind: Option<RelationshipKind>) -> Self {
+        let mut r = Self::new(Method::Put, format!("/users/@me/relationships/{user_id}"));
+        r.body = Some(match kind {
+            Some(k) => serde_json::json!({ "type": u8::from(k) }),
+            None => serde_json::json!({}),
+        });
+        r
+    }
+
+    /// POST /users/@me/relationships — send a friend request by username.
+    pub fn send_friend_request(username: &str) -> Self {
+        let mut r = Self::new(Method::Post, "/users/@me/relationships".into());
+        r.body = Some(serde_json::json!({
+            "username": username,
+            "discriminator": serde_json::Value::Null,
+        }));
+        r
+    }
+
+    /// DELETE /users/@me/relationships/{user_id} — unfriend, cancel/decline request, or unblock.
+    pub fn remove_relationship(user_id: Snowflake) -> Self {
+        Self::new(
+            Method::Delete,
+            format!("/users/@me/relationships/{user_id}"),
+        )
+    }
+
+    /// GET /guilds/{guild_id}/messages/search.
+    pub fn search_guild_messages(guild_id: Snowflake, query: &MessageSearchQuery) -> Self {
+        let mut r = Self::new(Method::Get, format!("/guilds/{guild_id}/messages/search"));
+        query.append_params(&mut r.query, true);
+        r
+    }
+
+    /// GET /channels/{channel_id}/messages/search (DMs / group DMs).
+    pub fn search_channel_messages(channel_id: Snowflake, query: &MessageSearchQuery) -> Self {
+        let mut r = Self::new(
+            Method::Get,
+            format!("/channels/{channel_id}/messages/search"),
+        );
+        query.append_params(&mut r.query, false);
+        r
     }
 
     /// Full URL including the query string.
@@ -475,17 +600,54 @@ impl Http {
         self.json(Route::guild_channels(guild_id)).await
     }
 
-    /// POST /interactions (type 3: message component). Implemented by protocol-eng.
-    pub async fn send_component_interaction(
-        &self,
-        _ix: &nixcord_model::components::ComponentInteraction,
-    ) -> Result<()> {
-        Err(HttpError::Transport("not implemented".into()))
+    /// POST /interactions (type 3: message component). Returns 204 No Content on accept.
+    pub async fn send_component_interaction(&self, ix: &ComponentInteraction) -> Result<()> {
+        self.empty(Route::send_component_interaction(ix, &generate_nonce()))
+            .await
     }
 
-    /// POST /channels/{cid}/messages/{mid}/ack. Implemented by protocol-eng.
-    pub async fn ack_message(&self, _channel_id: Snowflake, _message_id: Snowflake) -> Result<()> {
-        Ok(())
+    /// POST /channels/{cid}/messages/{mid}/ack.
+    pub async fn ack_message(&self, channel_id: Snowflake, message_id: Snowflake) -> Result<()> {
+        self.empty(Route::ack_message(channel_id, message_id)).await
+    }
+
+    /// PUT /users/@me/relationships/{user_id} (204).
+    pub async fn put_relationship(
+        &self,
+        user_id: Snowflake,
+        kind: Option<RelationshipKind>,
+    ) -> Result<()> {
+        self.empty(Route::put_relationship(user_id, kind)).await
+    }
+
+    /// POST /users/@me/relationships (204).
+    pub async fn send_friend_request(&self, username: &str) -> Result<()> {
+        self.empty(Route::send_friend_request(username)).await
+    }
+
+    /// DELETE /users/@me/relationships/{user_id} (204).
+    pub async fn remove_relationship(&self, user_id: Snowflake) -> Result<()> {
+        self.empty(Route::remove_relationship(user_id)).await
+    }
+
+    /// GET /guilds/{guild_id}/messages/search.
+    pub async fn search_guild_messages(
+        &self,
+        guild_id: Snowflake,
+        query: &MessageSearchQuery,
+    ) -> Result<MessageSearchResult> {
+        self.json(Route::search_guild_messages(guild_id, query))
+            .await
+    }
+
+    /// GET /channels/{channel_id}/messages/search.
+    pub async fn search_channel_messages(
+        &self,
+        channel_id: Snowflake,
+        query: &MessageSearchQuery,
+    ) -> Result<MessageSearchResult> {
+        self.json(Route::search_channel_messages(channel_id, query))
+            .await
     }
 }
 
@@ -899,5 +1061,192 @@ mod tests {
             http.current_user().await,
             Err(HttpError::Unauthorized)
         ));
+    }
+
+    #[test]
+    fn component_interaction_routes() {
+        let btn = ComponentInteraction {
+            guild_id: Some(Snowflake(10)),
+            channel_id: C,
+            message_id: M,
+            message_flags: 32768,
+            application_id: Snowflake(999),
+            session_id: "sess_abc".into(),
+            component_type: 2,
+            custom_id: "vote_yes".into(),
+            values: vec![],
+        };
+        let r = Route::send_component_interaction(&btn, "777");
+        assert_eq!(r.method, Method::Post);
+        assert_eq!(r.path, "/interactions");
+        assert_eq!(
+            r.body,
+            Some(serde_json::json!({
+                "type": 3,
+                "nonce": "777",
+                "guild_id": "10",
+                "channel_id": "111",
+                "message_flags": 32768,
+                "message_id": "222",
+                "application_id": "999",
+                "session_id": "sess_abc",
+                "data": {
+                    "component_type": 2,
+                    "custom_id": "vote_yes",
+                },
+            }))
+        );
+
+        // DM select menu omits guild_id and includes values.
+        let sel = ComponentInteraction {
+            guild_id: None,
+            channel_id: C,
+            message_id: M,
+            message_flags: 0,
+            application_id: Snowflake(999),
+            session_id: "sess_abc".into(),
+            component_type: 3,
+            custom_id: "pick_theme".into(),
+            values: vec!["graphite".into(), "onyx".into()],
+        };
+        let r = Route::send_component_interaction(&sel, "888");
+        let b = r.body.unwrap();
+        assert!(b.get("guild_id").is_none());
+        assert_eq!(b["data"]["component_type"], 3);
+        assert_eq!(b["data"]["custom_id"], "pick_theme");
+        assert_eq!(b["data"]["values"], serde_json::json!(["graphite", "onyx"]));
+    }
+
+    #[test]
+    fn ack_and_relationship_routes() {
+        let ack = Route::ack_message(C, M);
+        assert_eq!(ack.method, Method::Post);
+        assert_eq!(
+            ack.url(API_BASE).unwrap().as_str(),
+            "https://discord.com/api/v10/channels/111/messages/222/ack"
+        );
+        assert_eq!(ack.body, Some(serde_json::json!({ "token": null })));
+
+        let accept = Route::put_relationship(Snowflake(55), None);
+        assert_eq!(accept.method, Method::Put);
+        assert_eq!(
+            accept.url(API_BASE).unwrap().as_str(),
+            "https://discord.com/api/v10/users/@me/relationships/55"
+        );
+        assert_eq!(accept.body, Some(serde_json::json!({})));
+
+        let block = Route::put_relationship(Snowflake(55), Some(RelationshipKind::Blocked));
+        assert_eq!(block.body, Some(serde_json::json!({ "type": 2 })));
+
+        let req = Route::send_friend_request("alice");
+        assert_eq!(req.method, Method::Post);
+        assert_eq!(req.path, "/users/@me/relationships");
+        assert_eq!(
+            req.body,
+            Some(serde_json::json!({ "username": "alice", "discriminator": null }))
+        );
+
+        let rm = Route::remove_relationship(Snowflake(55));
+        assert_eq!(rm.method, Method::Delete);
+        assert_eq!(rm.path, "/users/@me/relationships/55");
+        assert!(rm.body.is_none());
+    }
+
+    #[test]
+    fn message_search_routes() {
+        let q = MessageSearchQuery {
+            content: Some("rust lang".into()),
+            author_id: Some(Snowflake(42)),
+            channel_id: Some(C),
+            offset: Some(25),
+        };
+        let r = Route::search_guild_messages(Snowflake(7), &q);
+        assert_eq!(r.method, Method::Get);
+        assert_eq!(
+            r.url(API_BASE).unwrap().as_str(),
+            "https://discord.com/api/v10/guilds/7/messages/search?content=rust+lang&author_id=42&channel_id=111&offset=25"
+        );
+
+        // Channel search omits channel_id query parameter.
+        let r = Route::search_channel_messages(C, &q);
+        assert_eq!(
+            r.url(API_BASE).unwrap().as_str(),
+            "https://discord.com/api/v10/channels/111/messages/search?content=rust+lang&author_id=42&offset=25"
+        );
+
+        // Empty content and offset 0 are omitted.
+        let empty = MessageSearchQuery {
+            content: Some(String::new()),
+            offset: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            Route::search_guild_messages(Snowflake(7), &empty)
+                .url(API_BASE)
+                .unwrap()
+                .as_str(),
+            "https://discord.com/api/v10/guilds/7/messages/search"
+        );
+    }
+
+    #[tokio::test]
+    async fn interactions_ack_relationships_and_search_mock() {
+        let search_json = r#"{"total_results":1,"messages":[[{"id":"9","channel_id":"111","author":{"id":"42","username":"nix"},"content":"found it","timestamp":"2024-01-01T00:00:00+00:00","hit":true}]]}"#;
+        let (base, h) = mock(vec![
+            resp("204 No Content", "", ""),
+            resp("204 No Content", "", ""),
+            resp("204 No Content", "", ""),
+            resp("204 No Content", "", ""),
+            resp("204 No Content", "", ""),
+            resp("200 OK", "", search_json),
+        ])
+        .await;
+        let http = Http::with_base_url("t".into(), base);
+
+        let ix = ComponentInteraction {
+            guild_id: Some(Snowflake(7)),
+            channel_id: C,
+            message_id: M,
+            message_flags: 0,
+            application_id: Snowflake(88),
+            session_id: "s1".into(),
+            component_type: 2,
+            custom_id: "ok".into(),
+            values: vec![],
+        };
+        http.send_component_interaction(&ix).await.unwrap();
+        http.ack_message(C, M).await.unwrap();
+        http.put_relationship(Snowflake(55), None).await.unwrap();
+        http.send_friend_request("bob").await.unwrap();
+        http.remove_relationship(Snowflake(55)).await.unwrap();
+        let res = http
+            .search_guild_messages(
+                Snowflake(7),
+                &MessageSearchQuery {
+                    content: Some("found".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.total_results, 1);
+        assert_eq!(res.messages.len(), 1);
+        assert_eq!(res.messages[0][0].content, "found it");
+
+        let reqs = h.await.unwrap();
+        let body_of = |r: &str| -> serde_json::Value {
+            serde_json::from_str(r.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+        };
+        assert!(reqs[0].starts_with("POST /interactions "));
+        let v = body_of(&reqs[0]);
+        assert_eq!(v["type"], 3);
+        assert_eq!(v["session_id"], "s1");
+        assert_eq!(v["data"]["custom_id"], "ok");
+        assert!(v["nonce"].as_str().unwrap().parse::<u64>().is_ok());
+        assert!(reqs[1].starts_with("POST /channels/111/messages/222/ack "));
+        assert!(reqs[2].starts_with("PUT /users/@me/relationships/55 "));
+        assert!(reqs[3].starts_with("POST /users/@me/relationships "));
+        assert!(reqs[4].starts_with("DELETE /users/@me/relationships/55 "));
+        assert!(reqs[5].starts_with("GET /guilds/7/messages/search?content=found "));
     }
 }

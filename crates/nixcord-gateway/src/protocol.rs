@@ -151,12 +151,15 @@ pub fn guild_subscriptions_payload<'a>(
 }
 
 /// Turn a `resume_gateway_url` (usually bare, e.g. `wss://gateway-us-east1-b.discord.gg`)
-/// into a connectable URL with our version/encoding query.
+/// into a connectable URL with our version/encoding/compression query.
 pub fn with_gateway_query(base: &str) -> String {
     if base.contains('?') {
         return base.to_owned();
     }
-    format!("{}/?v=10&encoding=json", base.trim_end_matches('/'))
+    format!(
+        "{}/?v=10&encoding=json&compress=zlib-stream",
+        base.trim_end_matches('/')
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -952,11 +955,11 @@ mod tests {
     fn gateway_query() {
         assert_eq!(
             with_gateway_query("wss://gateway-us-east1-b.discord.gg"),
-            "wss://gateway-us-east1-b.discord.gg/?v=10&encoding=json"
+            "wss://gateway-us-east1-b.discord.gg/?v=10&encoding=json&compress=zlib-stream"
         );
         assert_eq!(
             with_gateway_query("wss://x.discord.gg/"),
-            "wss://x.discord.gg/?v=10&encoding=json"
+            "wss://x.discord.gg/?v=10&encoding=json&compress=zlib-stream"
         );
         assert_eq!(with_gateway_query("wss://x/?v=9"), "wss://x/?v=9");
     }
