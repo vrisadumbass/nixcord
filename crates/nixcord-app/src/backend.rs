@@ -9,6 +9,7 @@
 use eframe::egui;
 use nixcord_gateway::GatewayCommand;
 use nixcord_http::{Http, HttpError};
+use nixcord_model::components::ComponentInteraction;
 use nixcord_model::{Emoji, GatewayEvent, Message, MessageUpdate, Snowflake, User};
 use std::sync::mpsc as std_mpsc;
 use tokio::sync::{mpsc, watch};
@@ -37,6 +38,12 @@ pub enum AppEvent {
     /// Sending into this channel returned 403: show a read-only notice.
     Forbidden {
         channel: Snowflake,
+    },
+    /// A component interaction finished (with an optional error message).
+    InteractionDone {
+        message_id: Snowflake,
+        custom_id: String,
+        error: Option<String>,
     },
     Error(String),
     LoginOk(User),
@@ -87,6 +94,13 @@ pub enum Command {
     Gateway(GatewayCommand),
     Typing {
         channel: Snowflake,
+    },
+    /// Send a type-3 message component interaction (POST /interactions).
+    Interact(ComponentInteraction),
+    /// Best-effort read-state acknowledgement (POST /channels/{c}/messages/{m}/ack).
+    Ack {
+        channel: Snowflake,
+        message: Snowflake,
     },
     Logout,
 }
@@ -315,6 +329,27 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
         Command::Typing { channel } => {
             if let Err(e) = http.trigger_typing(channel).await {
                 tracing::debug!("typing failed: {e}");
+            }
+        }
+        Command::Interact(ix) => {
+            let message_id = ix.message_id;
+            let custom_id = ix.custom_id.clone();
+            match http.send_component_interaction(&ix).await {
+                Ok(()) => events.send(AppEvent::InteractionDone {
+                    message_id,
+                    custom_id,
+                    error: None,
+                }),
+                Err(e) => events.send(AppEvent::InteractionDone {
+                    message_id,
+                    custom_id,
+                    error: Some(format!("Interaction failed: {e}")),
+                }),
+            }
+        }
+        Command::Ack { channel, message } => {
+            if let Err(e) = http.ack_message(channel, message).await {
+                tracing::debug!("ack failed: {e}");
             }
         }
         Command::Login(_) | Command::Logout | Command::Gateway(_) => {}

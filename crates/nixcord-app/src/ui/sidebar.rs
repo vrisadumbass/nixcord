@@ -5,12 +5,70 @@ use super::{
     paint_status_dot, prop, Action, Icon,
 };
 use crate::app::NixApp;
+use crate::theme::Theme;
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, Pos2, Rect, RichText, Sense,
     Stroke, Ui, Vec2,
 };
 use nixcord_model::{Channel, ChannelKind, Guild, Snowflake};
 use nixcord_store::ConnectionState;
+
+// ---- mention badge ------------------------------------------------------------------
+
+fn badge_text(count: u32) -> String {
+    if count > 99 {
+        "99+".into()
+    } else {
+        count.to_string()
+    }
+}
+
+/// Paint a Discord-style red mention pill (`count` > 0) with its right-center at
+/// `right_center`. If `ring` is `Some`, paints a cutout ring behind it (used on the
+/// guild rail icons). Returns the pill width (0 when `count == 0`).
+fn paint_mention_badge(
+    ui: &Ui,
+    right_center: Pos2,
+    count: u32,
+    ring: Option<Color32>,
+    t: &Theme,
+) -> f32 {
+    if count == 0 {
+        return 0.0;
+    }
+    let text = badge_text(count);
+    let g = ui
+        .painter()
+        .layout_no_wrap(text, bold(11.0), Color32::WHITE);
+    let w = (g.size().x + 8.0).max(16.0);
+    let h = 16.0;
+    let rect = Rect::from_min_size(
+        Pos2::new(right_center.x - w, right_center.y - h / 2.0),
+        Vec2::new(w, h),
+    );
+    if let Some(bg) = ring {
+        ui.painter()
+            .rect_filled(rect.expand(2.5), CornerRadius::same(10), bg);
+    }
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(8), t.danger);
+    ui.painter()
+        .galley(rect.center() - g.size() / 2.0, g, Color32::WHITE);
+    w
+}
+
+/// Width reserved for a right-aligned mention badge in a channel/DM row.
+fn badge_reserve(count: u32) -> f32 {
+    if count == 0 {
+        0.0
+    } else if count > 99 {
+        36.0
+    } else if count >= 10 {
+        28.0
+    } else {
+        22.0
+    }
+}
 
 // ---- guild rail ---------------------------------------------------------------------
 
@@ -44,7 +102,26 @@ pub fn rail(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
     ui.vertical_centered(|ui| {
         ui.add_space(12.0);
         let home_sel = app.view.guild.is_none();
-        if rail_item(ui, app, home_sel, false, "Direct Messages", "N", None).clicked() {
+        let dm_mentions = app.store.dm_mention_count();
+        let dm_unread = !home_sel
+            && (dm_mentions > 0
+                || app
+                    .store
+                    .private_channels()
+                    .iter()
+                    .any(|c| app.is_unread(c)));
+        if rail_item(
+            ui,
+            app,
+            home_sel,
+            dm_unread,
+            dm_mentions,
+            "Direct Messages",
+            "N",
+            None,
+        )
+        .clicked()
+        {
             actions.push(Action::SelectHome);
         }
         ui.add_space(4.0);
@@ -65,10 +142,19 @@ pub fn rail(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
                             continue;
                         }
                         let sel = app.view.guild == Some(guild.id);
-                        let unread = !sel && app.guild_unread(guild.id);
+                        let mentions = app.store.guild_mention_count(guild.id);
+                        let unread = !sel && (app.guild_unread(guild.id) || mentions > 0);
                         let label = initials(&guild.name, 3);
-                        let resp =
-                            rail_item(ui, app, sel, unread, &guild.name, &label, Some(guild));
+                        let resp = rail_item(
+                            ui,
+                            app,
+                            sel,
+                            unread,
+                            mentions,
+                            &guild.name,
+                            &label,
+                            Some(guild),
+                        );
                         if resp.clicked() {
                             actions.push(Action::SelectGuild(guild.id));
                         }
@@ -80,13 +166,15 @@ pub fn rail(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
 }
 
 /// One 48px rail icon (server icon, or initials on a circle) that rounds into a squircle
-/// when active, with the left-edge pill (selected / hovered / unread).
+/// when active, with the left-edge pill (selected / hovered / unread) and optional red
+/// mention badge at the bottom right.
 #[allow(clippy::too_many_arguments)]
 fn rail_item(
     ui: &mut Ui,
     app: &NixApp,
     selected: bool,
     unread: bool,
+    mentions: u32,
     tooltip: &str,
     text: &str,
     guild: Option<&Guild>,
@@ -121,6 +209,16 @@ fn rail_item(
         };
         ui.painter()
             .text(rect.center(), Align2::CENTER_CENTER, text, bold(size), fg);
+    }
+    if mentions > 0 {
+        let ring = super::presence::opaque_bg(t, t.rail);
+        paint_mention_badge(
+            ui,
+            Pos2::new(rect.right() + 2.0, rect.bottom() - 7.0),
+            mentions,
+            Some(ring),
+            t,
+        );
     }
     // Pill on the panel's left edge.
     let pill_h = if selected {
@@ -271,15 +369,29 @@ fn guild_channels(ui: &mut Ui, app: &NixApp, gid: Snowflake, actions: &mut Vec<A
             }
             continue;
         }
+        if ch.kind.is_thread() {
+            continue;
+        }
         if ch.parent_id.is_none() {
             current_cat = None;
         }
-        let hidden = current_cat.is_some_and(|c| app.view.collapsed.contains(&c))
-            && app.view.channel != Some(ch.id);
+        let threads = app.store.channel_threads(ch.id);
+        let collapsed_cat = current_cat.is_some_and(|c| app.view.collapsed.contains(&c));
+        let active_in_branch = app.view.channel == Some(ch.id)
+            || threads.iter().any(|th| app.view.channel == Some(th.id));
+        let hidden = collapsed_cat && !active_in_branch;
         if hidden {
             continue;
         }
         channel_row(ui, app, ch, actions);
+        let visible_threads: Vec<&Channel> = threads
+            .into_iter()
+            .filter(|th| !collapsed_cat || app.view.channel == Some(th.id))
+            .collect();
+        let n = visible_threads.len();
+        for (i, th) in visible_threads.into_iter().enumerate() {
+            thread_row(ui, app, th, i + 1 == n, actions);
+        }
     }
 }
 
@@ -305,7 +417,12 @@ fn channel_row(ui: &mut Ui, app: &NixApp, ch: &Channel, actions: &mut Vec<Action
         ui.painter()
             .rect_filled(rect, CornerRadius::same(4), t.hover);
     }
-    let unread = textual && !selected && app.is_unread(ch);
+    let mentions = if textual && !selected {
+        app.store.channel_mention_count(ch.id)
+    } else {
+        0
+    };
+    let unread = textual && !selected && (app.is_unread(ch) || mentions > 0);
     if unread {
         // Small white pill on the column's left edge.
         let dot = Rect::from_center_size(
@@ -334,7 +451,7 @@ fn channel_row(ui: &mut Ui, app: &NixApp, ch: &Channel, actions: &mut Vec<Action
     );
     let text_rect = Rect::from_min_max(
         Pos2::new(rect.left() + 34.0, rect.top()),
-        Pos2::new(rect.right() - 8.0, rect.bottom()),
+        Pos2::new(rect.right() - 8.0 - badge_reserve(mentions), rect.bottom()),
     );
     let p = ui
         .painter()
@@ -348,11 +465,97 @@ fn channel_row(ui: &mut Ui, app: &NixApp, ch: &Channel, actions: &mut Vec<Action
         ),
         &app.media,
     );
+    if mentions > 0 {
+        paint_mention_badge(
+            ui,
+            Pos2::new(rect.right() - 6.0, rect.center().y),
+            mentions,
+            None,
+            t,
+        );
+    }
     if resp.clicked() && textual {
         actions.push(Action::SelectChannel(ch.id));
     }
     if !textual {
         resp.on_hover_text("Not supported in nixcord yet");
+    }
+}
+
+/// Active thread row indented beneath its parent channel, with a Discord-style branch
+/// connector spine, unread indicator, and mention badge.
+fn thread_row(ui: &mut Ui, app: &NixApp, ch: &Channel, is_last: bool, actions: &mut Vec<Action>) {
+    let t = app.theme;
+    let selected = app.view.channel == Some(ch.id);
+    let row_w = ui.available_width();
+    let (outer, resp) = ui.allocate_exact_size(Vec2::new(row_w, 28.0), Sense::click());
+    let rect = outer.shrink2(Vec2::new(8.0, 1.0));
+
+    // Branch connector spine on the left.
+    let spine_x = rect.left() + 18.0;
+    let cy = rect.center().y;
+    let spine_stroke = Stroke::new(1.5, t.muted.gamma_multiply(0.45));
+    let spine_end_y = if is_last { cy - 3.0 } else { outer.bottom() };
+    ui.painter().line_segment(
+        [
+            Pos2::new(spine_x, outer.top()),
+            Pos2::new(spine_x, spine_end_y),
+        ],
+        spine_stroke,
+    );
+    let elbow = vec![
+        Pos2::new(spine_x, cy - 3.0),
+        Pos2::new(spine_x + 1.0, cy - 0.8),
+        Pos2::new(spine_x + 3.5, cy),
+        Pos2::new(spine_x + 11.0, cy),
+    ];
+    ui.painter().add(egui::Shape::line(elbow, spine_stroke));
+
+    let pill = Rect::from_min_max(Pos2::new(rect.left() + 32.0, rect.top()), rect.max);
+    let hovered = resp.hovered();
+    if selected {
+        ui.painter()
+            .rect_filled(pill, CornerRadius::same(4), t.selected);
+    } else if hovered {
+        ui.painter()
+            .rect_filled(pill, CornerRadius::same(4), t.hover);
+    }
+
+    let mentions = if !selected {
+        app.store.channel_mention_count(ch.id)
+    } else {
+        0
+    };
+    let unread = !selected && (app.is_unread(ch) || mentions > 0);
+    if unread {
+        let dot = Rect::from_center_size(Pos2::new(outer.left(), cy), Vec2::new(8.0, 8.0));
+        ui.painter()
+            .rect_filled(dot, CornerRadius::same(4), t.strong);
+    }
+    let color = if selected || hovered || unread {
+        t.strong
+    } else {
+        t.muted
+    };
+    let name_font = if unread { bold(14.0) } else { prop(14.0) };
+    let text_rect = Rect::from_min_max(
+        Pos2::new(pill.left() + 8.0, pill.top()),
+        Pos2::new(pill.right() - 6.0 - badge_reserve(mentions), pill.bottom()),
+    );
+    let p = ui
+        .painter()
+        .with_clip_rect(text_rect.intersect(ui.clip_rect()));
+    let galley = emoji_text::layout(&p, &ch.label(), name_font, color, f32::INFINITY, 0);
+    galley.paint(
+        &p,
+        Pos2::new(text_rect.left(), cy - galley.size().y / 2.0),
+        &app.media,
+    );
+    if mentions > 0 {
+        paint_mention_badge(ui, Pos2::new(pill.right() - 6.0, cy), mentions, None, t);
+    }
+    if resp.clicked() {
+        actions.push(Action::SelectChannel(ch.id));
     }
 }
 
@@ -419,7 +622,20 @@ fn dm_list(ui: &mut Ui, app: &NixApp, actions: &mut Vec<Action>) {
                 );
             }
         }
-        let unread = !selected && app.is_unread(ch);
+        let mentions = if !selected {
+            app.store.channel_mention_count(ch.id)
+        } else {
+            0
+        };
+        let unread = !selected && (app.is_unread(ch) || mentions > 0);
+        if unread {
+            let dot = Rect::from_center_size(
+                Pos2::new(outer.left(), rect.center().y),
+                Vec2::new(8.0, 8.0),
+            );
+            ui.painter()
+                .rect_filled(dot, CornerRadius::same(4), t.strong);
+        }
         let color = if selected || hovered || unread {
             t.strong
         } else {
@@ -428,7 +644,7 @@ fn dm_list(ui: &mut Ui, app: &NixApp, actions: &mut Vec<Action>) {
         let text_left = rect.left() + 52.0;
         let clip = Rect::from_min_max(
             Pos2::new(text_left, rect.top()),
-            Pos2::new(rect.right() - 6.0, rect.bottom()),
+            Pos2::new(rect.right() - 6.0 - badge_reserve(mentions), rect.bottom()),
         )
         .intersect(ui.clip_rect());
         let name_font = if unread { bold(15.5) } else { prop(15.5) };
@@ -453,8 +669,25 @@ fn dm_list(ui: &mut Ui, app: &NixApp, actions: &mut Vec<Action>) {
                 &app.media,
             );
         }
+        if mentions > 0 {
+            paint_mention_badge(
+                ui,
+                Pos2::new(rect.right() - 6.0, rect.center().y),
+                mentions,
+                None,
+                t,
+            );
+        }
         if resp.clicked() {
             actions.push(Action::SelectChannel(ch.id));
+        } else if resp.secondary_clicked() {
+            if let (ChannelKind::Dm, Some(u)) = (ch.kind, other) {
+                actions.push(Action::OpenProfile {
+                    user_id: u.id,
+                    guild_id: None,
+                    anchor: rect,
+                });
+            }
         }
     }
 }
@@ -574,4 +807,19 @@ fn strike(ui: &Ui, rect: Rect, color: Color32) {
     let r = rect.shrink(8.0);
     ui.painter()
         .line_segment([r.left_top(), r.right_bottom()], Stroke::new(2.0, color));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mention_badge_formatting_and_width_reserve() {
+        assert_eq!(badge_text(1), "1");
+        assert_eq!(badge_text(99), "99");
+        assert_eq!(badge_text(100), "99+");
+        assert_eq!(badge_reserve(0), 0.0);
+        assert!(badge_reserve(5) > 0.0);
+        assert!(badge_reserve(120) > badge_reserve(5));
+    }
 }
