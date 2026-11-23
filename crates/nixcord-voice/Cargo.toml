@@ -1,0 +1,19 @@
+[package]
+name = "nixcord-voice"
+description = "Discord voice calls for nixcord: Voice Gateway, UDP IP discovery, AEAD RTP, Opus, cpal capture/playback"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nixcord-model.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+aws-lc-rs = { version = "1.19", default-features = false, features = ["aws-lc-sys"] }
+cpal = "0.18.2"

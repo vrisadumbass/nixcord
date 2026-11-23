@@ -2425,6 +2425,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "nixcord-voice"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "cpal",
+ "futures-util",
+ "nixcord-model",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
 name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
