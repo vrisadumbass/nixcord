@@ -6,8 +6,9 @@ use crate::media::Media;
 use crate::theme::{self, Theme};
 use crate::token;
 use crate::ui::{self, Action};
-use eframe::egui::{self, Color32, CornerRadius, Frame, Id, Margin, Rect};
-use nixcord_model::{Channel, GatewayEvent, Snowflake};
+use eframe::egui::{self, Color32, CornerRadius, CursorIcon, Frame, Id, Margin, Rect, Sense};
+use nixcord_model::components::ComponentInteraction;
+use nixcord_model::{Channel, ChannelKind, GatewayEvent, Message, Snowflake};
 use nixcord_store::{ConnectionState, Store};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -19,6 +20,8 @@ const PREFS_KEY: &str = "nixcord.prefs";
 /// Minimum time between automatic "load older" requests for one channel.
 const OLDER_COOLDOWN: Duration = Duration::from_secs(2);
 const TOAST_FOR: Duration = Duration::from_secs(5);
+/// Maximum time a component interaction shows a pending spinner before auto-clearing.
+const INTERACTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Persisted UI preferences. Never contains the token.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -134,6 +137,17 @@ pub struct ViewState {
     pub deafened: bool,
     pub confirm_delete: Option<(Snowflake, Snowflake)>,
     pub member_sub: ui::presence::SubState,
+    pub profile_popout: Option<ui::profile::ProfilePopout>,
+    /// In-flight component interactions keyed by `(message_id, custom_id)`.
+    pub pending_interactions: HashMap<(Snowflake, String), Instant>,
+}
+
+struct Toast {
+    msg: String,
+    at: Instant,
+    is_err: bool,
+    /// When set (in-app mention toast), clicking the toast jumps to this channel.
+    jump_channel: Option<Snowflake>,
 }
 
 pub struct NixApp {
@@ -151,11 +165,16 @@ pub struct NixApp {
     /// Images (avatars, icons, emoji, previews). A `RefCell` because the screens draw from
     /// `&NixApp` while the cache mutates.
     pub media: RefCell<Media>,
-    /// Newest message id the user has seen per channel (unread indicators; not persisted).
+    /// Newest message id the user has seen per channel (fallback when store has no read state).
     pub seen: HashMap<Snowflake, Snowflake>,
     seen_dirty: bool,
-    /// (message, shown at, is_error)
-    toast: Option<(String, Instant, bool)>,
+    /// Last message id we sent a best-effort REST `ack` for per channel.
+    acked: HashMap<Snowflake, Snowflake>,
+    /// Gateway `session_id` from `READY`, needed by `POST /interactions`.
+    session_id: String,
+    /// Last total mention count applied to the OS window title.
+    last_title_mentions: Option<u32>,
+    toast: Option<Toast>,
     /// Token + remember flag of the login in flight. Dropped once it resolves.
     pending_login: Option<(String, bool)>,
     token_source: Option<token::Source>,
@@ -192,6 +211,9 @@ impl NixApp {
             media: RefCell::new(Media::new(&cc.egui_ctx, demo)),
             seen: HashMap::new(),
             seen_dirty: false,
+            acked: HashMap::new(),
+            session_id: String::new(),
+            last_title_mentions: None,
             toast: None,
             pending_login: None,
             token_source: None,
@@ -217,12 +239,67 @@ impl NixApp {
 
     /// Neutral notice (e.g. "Saved to Downloads").
     pub fn toast(&mut self, msg: impl Into<String>) {
-        self.toast = Some((msg.into(), Instant::now(), false));
+        self.toast = Some(Toast {
+            msg: msg.into(),
+            at: Instant::now(),
+            is_err: false,
+            jump_channel: None,
+        });
     }
 
     /// Error notice, drawn with a red border.
     pub fn toast_err(&mut self, msg: impl Into<String>) {
-        self.toast = Some((msg.into(), Instant::now(), true));
+        self.toast = Some(Toast {
+            msg: msg.into(),
+            at: Instant::now(),
+            is_err: true,
+            jump_channel: None,
+        });
+    }
+
+    /// Clickable in-app mention notification toast that jumps to `channel` on click.
+    pub fn toast_mention(&mut self, msg: impl Into<String>, channel: Snowflake) {
+        self.toast = Some(Toast {
+            msg: msg.into(),
+            at: Instant::now(),
+            is_err: false,
+            jump_channel: Some(channel),
+        });
+    }
+
+    /// True while a component interaction for `(message_id, custom_id)` is in flight.
+    pub fn is_interaction_pending(&self, message_id: Snowflake, custom_id: &str) -> bool {
+        self.view
+            .pending_interactions
+            .iter()
+            .any(|((mid, cid), _)| *mid == message_id && cid == custom_id)
+    }
+
+    fn expire_pending_interactions(&mut self, ctx: &egui::Context) {
+        if self.view.pending_interactions.is_empty() {
+            return;
+        }
+        let mut next_wake: Option<Duration> = None;
+        self.view.pending_interactions.retain(|_, at| {
+            let left = INTERACTION_TIMEOUT.saturating_sub(at.elapsed());
+            if left.is_zero() {
+                false
+            } else {
+                next_wake = Some(next_wake.map_or(left, |cur| cur.min(left)));
+                true
+            }
+        });
+        if let Some(wait) = next_wake {
+            ctx.request_repaint_after(wait);
+        }
+    }
+
+    fn update_window_title(&mut self, ctx: &egui::Context) {
+        let count = self.store.total_mention_count();
+        if self.last_title_mentions != Some(count) {
+            self.last_title_mentions = Some(count);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(window_title_for(count)));
+        }
     }
 
     // ---- backend events -------------------------------------------------------------
@@ -244,15 +321,31 @@ impl NixApp {
                 self.login.error = Some("Your session expired or the token was revoked.".into());
             }
             AppEvent::Gateway(ev) => {
+                if let GatewayEvent::Ready(ref r) = ev {
+                    self.session_id.clone_from(&r.session_id);
+                }
+                if let GatewayEvent::MessageUpdate(ref u) = ev {
+                    self.view
+                        .pending_interactions
+                        .retain(|(mid, _), _| *mid != u.id);
+                }
                 if matches!(
                     ev,
                     GatewayEvent::Ready(_)
                         | GatewayEvent::GuildCreate(_)
                         | GatewayEvent::ChannelCreate(_)
+                        | GatewayEvent::ThreadCreate(_)
+                        | GatewayEvent::ThreadListSync { .. }
                 ) {
                     self.seen_dirty = true;
                 }
                 self.store.apply(&ev);
+                if let GatewayEvent::MessageCreate(ref m) = ev {
+                    if self.store.should_notify(m, self.view.channel) {
+                        let text = format_mention_toast(&self.store, m);
+                        self.toast_mention(text, m.channel_id);
+                    }
+                }
             }
             AppEvent::History {
                 channel,
@@ -279,6 +372,18 @@ impl NixApp {
             AppEvent::Forbidden { channel } => {
                 self.view.forbidden.insert(channel);
                 self.toast_err("You don't have permission to send messages in this channel.");
+            }
+            AppEvent::InteractionDone {
+                message_id,
+                custom_id,
+                error,
+            } => {
+                self.view
+                    .pending_interactions
+                    .remove(&(message_id, custom_id));
+                if let Some(err) = error {
+                    self.toast_err(err);
+                }
             }
             AppEvent::HistoryFailed { channel, error } => {
                 // Unblock this channel only, so the user can retry it.
@@ -319,6 +424,9 @@ impl NixApp {
         self.store = Store::new();
         self.media.borrow_mut().clear();
         self.seen.clear();
+        self.acked.clear();
+        self.session_id.clear();
+        self.last_title_mentions = None;
         self.view = ViewState::default();
         self.composer = ComposerState::default();
         self.chat.reset();
@@ -456,11 +564,82 @@ impl NixApp {
             Action::OpenSettings => self.settings_open = true,
             Action::EmojiUsed(key) => ui::emoji_picker::count_use(&mut self.prefs.emoji_usage, key),
             Action::SetSkinTone(tone) => self.prefs.skin_tone = tone.min(5),
+            Action::OpenProfile {
+                user_id,
+                guild_id,
+                anchor,
+            } => {
+                if self
+                    .view
+                    .profile_popout
+                    .is_some_and(|p| p.user_id == user_id && p.guild_id == guild_id)
+                {
+                    self.view.profile_popout = None;
+                } else {
+                    self.view.profile_popout = Some(ui::profile::ProfilePopout {
+                        user_id,
+                        guild_id,
+                        anchor,
+                    });
+                }
+            }
+            Action::OpenDm(user_id) => {
+                let dm = self
+                    .store
+                    .private_channels()
+                    .into_iter()
+                    .find(|c| {
+                        c.kind == ChannelKind::Dm && c.recipients.iter().any(|u| u.id == user_id)
+                    })
+                    .map(|c| c.id);
+                match dm {
+                    Some(id) => {
+                        self.view.guild = None;
+                        self.select_channel(Some(id));
+                        self.view.profile_popout = None;
+                    }
+                    None => self.toast("No existing DM with this user yet"),
+                }
+            }
+            Action::Interact {
+                channel_id,
+                guild_id,
+                message_id,
+                message_flags,
+                application_id,
+                component_type,
+                custom_id,
+                values,
+            } => {
+                if self.session_id.is_empty() && !self.demo {
+                    self.toast_err("Not connected to gateway yet.");
+                    return;
+                }
+                self.view
+                    .pending_interactions
+                    .insert((message_id, custom_id.clone()), Instant::now());
+                self.send(Command::Interact(ComponentInteraction {
+                    guild_id,
+                    channel_id,
+                    message_id,
+                    message_flags,
+                    application_id,
+                    session_id: self.session_id.clone(),
+                    component_type,
+                    custom_id,
+                    values,
+                }));
+            }
             Action::Toast(msg) => self.toast(msg),
         }
     }
 
     fn select_channel(&mut self, ch: Option<Snowflake>) {
+        if let Some(c) = ch {
+            if let Some(channel) = self.store.channel(c) {
+                self.view.guild = channel.guild_id;
+            }
+        }
         if self.view.channel == ch {
             return;
         }
@@ -518,23 +697,38 @@ impl NixApp {
     }
 
     /// New messages since the user last looked at this channel.
+    /// Delegates to `Store::channel_unread` whenever the store tracks read state for `ch`,
+    /// falling back to the local `seen` map otherwise.
     pub fn is_unread(&self, ch: &Channel) -> bool {
+        if self.store.channel_unread(ch.id) {
+            return true;
+        }
+        if self.store.last_read_message_id(ch.id).is_some() {
+            return false;
+        }
         match (ch.last_message_id, self.seen.get(&ch.id)) {
             (Some(last), Some(seen)) => last > *seen,
             _ => false,
         }
     }
 
-    /// Does this server have an unread text channel?
+    /// Does this server have an unread text channel or thread?
     pub fn guild_unread(&self, guild: Snowflake) -> bool {
-        self.store
-            .visible_guild_channels(guild)
-            .into_iter()
-            .any(|c| c.kind.is_textual() && self.is_unread(c))
+        self.store.guild_unread(guild)
+            || self
+                .store
+                .visible_guild_channels(guild)
+                .into_iter()
+                .any(|c| c.kind.is_textual() && self.is_unread(c))
+            || self
+                .store
+                .guild_threads(guild)
+                .into_iter()
+                .any(|c| self.is_unread(c))
     }
 
-    /// Channels we have no read state for start out read (we don't sync Discord's read
-    /// states yet); the open channel is always read up to its newest message.
+    /// Channels we have no read state for start out read; the open channel is marked read
+    /// in the store (and acknowledged over REST once when advancing).
     fn update_seen(&mut self) {
         if std::mem::take(&mut self.seen_dirty) {
             let store = &self.store;
@@ -550,14 +744,31 @@ impl NixApp {
                 for c in store.guild_channels(g.id) {
                     baseline(c);
                 }
+                for th in store.guild_threads(g.id) {
+                    baseline(th);
+                }
             }
             for c in store.private_channels() {
                 baseline(c);
             }
         }
-        if let Some(c) = self.view.channel.and_then(|c| self.store.channel(c)) {
-            if let Some(last) = c.last_message_id {
-                self.seen.insert(c.id, last);
+        if let Some(ch_id) = self.view.channel {
+            let info = self.store.channel(ch_id).map(|c| {
+                let unread = self.is_unread(c) || self.store.channel_mention_count(c.id) > 0;
+                (c.id, c.last_message_id, unread)
+            });
+            if let Some((id, last, was_unread)) = info {
+                self.store.mark_read(id);
+                if let Some(last) = last {
+                    self.seen.insert(id, last);
+                    if !self.demo && was_unread && self.acked.get(&id) != Some(&last) {
+                        self.acked.insert(id, last);
+                        self.send(Command::Ack {
+                            channel: id,
+                            message: last,
+                        });
+                    }
+                }
             }
         }
     }
@@ -633,7 +844,7 @@ impl NixApp {
                     .fill(t.header)
                     .inner_margin(Margin::symmetric(16, 0)),
             )
-            .show(ui, |ui| ui::chat::header(ui, self, ch));
+            .show(ui, |ui| ui::chat::header(ui, self, ch, actions));
 
         if self.members_visible(ui.ctx()) {
             egui::Panel::right("members")
@@ -645,7 +856,7 @@ impl NixApp {
                         .fill(t.sidebar)
                         .inner_margin(Margin::symmetric(8, 8)),
                 )
-                .show(ui, |ui| ui::chat::members(ui, self, ch));
+                .show(ui, |ui| ui::chat::members(ui, self, ch, actions));
         }
 
         egui::Panel::bottom("composer")
@@ -663,38 +874,93 @@ impl NixApp {
             .show(ui, |ui| ui::chat::messages(ui, self, ch, actions));
     }
 
-    fn toast_ui(&mut self, ctx: &egui::Context) {
-        let Some((msg, at, is_err)) = &self.toast else {
+    fn toast_ui(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let Some(toast) = &self.toast else {
             return;
         };
-        let left = TOAST_FOR.saturating_sub(at.elapsed());
+        let left = TOAST_FOR.saturating_sub(toast.at.elapsed());
         if left.is_zero() {
             self.toast = None;
             return;
         }
         ctx.request_repaint_after(left);
         let t = self.theme;
+        let msg = toast.msg.clone();
+        let is_err = toast.is_err;
+        let jump = toast.jump_channel;
+        let border = if is_err {
+            t.danger.gamma_multiply(0.6)
+        } else if jump.is_some() {
+            t.mention_bar
+        } else {
+            t.divider
+        };
+        let mut clicked = false;
         egui::Area::new(Id::unique("toast"))
             .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -96.0])
             .order(egui::Order::Foreground)
-            .interactable(false)
+            .interactable(jump.is_some())
             .show(ctx, |ui| {
-                Frame::new()
+                let frame = Frame::new()
                     .fill(t.elevated.to_opaque())
-                    .stroke(egui::Stroke::new(
-                        1.0,
-                        if *is_err {
-                            t.danger.gamma_multiply(0.6)
-                        } else {
-                            t.divider
-                        },
-                    ))
+                    .stroke(egui::Stroke::new(1.0, border))
                     .corner_radius(CornerRadius::same(8))
                     .inner_margin(Margin::symmetric(14, 10))
                     .show(ui, |ui| {
                         ui.label(egui::RichText::new(msg.as_str()).color(t.strong));
                     });
+                if jump.is_some() {
+                    let resp = frame
+                        .response
+                        .interact(Sense::click())
+                        .on_hover_cursor(CursorIcon::PointingHand);
+                    if resp.clicked() {
+                        clicked = true;
+                    }
+                }
             });
+        if clicked {
+            if let Some(ch) = jump {
+                actions.push(Action::SelectChannel(ch));
+            }
+            self.toast = None;
+        }
+    }
+}
+
+fn window_title_for(mentions: u32) -> String {
+    if mentions > 0 {
+        format!("({mentions}) nixcord")
+    } else {
+        "nixcord".into()
+    }
+}
+
+fn format_mention_toast(store: &Store, msg: &Message) -> String {
+    let ch = store.channel(msg.channel_id);
+    let guild = msg.guild_id.or_else(|| ch.and_then(|c| c.guild_id));
+    let author = ui::member_name(store, guild, &msg.author);
+    let snippet = single_line_snippet(&msg.content, 80);
+    let prefix = match ch {
+        Some(c) if matches!(c.kind, ChannelKind::Dm) => format!("DM from {author}"),
+        Some(c) if matches!(c.kind, ChannelKind::GroupDm) => {
+            format!("{author} in {}", c.label())
+        }
+        Some(c) => format!("{author} in #{}", c.label()),
+        None => author.to_string(),
+    };
+    if snippet.is_empty() {
+        prefix
+    } else {
+        format!("{prefix}: {snippet}")
+    }
+}
+
+fn single_line_snippet(text: &str, max_chars: usize) -> String {
+    let one_line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match one_line.char_indices().nth(max_chars) {
+        Some((idx, _)) => format!("{}…", &one_line[..idx]),
+        None => one_line,
     }
 }
 
@@ -741,13 +1007,16 @@ impl eframe::App for NixApp {
                 self.ensure_history();
                 self.sync_member_subscription();
                 self.update_seen();
+                self.expire_pending_interactions(&ctx);
+                self.update_window_title(&ctx);
                 self.main_ui(ui, &mut actions);
+                ui::profile::show(&ctx, self, &mut actions);
                 ui::settings::window(&ctx, self, &mut actions);
                 ui::chat::delete_modal(&ctx, self, &mut actions);
                 ui::viewer::show(&ctx, self);
             }
         }
-        self.toast_ui(&ctx);
+        self.toast_ui(&ctx, &mut actions);
 
         for a in actions {
             self.apply_action(a, &ctx);
@@ -849,4 +1118,79 @@ fn install_text_styles(ctx: &egui::Context) {
         style.spacing.scroll = egui::style::ScrollStyle::thin();
         style.url_in_tooltip = false;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nixcord_model::{Guild, Ready, User};
+
+    #[test]
+    fn window_title_includes_mention_count_only_when_nonzero() {
+        assert_eq!(window_title_for(0), "nixcord");
+        assert_eq!(window_title_for(1), "(1) nixcord");
+        assert_eq!(window_title_for(42), "(42) nixcord");
+    }
+
+    #[test]
+    fn mention_toast_formats_guild_and_dm_messages() {
+        let mut store = Store::new();
+        let me = User {
+            id: Snowflake(1),
+            username: "me".into(),
+            ..Default::default()
+        };
+        let sol = User {
+            id: Snowflake(2),
+            username: "sol".into(),
+            global_name: Some("Sol".into()),
+            ..Default::default()
+        };
+        store.apply(&GatewayEvent::Ready(Box::new(Ready {
+            user: me,
+            guilds: vec![Guild {
+                id: Snowflake(10),
+                name: "Hearth".into(),
+                channels: vec![Channel {
+                    id: Snowflake(100),
+                    kind: ChannelKind::Text,
+                    guild_id: Some(Snowflake(10)),
+                    name: Some("general".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            private_channels: vec![Channel {
+                id: Snowflake(200),
+                kind: ChannelKind::Dm,
+                recipients: vec![sol.clone()],
+                ..Default::default()
+            }],
+            session_id: "s".into(),
+            ..Default::default()
+        })));
+        let gm = Message {
+            id: Snowflake(500),
+            channel_id: Snowflake(100),
+            guild_id: Some(Snowflake(10)),
+            author: sol.clone(),
+            content: "hey\nthere   friend".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_mention_toast(&store, &gm),
+            "Sol in #general: hey there friend"
+        );
+        let dm = Message {
+            id: Snowflake(501),
+            channel_id: Snowflake(200),
+            author: sol,
+            content: "got a minute?".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_mention_toast(&store, &dm),
+            "DM from Sol: got a minute?"
+        );
+    }
 }

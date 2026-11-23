@@ -8,11 +8,13 @@
 //! an empty subscription for the guild it left. The store keeps the list of the focused
 //! guild only. The gateway coalesces and throttles the actual op 37 frames.
 
-use super::{member_name, prop, role_color};
+use super::{member_name, prop, role_color, Action};
 use crate::app::NixApp;
 use crate::backend::Command;
 use crate::theme::Theme;
-use eframe::egui::{self, Align2, Color32, CornerRadius, Pos2, Rect, RichText, Sense, Ui, Vec2};
+use eframe::egui::{
+    self, Align2, Color32, CornerRadius, CursorIcon, Pos2, Rect, RichText, Sense, Ui, Vec2,
+};
 use nixcord_gateway::GatewayCommand;
 use nixcord_model::{ChannelKind, Presence, Snowflake, Status, User};
 use nixcord_store::{ListSection, MEMBER_LIST_MAX_ROWS};
@@ -283,7 +285,13 @@ fn group_name(app: &NixApp, guild: Snowflake, s: &ListSection) -> String {
 
 /// Discord's member list for a guild channel. Returns `false` when no list has been
 /// synced yet (the caller shows a fallback).
-pub fn guild_member_list(ui: &mut Ui, app: &mut NixApp, guild: Snowflake, ch: Snowflake) -> bool {
+pub fn guild_member_list(
+    ui: &mut Ui,
+    app: &mut NixApp,
+    guild: Snowflake,
+    ch: Snowflake,
+    actions: &mut Vec<Action>,
+) -> bool {
     let Some(list) = app.store.member_list(guild) else {
         return false;
     };
@@ -316,7 +324,7 @@ pub fn guild_member_list(ui: &mut Ui, app: &mut NixApp, guild: Snowflake, ch: Sn
                     let offline_group = s.group.id == "offline";
                     for id in &s.members {
                         if let Some(u) = app.store.user(*id) {
-                            member_row(ui, app, u, Some(guild), offline_group);
+                            member_row(ui, app, u, Some(guild), offline_group, actions);
                         }
                     }
                 }
@@ -347,7 +355,7 @@ pub fn guild_member_list(ui: &mut Ui, app: &mut NixApp, guild: Snowflake, ch: Sn
 }
 
 /// DM / group DM member list: the recipients and me, online first.
-pub fn private_member_list(ui: &mut Ui, app: &NixApp, ch: Snowflake) {
+pub fn private_member_list(ui: &mut Ui, app: &NixApp, ch: Snowflake, actions: &mut Vec<Action>) {
     let t = app.theme;
     let Some(channel) = app.store.channel(ch) else {
         return;
@@ -380,7 +388,7 @@ pub fn private_member_list(ui: &mut Ui, app: &NixApp, ch: Snowflake) {
                 });
                 ui.add_space(2.0);
                 for u in list {
-                    member_row(ui, app, u, None, dim);
+                    member_row(ui, app, u, None, dim, actions);
                 }
             }
         });
@@ -388,10 +396,17 @@ pub fn private_member_list(ui: &mut Ui, app: &NixApp, ch: Snowflake) {
 
 /// One member: avatar with status dot, name in role color, status line under it.
 /// Offline members are dimmed.
-pub fn member_row(ui: &mut Ui, app: &NixApp, u: &User, guild: Option<Snowflake>, dim: bool) {
+pub fn member_row(
+    ui: &mut Ui,
+    app: &NixApp,
+    u: &User,
+    guild: Option<Snowflake>,
+    dim: bool,
+    actions: &mut Vec<Action>,
+) {
     let t = app.theme;
     let (outer, resp) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 42.0), Sense::hover());
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 42.0), Sense::click());
     if !ui.is_rect_visible(outer) {
         return;
     }
@@ -451,4 +466,12 @@ pub fn member_row(ui: &mut Ui, app: &NixApp, u: &User, guild: Option<Snowflake>,
     if u.bot && left + name_w + 40.0 < rect.right() {
         super::paint_app_badge(ui, Pos2::new(left + name_w + 5.0, top + name_h / 2.0));
     }
+    if resp.clicked() {
+        actions.push(Action::OpenProfile {
+            user_id: u.id,
+            guild_id: guild,
+            anchor: rect,
+        });
+    }
+    resp.on_hover_cursor(CursorIcon::PointingHand);
 }

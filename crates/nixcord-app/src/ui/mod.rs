@@ -12,6 +12,7 @@ pub mod emoji_text;
 pub mod login;
 pub mod markdown;
 pub mod presence;
+pub mod profile;
 pub mod settings;
 pub mod sidebar;
 pub mod viewer;
@@ -84,6 +85,25 @@ pub enum Action {
     EmojiUsed(String),
     /// Default skin tone for emoji (0 = none, 1..=5).
     SetSkinTone(u8),
+    /// Open (or toggle closed) a user's floating profile card anchored at `anchor`.
+    OpenProfile {
+        user_id: Snowflake,
+        guild_id: Option<Snowflake>,
+        anchor: Rect,
+    },
+    /// Jump to an existing DM channel with `user_id`.
+    OpenDm(Snowflake),
+    /// Trigger a Discord type-3 message component interaction (button or select menu).
+    Interact {
+        channel_id: Snowflake,
+        guild_id: Option<Snowflake>,
+        message_id: Snowflake,
+        message_flags: u64,
+        application_id: Snowflake,
+        component_type: u8,
+        custom_id: String,
+        values: Vec<String>,
+    },
     /// Short notice at the bottom of the window.
     Toast(String),
 }

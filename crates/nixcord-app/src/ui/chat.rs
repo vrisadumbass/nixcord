@@ -69,7 +69,7 @@ fn toggle_react_picker(ctx: &egui::Context, m: &Message, anchor: Rect) {
 
 // ---- header -------------------------------------------------------------------------
 
-pub fn header(ui: &mut Ui, app: &mut NixApp, ch: Snowflake) {
+pub fn header(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Action>) {
     let t = app.theme;
     let full = ui.max_rect().expand2(Vec2::new(16.0, 0.0));
     hline(ui, full, full.bottom() - 0.5, t.divider);
@@ -77,6 +77,15 @@ pub fn header(ui: &mut Ui, app: &mut NixApp, ch: Snowflake) {
         return;
     };
     let is_dm = matches!(channel.kind, ChannelKind::Dm | ChannelKind::GroupDm);
+    let is_thread = channel.kind.is_thread();
+    let parent_channel = is_thread
+        .then(|| {
+            channel
+                .parent_id
+                .and_then(|pid| app.store.channel(pid))
+                .map(|p| (p.id, p.label()))
+        })
+        .flatten();
     let name = channel.label();
     let topic = channel.topic.clone().filter(|s| !s.trim().is_empty());
     let me = app.store.me().map(|u| u.id);
@@ -146,19 +155,57 @@ pub fn header(ui: &mut Ui, app: &mut NixApp, ch: Snowflake) {
             ui.spacing_mut().item_spacing.x = 6.0;
             match &dm_user {
                 Some(u) => {
-                    let r = app.media.borrow_mut().avatar(ui, u, None, 24.0).rect;
+                    let av_resp = app
+                        .media
+                        .borrow_mut()
+                        .avatar(ui, u, None, 24.0)
+                        .interact(Sense::click())
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    let r = av_resp.rect;
                     let ring = super::presence::opaque_bg(t, t.header);
                     super::presence::paint_user_status(ui, app, u.id, r.center(), 24.0, ring);
+                    let name_resp =
+                        emoji_text::label_truncated(ui, &app.media, &name, bold(16.0), t.strong)
+                            .interact(Sense::click())
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if av_resp.clicked() || name_resp.clicked() {
+                        let anchor = if av_resp.clicked() {
+                            av_resp.rect
+                        } else {
+                            name_resp.rect
+                        };
+                        actions.push(Action::OpenProfile {
+                            user_id: u.id,
+                            guild_id: None,
+                            anchor,
+                        });
+                    }
                 }
                 None => {
-                    ui.label(
-                        RichText::new(if is_dm { "@" } else { "#" })
-                            .font(prop(22.0))
-                            .color(t.muted),
-                    );
+                    if let Some((parent_id, parent_name)) = &parent_channel {
+                        ui.label(RichText::new("#").font(prop(20.0)).color(t.muted));
+                        let parent_resp = ui
+                            .add(
+                                egui::Label::new(
+                                    RichText::new(parent_name).font(prop(15.0)).color(t.muted),
+                                )
+                                .sense(Sense::click()),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if parent_resp.clicked() {
+                            actions.push(Action::SelectChannel(*parent_id));
+                        }
+                        ui.label(RichText::new("›").font(prop(16.0)).color(t.muted));
+                    } else {
+                        ui.label(
+                            RichText::new(if is_dm { "@" } else { "#" })
+                                .font(prop(22.0))
+                                .color(t.muted),
+                        );
+                    }
+                    emoji_text::label_truncated(ui, &app.media, &name, bold(16.0), t.strong);
                 }
             }
-            emoji_text::label_truncated(ui, &app.media, &name, bold(16.0), t.strong);
             if let Some(topic) = topic {
                 ui.add_space(4.0);
                 let (r, _) = ui.allocate_exact_size(Vec2::new(1.0, 24.0), Sense::hover());
@@ -215,7 +262,7 @@ type MemberGroup<'a> = (Option<(i32, Snowflake)>, &'a str, Vec<&'a Message>);
 
 /// The member panel: Discord's member list for guild channels (from
 /// GUILD_MEMBER_LIST_UPDATE), the participants for DMs.
-pub fn members(ui: &mut Ui, app: &mut NixApp, ch: Snowflake) {
+pub fn members(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Action>) {
     let t = app.theme;
     let outer = ui.max_rect().expand(8.0);
     ui.painter().vline(
@@ -225,17 +272,17 @@ pub fn members(ui: &mut Ui, app: &mut NixApp, ch: Snowflake) {
     );
     match app.store.channel(ch).and_then(|c| c.guild_id) {
         Some(g) => {
-            if !super::presence::guild_member_list(ui, app, g, ch) {
-                recent_authors(ui, app, ch);
+            if !super::presence::guild_member_list(ui, app, g, ch, actions) {
+                recent_authors(ui, app, ch, actions);
             }
         }
-        None => super::presence::private_member_list(ui, app, ch),
+        None => super::presence::private_member_list(ui, app, ch, actions),
     }
 }
 
 /// Until the member list arrives (or if Discord never sends one): unique authors of the
 /// loaded messages (newest first), grouped under their highest role.
-fn recent_authors(ui: &mut Ui, app: &NixApp, ch: Snowflake) {
+fn recent_authors(ui: &mut Ui, app: &NixApp, ch: Snowflake, actions: &mut Vec<Action>) {
     let t = app.theme;
     let guild = app.store.channel(ch).and_then(|c| c.guild_id);
     let mut seen = HashSet::new();
@@ -276,17 +323,23 @@ fn recent_authors(ui: &mut Ui, app: &NixApp, ch: Snowflake) {
                 });
                 ui.add_space(2.0);
                 for m in list {
-                    member_row(ui, app, m, guild);
+                    member_row(ui, app, m, guild, actions);
                 }
             }
         });
 }
 
-fn member_row(ui: &mut Ui, app: &NixApp, m: &Message, guild: Option<Snowflake>) {
+fn member_row(
+    ui: &mut Ui,
+    app: &NixApp,
+    m: &Message,
+    guild: Option<Snowflake>,
+    actions: &mut Vec<Action>,
+) {
     let t = app.theme;
     let u = &m.author;
     let (outer, resp) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 42.0), Sense::hover());
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 42.0), Sense::click());
     let rect = outer.shrink2(Vec2::new(0.0, 1.0));
     if resp.hovered() {
         ui.painter()
@@ -318,6 +371,14 @@ fn member_row(ui: &mut Ui, app: &NixApp, m: &Message, guild: Option<Snowflake>) 
     if u.bot && left + w + 40.0 < rect.right() {
         paint_app_badge(ui, Pos2::new(left + w + 5.0, rect.center().y));
     }
+    if resp.clicked() {
+        actions.push(Action::OpenProfile {
+            user_id: u.id,
+            guild_id: guild,
+            anchor: rect,
+        });
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand);
 }
 
 /// `(guild, member avatar hash)` for `Media::paint_avatar` (per-guild avatars win).
@@ -774,13 +835,29 @@ fn message_row(
         let name_color = role_color(&app.store, guild, m.author.id).unwrap_or(t.strong);
         child.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            emoji_text::label(
+            let name_resp = emoji_text::label(
                 ui,
                 &app.media,
                 member_name(&app.store, guild, &m.author),
                 bold(15.5),
                 name_color,
-            );
+            )
+            .interact(Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if name_resp.hovered() {
+                ui.painter().hline(
+                    name_resp.rect.x_range(),
+                    name_resp.rect.bottom() - 1.0,
+                    Stroke::new(1.0, name_color),
+                );
+            }
+            if name_resp.clicked() {
+                actions.push(Action::OpenProfile {
+                    user_id: m.author.id,
+                    guild_id: guild,
+                    anchor: name_resp.rect,
+                });
+            }
             if m.author.bot {
                 let (r, _) = ui.allocate_exact_size(Vec2::new(30.0, 16.0), Sense::hover());
                 paint_app_badge(ui, r.left_center());
@@ -820,9 +897,24 @@ fn message_row(
 
     if rc.head {
         let c = Pos2::new(left + 16.0 + 20.0, y + 20.0);
+        let avatar_rect = Rect::from_center_size(c, Vec2::splat(40.0));
+        let avatar_resp = ui
+            .interact(
+                avatar_rect,
+                ui.scope_id().with(("avatar", m.id)),
+                Sense::click(),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
         app.media
             .borrow_mut()
             .paint_avatar(ui, c, 40.0, &m.author, member_avatar(m, guild));
+        if avatar_resp.clicked() {
+            actions.push(Action::OpenProfile {
+                user_id: m.author.id,
+                guild_id: guild,
+                anchor: avatar_rect,
+            });
+        }
     } else if hovered {
         ui.painter().text(
             Pos2::new(left + GUTTER / 2.0, first_line_y + 10.0),

@@ -17,8 +17,8 @@ use nixcord_model::{
     Activity, ActivityKind, Attachment, Channel, ChannelKind, Embed, EmbedAuthor, EmbedField,
     EmbedFooter, EmbedMedia, Emoji, GatewayEvent, Guild, GuildMember, ListMember, MemberListGroup,
     MemberListItem, MemberListOp, MemberListUpdate, Message, MessageReference, MessageUpdate,
-    Overwrite, OverwriteKind, PartialMember, Presence, Reaction, Ready, Relationship,
-    RelationshipKind, Role, Snowflake, Status, User,
+    Overwrite, OverwriteKind, PartialMember, Presence, Reaction, ReadState, Ready, Relationship,
+    RelationshipKind, Role, Snowflake, Status, ThreadMetadata, User,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -308,6 +308,33 @@ fn ready() -> Ready {
     });
     nix.channels
         .push(chan(110, t(10), Text, "__hidden__", t(101), 3, None));
+    // Active threads under #general (102) and #💡-suggestions (103).
+    nix.threads = vec![
+        Channel {
+            thread_metadata: Some(ThreadMetadata {
+                archived: false,
+                locked: false,
+            }),
+            last_message_id: Some(snowflake_at(now_ms() - 4 * 60_000, 1)),
+            ..chan(111, t(10), PublicThread, "v0.3-roadmap", t(102), 0, None)
+        },
+        Channel {
+            thread_metadata: Some(ThreadMetadata {
+                archived: false,
+                locked: false,
+            }),
+            last_message_id: Some(snowflake_at(now_ms() - 12 * 60_000, 2)),
+            ..chan(
+                112,
+                t(10),
+                PublicThread,
+                "compact-mode-ideas",
+                t(103),
+                0,
+                None,
+            )
+        },
+    ];
     let rust = guild(
         20,
         "Rust Lounge",
@@ -418,7 +445,11 @@ fn ready() -> Ready {
             })
             .collect(),
         status: Some(Status::Online),
-        read_state: Vec::new(),
+        read_state: vec![ReadState {
+            id: Snowflake(103),
+            last_message_id: Some(snowflake_at(now_ms() - 30 * 60_000, 0)),
+            mention_count: 1,
+        }],
     }
 }
 
@@ -1047,11 +1078,33 @@ fn vote_buttons(id: Snowflake, channel: Snowflake, bot: &User, t: u64) -> Messag
                 kind: SelectKind::String,
                 custom_id: Some("theme".into()),
                 placeholder: Some("Pick your favorite theme".into()),
-                options: vec![SelectOption {
-                    label: "Midnight".into(),
-                    value: "midnight".into(),
-                    ..Default::default()
-                }],
+                options: vec![
+                    SelectOption {
+                        label: "Graphite".into(),
+                        value: "graphite".into(),
+                        description: Some("Flat dark surfaces (default)".into()),
+                        default: true,
+                        ..Default::default()
+                    },
+                    SelectOption {
+                        label: "Onyx".into(),
+                        value: "onyx".into(),
+                        description: Some("Pure black with hairline borders".into()),
+                        ..Default::default()
+                    },
+                    SelectOption {
+                        label: "Aurora".into(),
+                        value: "aurora".into(),
+                        description: Some("Deep teal and mint gradient".into()),
+                        ..Default::default()
+                    },
+                    SelectOption {
+                        label: "Sunset".into(),
+                        value: "sunset".into(),
+                        description: Some("Warm plum and coral gradient".into()),
+                        ..Default::default()
+                    },
+                ],
                 ..Default::default()
             })],
         }),
@@ -1285,24 +1338,28 @@ pub async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx
         let people = people.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(1500)).await;
-            let posts: [(u64, usize, &str); 3] = [
+            let posts: [(u64, usize, &str, bool); 3] = [
                 (
                     104,
                     3,
-                    "found a crash when the window is minimized, logs incoming",
+                    "found a crash when the window is minimized, logs incoming — <@1000> can you check?",
+                    true,
                 ),
-                (201, 5, "anyone tried the new borrow checker diagnostics?"),
-                (2, 3, "you around? got a minute"),
+                (201, 5, "anyone tried the new borrow checker diagnostics?", false),
+                (2, 3, "you around? got a minute", false),
             ];
-            for (i, (channel, who, text)) in posts.into_iter().enumerate() {
+            for (i, (channel, who, text, ping_me)) in posts.into_iter().enumerate() {
                 let t = now_ms();
-                let m = base_msg(
+                let mut m = base_msg(
                     snowflake_at(t, 0x3f_0000 + i as u64),
                     Snowflake(channel),
                     &people[who.min(people.len() - 1)],
                     text.into(),
                     t,
                 );
+                if ping_me {
+                    m.mentions.push(people[0].clone());
+                }
                 events.send(AppEvent::Gateway(GatewayEvent::MessageCreate(Box::new(m))));
             }
         });
@@ -1445,7 +1502,37 @@ pub async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx
                     emoji,
                 }));
             }
-            Command::Typing { .. } => {}
+            Command::Typing { .. } | Command::Ack { .. } => {}
+            Command::Interact(ix) => {
+                let events = events.clone();
+                let summary = if ix.values.is_empty() {
+                    format!(
+                        "**Poll:** what should nixcord build next?\n-# Latest vote: **{}** (by You)",
+                        ix.custom_id
+                    )
+                } else {
+                    format!(
+                        "**Poll:** what should nixcord build next?\n-# Selected theme: **{}** (by You)",
+                        ix.values.join(", ")
+                    )
+                };
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(220)).await;
+                    events.send(AppEvent::InteractionDone {
+                        message_id: ix.message_id,
+                        custom_id: ix.custom_id,
+                        error: None,
+                    });
+                    events.send(AppEvent::Gateway(GatewayEvent::MessageUpdate(Box::new(
+                        MessageUpdate {
+                            id: ix.message_id,
+                            channel_id: ix.channel_id,
+                            content: Some(summary),
+                            ..Default::default()
+                        },
+                    ))));
+                });
+            }
             Command::Gateway(GatewayCommand::SubscribeGuild {
                 guild_id, ranges, ..
             }) => {

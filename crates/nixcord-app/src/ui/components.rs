@@ -7,8 +7,8 @@
 //! row's height doesn't jump when images arrive; the chat list re-measures visible rows
 //! every frame anyway.
 //!
-//! Interactions (non-link buttons, selects) need the gateway `session_id` plumbing, which
-//! isn't there yet: they render normally and a click shows a toast.
+//! Interactions: non-link buttons and string select menus emit `Action::Interact`, with
+//! pending visual feedback while in flight and a themed dropdown popup for selects.
 
 use super::markdown::{self, MdClick, RenderCtx, StoreResolver};
 use super::{bold, fmt_size, paint_icon, prop, Action, Icon};
@@ -39,8 +39,32 @@ const BUTTON_H: f32 = 32.0;
 const SELECT_H: f32 = 40.0;
 const SELECT_MAX_W: f32 = 400.0;
 const FILE_MAX_W: f32 = 432.0;
+const SELECT_POPUP_MAX_H: f32 = 260.0;
 
-pub const UNSUPPORTED: &str = "Interactions aren't supported yet";
+pub const UNSUPPORTED: &str = "Only string select menus are supported yet";
+
+fn select_popup_id() -> Id {
+    Id::unique("nixcord-select-popup-state")
+}
+
+/// Active string-select dropdown popup stored in egui memory.
+#[derive(Clone, Debug)]
+struct OpenSelect {
+    id: Id,
+    anchor: Rect,
+    width: f32,
+    draft: Vec<String>,
+}
+
+/// Application ID that owns a bot/component message (falls back to `author.id`).
+pub(crate) fn interaction_app_id(m: &Message) -> Snowflake {
+    m.application_id.unwrap_or(m.author.id)
+}
+
+fn message_guild_id(app: &NixApp, m: &Message) -> Option<Snowflake> {
+    m.guild_id
+        .or_else(|| app.store.channel(m.channel_id).and_then(|c| c.guild_id))
+}
 
 /// Shared state while drawing one message's components.
 struct Cx<'a> {
@@ -645,7 +669,11 @@ fn button_layout(ui: &Ui, b: &Button) -> (f32, Option<Arc<Galley>>) {
 fn button(ui: &mut Ui, cx: &mut Cx, b: &Button) -> Response {
     let t = cx.app.theme;
     let (w, galley) = button_layout(ui, b);
-    let enabled = !b.disabled;
+    let pending = b
+        .custom_id
+        .as_deref()
+        .is_some_and(|cid| cx.app.is_interaction_pending(cx.m.id, cid));
+    let enabled = !b.disabled && !pending;
     let sense = if enabled {
         Sense::click()
     } else {
@@ -656,7 +684,15 @@ fn button(ui: &mut Ui, cx: &mut Cx, b: &Button) -> Response {
         return resp;
     }
     let (fill, hover, fg) = button_colors(t.dark, b.style);
-    let dim = |c: Color32| if enabled { c } else { c.gamma_multiply(0.5) };
+    let dim = |c: Color32| {
+        if pending {
+            c.gamma_multiply(0.65)
+        } else if enabled {
+            c
+        } else {
+            c.gamma_multiply(0.5)
+        }
+    };
     let fill = if enabled && resp.hovered() {
         hover
     } else {
@@ -665,35 +701,57 @@ fn button(ui: &mut Ui, cx: &mut Cx, b: &Button) -> Response {
     ui.painter()
         .rect_filled(rect, CornerRadius::same(8), dim(fill));
 
-    let mut x = rect.left() + BTN_PAD;
-    let cy = rect.center().y;
-    if let Some(e) = b.emoji.as_ref().filter(|_| b.style != ButtonStyle::Premium) {
-        let er = Rect::from_center_size(Pos2::new(x + BTN_EMOJI / 2.0, cy), Vec2::splat(BTN_EMOJI));
-        paint_emoji(ui, cx, e, er, dim(fg));
-        x += BTN_EMOJI + 6.0;
-    }
-    if let Some(g) = galley {
-        let gw = g.size().x;
-        ui.painter()
-            .galley(Pos2::new(x, cy - g.size().y / 2.0), g, dim(fg));
-        x += gw + 6.0;
-    }
-    if b.style == ButtonStyle::Link {
-        let ir = Rect::from_center_size(
-            Pos2::new(x + BTN_LINK_ICON / 2.0, cy),
-            Vec2::splat(BTN_LINK_ICON),
-        );
-        paint_external(ui, ir, dim(fg));
+    if pending {
+        let spin_rect = Rect::from_center_size(rect.center(), Vec2::splat(16.0));
+        let mut child = ui.new_child(UiBuilder::new().max_rect(spin_rect));
+        child.add(egui::Spinner::new().size(14.0).color(Color32::WHITE));
+    } else {
+        let mut x = rect.left() + BTN_PAD;
+        let cy = rect.center().y;
+        if let Some(e) = b.emoji.as_ref().filter(|_| b.style != ButtonStyle::Premium) {
+            let er =
+                Rect::from_center_size(Pos2::new(x + BTN_EMOJI / 2.0, cy), Vec2::splat(BTN_EMOJI));
+            paint_emoji(ui, cx, e, er, dim(fg));
+            x += BTN_EMOJI + 6.0;
+        }
+        if let Some(g) = galley {
+            let gw = g.size().x;
+            ui.painter()
+                .galley(Pos2::new(x, cy - g.size().y / 2.0), g, dim(fg));
+            x += gw + 6.0;
+        }
+        if b.style == ButtonStyle::Link {
+            let ir = Rect::from_center_size(
+                Pos2::new(x + BTN_LINK_ICON / 2.0, cy),
+                Vec2::splat(BTN_LINK_ICON),
+            );
+            paint_external(ui, ir, dim(fg));
+        }
     }
 
     let url = b.url.as_deref().filter(|_| b.style == ButtonStyle::Link);
-    if resp.clicked() {
-        match url {
-            Some(u) => ui.ctx().open_url(egui::OpenUrl::new_tab(u)),
-            None => cx.actions.push(Action::Toast(UNSUPPORTED.into())),
+    if resp.clicked() && enabled {
+        match (b.style, url, b.custom_id.as_ref()) {
+            (ButtonStyle::Link, Some(u), _) => ui.ctx().open_url(egui::OpenUrl::new_tab(u)),
+            (ButtonStyle::Premium, _, _) => cx
+                .actions
+                .push(Action::Toast("Premium purchases aren't supported".into())),
+            (_, _, Some(custom_id)) => cx.actions.push(Action::Interact {
+                channel_id: cx.m.channel_id,
+                guild_id: message_guild_id(cx.app, cx.m),
+                message_id: cx.m.id,
+                message_flags: cx.m.flags,
+                application_id: interaction_app_id(cx.m),
+                component_type: 2,
+                custom_id: custom_id.clone(),
+                values: Vec::new(),
+            }),
+            _ => {}
         }
     }
-    let resp = resp.on_hover_cursor(if enabled {
+    let resp = resp.on_hover_cursor(if pending {
+        CursorIcon::Progress
+    } else if enabled {
         CursorIcon::PointingHand
     } else {
         CursorIcon::NotAllowed
@@ -743,9 +801,14 @@ fn paint_external(ui: &Ui, r: Rect, color: Color32) {
 }
 
 fn select(ui: &mut Ui, cx: &mut Cx, s: &SelectMenu) {
+    let id = cx.next_id("select");
     let t = cx.app.theme;
     let w = ui.available_width().min(SELECT_MAX_W);
-    let enabled = !s.disabled;
+    let pending = s
+        .custom_id
+        .as_deref()
+        .is_some_and(|cid| cx.app.is_interaction_pending(cx.m.id, cid));
+    let enabled = !s.disabled && !pending;
     let sense = if enabled {
         Sense::click()
     } else {
@@ -755,13 +818,27 @@ fn select(ui: &mut Ui, cx: &mut Cx, s: &SelectMenu) {
     if !ui.is_rect_visible(rect) {
         return;
     }
-    let dim = |c: Color32| if enabled { c } else { c.gamma_multiply(0.5) };
+
+    let open_state: Option<OpenSelect> = ui.ctx().data(|d| d.get_temp(select_popup_id()));
+    let is_open = open_state.as_ref().is_some_and(|o| o.id == id);
+
+    let dim = |c: Color32| {
+        if pending {
+            c.gamma_multiply(0.65)
+        } else if enabled {
+            c
+        } else {
+            c.gamma_multiply(0.5)
+        }
+    };
     let fill = if t.dark {
         Color32::from_black_alpha(70)
     } else {
         Color32::from_white_alpha(200)
     };
-    let border = if enabled && resp.hovered() {
+    let border = if is_open {
+        t.accent
+    } else if enabled && resp.hovered() {
         t.muted.gamma_multiply(0.6)
     } else {
         t.divider
@@ -773,13 +850,27 @@ fn select(ui: &mut Ui, cx: &mut Cx, s: &SelectMenu) {
         Stroke::new(1.0, dim(border)),
         egui::StrokeKind::Inside,
     );
-    let defaults: Vec<&str> = s
+
+    // Local chosen values (if the user already picked one) take precedence over defaults.
+    let chosen_key = id.with("chosen");
+    let chosen_values: Vec<String> = ui
+        .ctx()
+        .data(|d| d.get_temp::<Vec<String>>(chosen_key))
+        .unwrap_or_else(|| {
+            s.options
+                .iter()
+                .filter(|o| o.default)
+                .map(|o| o.value.clone())
+                .collect()
+        });
+    let selected_labels: Vec<&str> = s
         .options
         .iter()
-        .filter(|o| o.default)
+        .filter(|o| chosen_values.iter().any(|v| v == &o.value))
         .map(|o| o.label.as_str())
         .collect();
-    let (label, color) = if defaults.is_empty() {
+
+    let (label, color) = if selected_labels.is_empty() {
         let fallback = match s.kind {
             SelectKind::String => "Make a selection",
             SelectKind::User => "Select a user",
@@ -792,7 +883,7 @@ fn select(ui: &mut Ui, cx: &mut Cx, s: &SelectMenu) {
             t.muted,
         )
     } else {
-        (defaults.join(", "), t.text)
+        (selected_labels.join(", "), t.text)
     };
     let mut job = egui::text::LayoutJob::single_section(
         label,
@@ -808,24 +899,280 @@ fn select(ui: &mut Ui, cx: &mut Cx, s: &SelectMenu) {
         g,
         dim(color),
     );
-    // Chevron.
+
+    // Right indicator: spinner when pending, chevron otherwise (flipped up when open).
     let c = Pos2::new(rect.right() - 20.0, rect.center().y);
-    ui.painter().add(Shape::line(
-        vec![
-            c + Vec2::new(-5.0, -2.5),
-            c + Vec2::new(0.0, 2.5),
-            c + Vec2::new(5.0, -2.5),
-        ],
-        Stroke::new(2.0, dim(t.text)),
-    ));
-    if resp.clicked() {
-        cx.actions.push(Action::Toast(UNSUPPORTED.into()));
+    if pending {
+        let sr = Rect::from_center_size(c, Vec2::splat(16.0));
+        let mut child = ui.new_child(UiBuilder::new().max_rect(sr));
+        child.add(egui::Spinner::new().size(14.0).color(t.muted));
+    } else {
+        let dy = if is_open { -2.5 } else { 2.5 };
+        ui.painter().add(Shape::line(
+            vec![
+                c + Vec2::new(-5.0, -dy),
+                c + Vec2::new(0.0, dy),
+                c + Vec2::new(5.0, -dy),
+            ],
+            Stroke::new(2.0, dim(t.text)),
+        ));
     }
-    resp.on_hover_cursor(if enabled {
+
+    if resp.clicked() && enabled {
+        if s.kind != SelectKind::String {
+            cx.actions.push(Action::Toast(UNSUPPORTED.into()));
+        } else if s.options.is_empty() || s.custom_id.is_none() {
+            cx.actions
+                .push(Action::Toast("This select menu has no options".into()));
+        } else if is_open {
+            ui.ctx()
+                .data_mut(|d| d.remove::<OpenSelect>(select_popup_id()));
+        } else {
+            ui.ctx().data_mut(|d| {
+                d.insert_temp(
+                    select_popup_id(),
+                    OpenSelect {
+                        id,
+                        anchor: rect,
+                        width: w,
+                        draft: chosen_values.clone(),
+                    },
+                );
+            });
+        }
+    }
+
+    if is_open {
+        if let Some(mut open) = open_state {
+            select_popup(ui.ctx(), cx, s, &mut open, chosen_key);
+        }
+    }
+
+    resp.on_hover_cursor(if pending {
+        CursorIcon::Progress
+    } else if enabled {
         CursorIcon::PointingHand
     } else {
         CursorIcon::NotAllowed
     });
+}
+
+fn select_popup(
+    ctx: &egui::Context,
+    cx: &mut Cx,
+    s: &SelectMenu,
+    open: &mut OpenSelect,
+    chosen_key: Id,
+) {
+    let t = cx.app.theme;
+    let min_values = s.min_values.unwrap_or(1) as usize;
+    let max_values = s.max_values.unwrap_or(1).max(1) as usize;
+    let multi = max_values > 1;
+
+    let screen = ctx.content_rect();
+    let est_h = (s.options.len() as f32 * 44.0 + if multi { 44.0 } else { 12.0 })
+        .min(SELECT_POPUP_MAX_H + if multi { 44.0 } else { 12.0 });
+    let below = open.anchor.bottom() + 4.0;
+    let above = open.anchor.top() - est_h - 4.0;
+    let y = if below + est_h <= screen.bottom() - 8.0 || above < screen.top() + 8.0 {
+        below.min((screen.bottom() - est_h - 8.0).max(screen.top() + 8.0))
+    } else {
+        above
+    };
+    let x = open.anchor.left().clamp(
+        screen.left() + 8.0,
+        (screen.right() - open.width - 8.0).max(screen.left() + 8.0),
+    );
+
+    let mut close = false;
+    let mut submit: Option<Vec<String>> = None;
+
+    let area = egui::Area::new(Id::unique("nixcord-select-popup-area"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(Pos2::new(x, y))
+        .show(ctx, |ui| {
+            Frame::new()
+                .fill(t.elevated.to_opaque())
+                .stroke(Stroke::new(1.0, t.divider))
+                .corner_radius(CornerRadius::same(8))
+                .shadow(egui::Shadow {
+                    offset: [0, 8],
+                    blur: 20,
+                    spread: 0,
+                    color: Color32::from_black_alpha(110),
+                })
+                .inner_margin(Margin::same(6))
+                .show(ui, |ui| {
+                    ui.set_width(open.width - 12.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt(("select_scroll", open.id))
+                        .max_height(SELECT_POPUP_MAX_H)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            for opt in &s.options {
+                                let selected = open.draft.iter().any(|v| v == &opt.value);
+                                let has_desc = opt
+                                    .description
+                                    .as_deref()
+                                    .is_some_and(|d| !d.trim().is_empty());
+                                let row_h = if has_desc { 46.0 } else { 34.0 };
+                                let (r, resp) = ui.allocate_exact_size(
+                                    Vec2::new(ui.available_width(), row_h),
+                                    Sense::click(),
+                                );
+                                if resp.hovered() || selected {
+                                    ui.painter().rect_filled(
+                                        r,
+                                        CornerRadius::same(6),
+                                        if resp.hovered() { t.hover } else { t.selected },
+                                    );
+                                }
+                                let mut lx = r.left() + 10.0;
+                                if let Some(e) = &opt.emoji {
+                                    let er = Rect::from_center_size(
+                                        Pos2::new(lx + 9.0, r.center().y),
+                                        Vec2::splat(18.0),
+                                    );
+                                    paint_emoji(ui, cx, e, er, t.strong);
+                                    lx += 26.0;
+                                }
+                                let text_right = r.right() - 28.0;
+                                let text_w = (text_right - lx).max(20.0);
+                                let mut ljob = egui::text::LayoutJob::single_section(
+                                    opt.label.clone(),
+                                    egui::TextFormat::simple(
+                                        if selected { bold(14.0) } else { prop(14.0) },
+                                        t.strong,
+                                    ),
+                                );
+                                ljob.wrap.max_width = text_w;
+                                ljob.wrap.max_rows = 1;
+                                ljob.wrap.overflow_character = Some('…');
+                                let lg = ui.painter().layout_job(ljob);
+
+                                if let Some(desc) =
+                                    opt.description.as_deref().filter(|d| !d.trim().is_empty())
+                                {
+                                    let mut djob = egui::text::LayoutJob::single_section(
+                                        desc.to_string(),
+                                        egui::TextFormat::simple(prop(12.0), t.muted),
+                                    );
+                                    djob.wrap.max_width = text_w;
+                                    djob.wrap.max_rows = 1;
+                                    djob.wrap.overflow_character = Some('…');
+                                    let dg = ui.painter().layout_job(djob);
+                                    let total_h = lg.size().y + dg.size().y + 1.0;
+                                    let top = r.center().y - total_h / 2.0;
+                                    let lh = lg.size().y;
+                                    ui.painter().galley(Pos2::new(lx, top), lg, t.strong);
+                                    ui.painter()
+                                        .galley(Pos2::new(lx, top + lh + 1.0), dg, t.muted);
+                                } else {
+                                    ui.painter().galley(
+                                        Pos2::new(lx, r.center().y - lg.size().y / 2.0),
+                                        lg,
+                                        t.strong,
+                                    );
+                                }
+
+                                if selected {
+                                    ui.painter().text(
+                                        Pos2::new(r.right() - 14.0, r.center().y),
+                                        Align2::CENTER_CENTER,
+                                        "✓",
+                                        bold(14.0),
+                                        t.accent,
+                                    );
+                                }
+
+                                if resp.clicked() {
+                                    if multi {
+                                        toggle_multi_value(&mut open.draft, &opt.value, max_values);
+                                    } else {
+                                        submit = Some(vec![opt.value.clone()]);
+                                        close = true;
+                                    }
+                                }
+                                resp.on_hover_cursor(CursorIcon::PointingHand);
+                            }
+                        });
+
+                    if multi {
+                        ui.add_space(4.0);
+                        let (div, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), 1.0),
+                            Sense::hover(),
+                        );
+                        ui.painter().rect_filled(div, 0.0, t.divider);
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{}/{} selected",
+                                    open.draft.len(),
+                                    max_values
+                                ))
+                                .font(prop(12.0))
+                                .color(t.muted),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let can_confirm = open.draft.len() >= min_values;
+                                let btn = egui::Button::new(
+                                    egui::RichText::new("Confirm")
+                                        .font(bold(12.5))
+                                        .color(if can_confirm { t.on_accent } else { t.muted }),
+                                )
+                                .fill(if can_confirm { t.accent } else { t.hover })
+                                .min_size(Vec2::new(72.0, 26.0));
+                                if ui.add_enabled(can_confirm, btn).clicked() {
+                                    submit = Some(open.draft.clone());
+                                    close = true;
+                                }
+                            });
+                        });
+                    }
+                });
+        });
+
+    if let Some(values) = submit {
+        ctx.data_mut(|d| d.insert_temp(chosen_key, values.clone()));
+        if let Some(custom_id) = &s.custom_id {
+            cx.actions.push(Action::Interact {
+                channel_id: cx.m.channel_id,
+                guild_id: message_guild_id(cx.app, cx.m),
+                message_id: cx.m.id,
+                message_flags: cx.m.flags,
+                application_id: interaction_app_id(cx.m),
+                component_type: s.kind.type_id() as u8,
+                custom_id: custom_id.clone(),
+                values,
+            });
+        }
+    }
+
+    let popup_rect = area.response.rect;
+    let dismissed = ctx.input(|i| {
+        i.key_pressed(egui::Key::Escape)
+            || (i.pointer.any_pressed()
+                && i.pointer
+                    .interact_pos()
+                    .is_some_and(|p| !popup_rect.contains(p) && !open.anchor.contains(p)))
+    });
+
+    if close || dismissed {
+        ctx.data_mut(|d| d.remove::<OpenSelect>(select_popup_id()));
+    } else {
+        ctx.data_mut(|d| d.insert_temp(select_popup_id(), open.clone()));
+    }
+}
+
+fn toggle_multi_value(draft: &mut Vec<String>, value: &str, max_values: usize) {
+    if let Some(pos) = draft.iter().position(|v| v == value) {
+        draft.remove(pos);
+    } else if draft.len() < max_values {
+        draft.push(value.to_string());
+    }
 }
 
 #[cfg(test)]
@@ -880,5 +1227,25 @@ mod tests {
         let h = estimate(&cs, 700.0);
         // padding + one text line + separator + a 3:1 banner (~187 tall at 560 wide).
         assert!(h > 200.0 && h < 320.0, "{h}");
+    }
+
+    #[test]
+    fn interaction_app_id_prefers_application_id_then_author() {
+        let mut m = Message::default();
+        m.author.id = Snowflake(42);
+        assert_eq!(interaction_app_id(&m), Snowflake(42));
+        m.application_id = Some(Snowflake(99));
+        assert_eq!(interaction_app_id(&m), Snowflake(99));
+    }
+
+    #[test]
+    fn multi_select_toggle_respects_cap() {
+        let mut draft = Vec::new();
+        toggle_multi_value(&mut draft, "a", 2);
+        toggle_multi_value(&mut draft, "b", 2);
+        toggle_multi_value(&mut draft, "c", 2);
+        assert_eq!(draft, vec!["a", "b"]);
+        toggle_multi_value(&mut draft, "a", 2);
+        assert_eq!(draft, vec!["b"]);
     }
 }
