@@ -1,6 +1,11 @@
 //! Message composer: Enter sends, Shift+Enter inserts a newline, Up on an empty composer
 //! edits your last message, Escape cancels edit/reply. Typing indicator underneath.
 //!
+//! Attachments: click `+` to open a non-blocking native file picker (`rfd`), or drag and
+//! drop files onto the window. Staged attachments appear in a horizontal tray above the
+//! input box with image/file badges, formatted sizes, and `×` remove buttons. Messages
+//! with attachments can be sent with or without text.
+//!
 //! Emoji: the smiley button on the right opens the emoji picker (inserts at the caret).
 //! Typing `:hea` (two or more name characters after a colon) shows matching emoji above the
 //! composer: Up/Down select, Tab/Enter insert, Escape closes. On send, complete
@@ -8,14 +13,18 @@
 //! name is unique in the channel's server.
 
 use super::emoji_picker::{self, Picked};
-use super::{bold, emoji_text, icon_button, paint_plus, prop, Action, Icon};
-use crate::app::NixApp;
+use super::{bold, emoji_text, fmt_size, icon_button, paint_plus, prop, Action, Icon};
+use crate::app::{ComposerState, NixApp};
+use crate::theme::Theme;
 use eframe::egui::{
     self, text::CCursor, text::CCursorRange, text_edit::TextEditState, Align, Align2, Color32,
-    CornerRadius, Frame, Id, Key, KeyboardShortcut, Layout, Margin, Modifiers, Pos2, Rect,
-    RichText, Sense, Stroke, Ui, Vec2,
+    CornerRadius, CursorIcon, Frame, Id, Key, KeyboardShortcut, Layout, Margin, Modifiers, Order,
+    Pos2, Rect, RichText, Sense, Shape, Stroke, Ui, Vec2,
 };
+use nixcord_http::{UploadFile, MAX_ATTACHMENTS, MAX_FILE_BYTES, MAX_TOTAL_BYTES};
 use nixcord_model::{ChannelKind, Snowflake};
+use std::path::PathBuf;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// Autocomplete shows at most this many rows.
@@ -25,15 +34,24 @@ const AC_ROW_H: f32 = 34.0;
 /// Re-send the typing notification at most this often (Discord shows it for ~10s).
 const TYPING_EVERY: Duration = Duration::from_secs(8);
 
+/// Attachment card dimensions in the horizontal tray above the composer.
+const ATTACH_CARD_W: f32 = 176.0;
+const ATTACH_CARD_H: f32 = 52.0;
+
 pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Action>) {
+    // Always drain background file-picker / drag-drop tasks first so finished dialogs
+    // reset `attach_dialog_open` even if the user switched channels.
+    drain_pending_attachments(app);
+
     let t = app.theme;
     let Some(channel) = app.store.channel(ch) else {
         return;
     };
-    let placeholder = match channel.kind {
-        ChannelKind::Dm | ChannelKind::GroupDm => format!("Message @{}", channel.label()),
-        _ => format!("Message #{}", channel.label()),
+    let channel_label = match channel.kind {
+        ChannelKind::Dm | ChannelKind::GroupDm => format!("@{}", channel.label()),
+        _ => format!("#{}", channel.label()),
     };
+    let placeholder = format!("Message {channel_label}");
 
     // Edit / reply banner.
     let banner = if app.composer.editing.is_some() {
@@ -107,6 +125,11 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
         return;
     }
 
+    // Drag-and-drop file handling (only when allowed to send and not editing).
+    if app.composer.editing.is_none() {
+        handle_drag_and_drop(ui.ctx(), app, &channel_label);
+    }
+
     if let Some(b) = &banner {
         Frame::new()
             .fill(Color32::from_black_alpha(if t.dark { 60 } else { 18 }))
@@ -134,6 +157,12 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
             });
     } else {
         ui.add_space(2.0);
+    }
+
+    // Horizontal attachment preview tray above the composer box (hidden while editing).
+    let show_tray = app.composer.editing.is_none() && !app.composer.attachments.is_empty();
+    if show_tray {
+        attachment_tray(ui, t, ch, banner.is_some(), &mut app.composer.attachments);
     }
 
     let id = Id::unique(("composer", ch));
@@ -180,7 +209,7 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
         )
     });
 
-    let corner = if banner.is_some() {
+    let corner = if banner.is_some() || show_tray {
         CornerRadius {
             nw: 0,
             ne: 0,
@@ -192,6 +221,13 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
     };
     let mut changed = false;
     let mut picker_btn: Option<(Rect, bool)> = None;
+    let mut send_clicked = false;
+    let mut attach_clicked = false;
+    let can_attach = app.composer.editing.is_none()
+        && app.composer.attachments.len() < MAX_ATTACHMENTS
+        && !app.composer.attach_dialog_open;
+    let show_send_btn = app.composer.editing.is_none() && !app.composer.attachments.is_empty();
+
     let frame = Frame::new()
         .fill(t.elevated)
         .corner_radius(corner)
@@ -205,12 +241,37 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 let (r, resp) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::click());
-                let c = if resp.hovered() { t.strong } else { t.muted };
+                let c = if !can_attach {
+                    t.muted.gamma_multiply(0.45)
+                } else if resp.hovered() {
+                    t.strong
+                } else {
+                    t.muted
+                };
                 ui.painter().circle_filled(r.center(), 11.0, c);
                 paint_plus(ui, r.center(), 10.0, t.elevated.to_opaque());
-                resp.on_hover_text("Uploads aren't supported yet");
+                let tip = if app.composer.editing.is_some() {
+                    "Finish editing to attach files"
+                } else if app.composer.attachments.len() >= MAX_ATTACHMENTS {
+                    "Maximum 10 attachments reached"
+                } else if app.composer.attach_dialog_open {
+                    "File picker open…"
+                } else {
+                    "Attach files (up to 10 files, 10 MB each)"
+                };
+                let resp = if can_attach {
+                    resp.on_hover_cursor(CursorIcon::PointingHand)
+                        .on_hover_text(tip)
+                } else {
+                    resp.on_hover_text(tip)
+                };
+                if can_attach && resp.clicked() {
+                    attach_clicked = true;
+                }
+
                 ui.add_space(4.0);
-                let text_w = (ui.available_width() - 44.0).max(40.0);
+                let right_controls_w = if show_send_btn { 84.0 } else { 44.0 };
+                let text_w = (ui.available_width() - right_controls_w).max(40.0);
                 egui::ScrollArea::vertical()
                     .id_salt(("composer_scroll", ch))
                     .max_width(text_w)
@@ -239,6 +300,12 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
                         }
                     });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if show_send_btn {
+                        if send_button(ui, t).clicked() {
+                            send_clicked = true;
+                        }
+                        ui.add_space(4.0);
+                    }
                     let open = app.composer.picker.is_some();
                     let b = icon_button(ui, t, Icon::Smile, 32.0, "Select emoji");
                     if open {
@@ -251,6 +318,10 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
     if changed {
         app.composer.ac_selected = 0;
         app.composer.ac_dismissed = None;
+    }
+    if attach_clicked {
+        let slots = MAX_ATTACHMENTS.saturating_sub(app.composer.attachments.len());
+        spawn_file_picker(ui.ctx().clone(), &mut app.composer, slots);
     }
 
     // Autocomplete popup, above the composer.
@@ -289,13 +360,21 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
         ui.memory_mut(|m| m.request_focus(id));
     }
 
+    if send_clicked {
+        submit(app, ch, actions);
+    }
+
     // Keyboard handling (only while the composer has focus).
     if focused {
         if enter && !shift {
             submit(app, ch, actions);
         } else if esc {
             cancel = true;
-        } else if up && app.composer.text.is_empty() && app.composer.editing.is_none() {
+        } else if up
+            && app.composer.text.is_empty()
+            && app.composer.attachments.is_empty()
+            && app.composer.editing.is_none()
+        {
             let me = app.store.me().map(|u| u.id);
             if let Some(last) = app
                 .store
@@ -331,6 +410,606 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
     }
 
     typing_line(ui, app, ch);
+}
+
+// ---- attachments: picker, drag-and-drop, preview tray -------------------------------
+
+/// Drain any completed background attachment loads (file picker or drag-drop).
+fn drain_pending_attachments(app: &mut NixApp) {
+    if app.composer.attach_rxs.is_empty() {
+        app.composer.attach_dialog_open = false;
+        return;
+    }
+    let mut incoming: Vec<UploadFile> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    app.composer.attach_rxs.retain(|rx| loop {
+        match rx.try_recv() {
+            Ok((files, errs)) => {
+                incoming.extend(files);
+                errors.extend(errs);
+            }
+            Err(mpsc::TryRecvError::Empty) => return true,
+            Err(mpsc::TryRecvError::Disconnected) => return false,
+        }
+    });
+    if app.composer.attach_rxs.is_empty() {
+        app.composer.attach_dialog_open = false;
+    }
+    if !incoming.is_empty() {
+        let (added, stage_errs) = stage_attachments(&mut app.composer.attachments, incoming);
+        errors.extend(stage_errs);
+        if added > 0 {
+            app.composer.want_focus = true;
+        }
+    }
+    report_attach_errors(app, &errors);
+}
+
+fn report_attach_errors(app: &mut NixApp, errors: &[String]) {
+    let Some(first) = errors.first() else {
+        return;
+    };
+    if errors.len() == 1 {
+        app.toast_err(first.clone());
+    } else {
+        app.toast_err(format!("{first} (+{} more)", errors.len() - 1));
+    }
+}
+
+/// Append valid `incoming` files into `staged`, enforcing `MAX_ATTACHMENTS`, `MAX_FILE_BYTES`,
+/// and `MAX_TOTAL_BYTES`. Returns `(added_count, error_messages)`.
+fn stage_attachments(
+    staged: &mut Vec<UploadFile>,
+    incoming: Vec<UploadFile>,
+) -> (usize, Vec<String>) {
+    let mut errors = Vec::new();
+    let mut added = 0usize;
+    let mut total_bytes: usize = staged.iter().map(|f| f.bytes.len()).sum();
+    let mut count_warned = false;
+
+    for file in incoming {
+        if staged.len() >= MAX_ATTACHMENTS {
+            if !count_warned {
+                errors.push(format!(
+                    "Maximum {MAX_ATTACHMENTS} attachments per message."
+                ));
+                count_warned = true;
+            }
+            continue;
+        }
+        let len = file.bytes.len();
+        if len > MAX_FILE_BYTES {
+            errors.push(format!(
+                "`{}` exceeds the {} limit.",
+                file.filename,
+                fmt_size(MAX_FILE_BYTES as u64)
+            ));
+            continue;
+        }
+        if total_bytes.saturating_add(len) > MAX_TOTAL_BYTES {
+            errors.push(format!(
+                "`{}` skipped: combined attachments exceed {}.",
+                file.filename,
+                fmt_size(MAX_TOTAL_BYTES as u64)
+            ));
+            continue;
+        }
+        total_bytes += len;
+        staged.push(file);
+        added += 1;
+    }
+    (added, errors)
+}
+
+/// Spawn a non-blocking background thread to open the native OS multi-file picker.
+fn spawn_file_picker(ctx: egui::Context, composer: &mut ComposerState, max_files: usize) {
+    let (tx, rx) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("nixcord-attach".into())
+        .spawn(move || {
+            let dialog = rfd::AsyncFileDialog::new().set_title("Attach files");
+            if let Some(handles) = block_on(dialog.pick_files()) {
+                let paths: Vec<PathBuf> = handles
+                    .into_iter()
+                    .map(|h| h.path().to_path_buf())
+                    .collect();
+                let batch = load_paths(&paths, max_files);
+                let _ = tx.send(batch);
+            }
+            ctx.request_repaint();
+        });
+    if spawned.is_ok() {
+        composer.attach_dialog_open = true;
+        composer.attach_rxs.push(rx);
+    }
+}
+
+/// Handle OS file drag-hover (overlay) and file drops into the composer.
+fn handle_drag_and_drop(ctx: &egui::Context, app: &mut NixApp, channel_label: &str) {
+    let (hovered_count, dropped) = ctx.input(|i| {
+        let hovered = i.raw.hovered_files.len();
+        let dropped = if i.raw.dropped_files.is_empty() {
+            Vec::new()
+        } else {
+            i.raw.dropped_files.clone()
+        };
+        (hovered, dropped)
+    });
+
+    if hovered_count > 0 {
+        paint_drop_overlay(ctx, app.theme, channel_label, hovered_count);
+    }
+
+    if dropped.is_empty() {
+        return;
+    }
+
+    let mut inline_files = Vec::new();
+    let mut paths = Vec::new();
+    let mut errors = Vec::new();
+
+    for file in dropped {
+        if let Some(bytes) = file.bytes {
+            let name = if !file.name.is_empty() {
+                file.name
+            } else {
+                file.path
+                    .as_deref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "attachment".into())
+            };
+            if bytes.len() > MAX_FILE_BYTES {
+                errors.push(format!(
+                    "`{name}` exceeds the {} limit.",
+                    fmt_size(MAX_FILE_BYTES as u64)
+                ));
+            } else {
+                let mut upload = UploadFile::from_bytes(name, bytes.to_vec());
+                if !file.mime.trim().is_empty() {
+                    upload.content_type =
+                        nixcord_http::multipart::sanitize_content_type(&file.mime);
+                }
+                inline_files.push(upload);
+            }
+        } else if let Some(path) = file.path {
+            paths.push(path);
+        }
+    }
+
+    if !inline_files.is_empty() {
+        let (added, stage_errs) = stage_attachments(&mut app.composer.attachments, inline_files);
+        errors.extend(stage_errs);
+        if added > 0 {
+            app.composer.want_focus = true;
+        }
+    }
+    report_attach_errors(app, &errors);
+
+    if !paths.is_empty() {
+        let slots = MAX_ATTACHMENTS.saturating_sub(app.composer.attachments.len());
+        let (tx, rx) = mpsc::channel();
+        let repaint_ctx = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("nixcord-drop".into())
+            .spawn(move || {
+                let batch = load_paths(&paths, slots);
+                let _ = tx.send(batch);
+                repaint_ctx.request_repaint();
+            });
+        if spawned.is_ok() {
+            app.composer.attach_rxs.push(rx);
+        } else {
+            app.toast_err("Couldn't read dropped files.");
+        }
+    }
+}
+
+/// Read up to `max_files` filesystem paths into [`UploadFile`]s, checking metadata size
+/// before allocating bytes so multi-gigabyte files never spike RAM.
+fn load_paths(paths: &[PathBuf], max_files: usize) -> (Vec<UploadFile>, Vec<String>) {
+    let mut files = Vec::new();
+    let mut errors = Vec::new();
+    let mut total_bytes: usize = 0;
+    let mut limit_warned = false;
+
+    for path in paths {
+        if files.len() >= max_files {
+            if !limit_warned {
+                errors.push(format!(
+                    "Maximum {MAX_ATTACHMENTS} attachments per message."
+                ));
+                limit_warned = true;
+            }
+            break;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "attachment".into());
+        let meta = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) => {
+                errors.push(format!("Couldn't read `{name}`: {e}"));
+                continue;
+            }
+        };
+        if !meta.is_file() {
+            errors.push(format!("`{name}` is not a regular file."));
+            continue;
+        }
+        if meta.len() > MAX_FILE_BYTES as u64 {
+            errors.push(format!(
+                "`{name}` is too large ({}, max {}).",
+                fmt_size(meta.len()),
+                fmt_size(MAX_FILE_BYTES as u64)
+            ));
+            continue;
+        }
+        let len = meta.len() as usize;
+        if total_bytes.saturating_add(len) > MAX_TOTAL_BYTES {
+            errors.push(format!(
+                "`{name}` skipped: combined attachments exceed {}.",
+                fmt_size(MAX_TOTAL_BYTES as u64)
+            ));
+            continue;
+        }
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                if bytes.len() > MAX_FILE_BYTES {
+                    errors.push(format!(
+                        "`{name}` exceeds the {} limit.",
+                        fmt_size(MAX_FILE_BYTES as u64)
+                    ));
+                    continue;
+                }
+                total_bytes = total_bytes.saturating_add(bytes.len());
+                files.push(UploadFile::from_bytes(name, bytes));
+            }
+            Err(e) => errors.push(format!("Couldn't read `{name}`: {e}")),
+        }
+    }
+
+    (files, errors)
+}
+
+/// Translucent full-window drop-target overlay shown while dragging files over the window.
+fn paint_drop_overlay(ctx: &egui::Context, t: &Theme, channel_label: &str, count: usize) {
+    let screen = ctx.content_rect();
+    egui::Area::new(Id::unique("nixcord-drop-overlay"))
+        .order(Order::Foreground)
+        .fixed_pos(screen.min)
+        .interactable(false)
+        .show(ctx, |ui| {
+            ui.set_clip_rect(screen);
+            let p = ui.painter();
+            let scrim = Color32::from_black_alpha(if t.dark { 155 } else { 95 });
+            p.rect_filled(screen, CornerRadius::ZERO, scrim);
+
+            let card_size = Vec2::new(360.0_f32.min(screen.width() - 32.0), 156.0);
+            let card = Rect::from_center_size(screen.center(), card_size);
+            let card_bg = super::presence::opaque_bg(t, t.elevated);
+            p.rect(
+                card,
+                CornerRadius::same(12),
+                card_bg,
+                Stroke::new(2.0, t.accent),
+                egui::StrokeKind::Inside,
+            );
+            p.rect_stroke(
+                card.shrink(8.0),
+                CornerRadius::same(8),
+                Stroke::new(1.0, t.accent.gamma_multiply(0.45)),
+                egui::StrokeKind::Inside,
+            );
+
+            // Upload tray + upward arrow icon.
+            let icon_c = Pos2::new(card.center().x, card.top() + 44.0);
+            let st = Stroke::new(2.2, t.accent);
+            p.line_segment(
+                [icon_c + Vec2::new(0.0, 8.0), icon_c + Vec2::new(0.0, -10.0)],
+                st,
+            );
+            p.line_segment(
+                [
+                    icon_c + Vec2::new(0.0, -10.0),
+                    icon_c + Vec2::new(-7.0, -3.0),
+                ],
+                st,
+            );
+            p.line_segment(
+                [
+                    icon_c + Vec2::new(0.0, -10.0),
+                    icon_c + Vec2::new(7.0, -3.0),
+                ],
+                st,
+            );
+            p.line_segment(
+                [
+                    icon_c + Vec2::new(-12.0, 12.0),
+                    icon_c + Vec2::new(12.0, 12.0),
+                ],
+                st,
+            );
+
+            let title = if count > 1 {
+                format!("Drop {count} files to upload to {channel_label}")
+            } else {
+                format!("Drop to upload to {channel_label}")
+            };
+            p.text(
+                Pos2::new(card.center().x, card.top() + 92.0),
+                Align2::CENTER_CENTER,
+                title,
+                bold(15.5),
+                t.strong,
+            );
+            p.text(
+                Pos2::new(card.center().x, card.top() + 118.0),
+                Align2::CENTER_CENTER,
+                format!(
+                    "Up to {MAX_ATTACHMENTS} files  ·  {} each",
+                    fmt_size(MAX_FILE_BYTES as u64)
+                ),
+                prop(12.5),
+                t.muted,
+            );
+        });
+}
+
+/// Horizontal attachment preview tray above the composer input box.
+fn attachment_tray(
+    ui: &mut Ui,
+    t: &Theme,
+    ch: Snowflake,
+    has_banner: bool,
+    attachments: &mut Vec<UploadFile>,
+) {
+    let top_r = if has_banner { 0 } else { 8 };
+    let total_bytes: u64 = attachments.iter().map(|f| f.bytes.len() as u64).sum();
+    let count = attachments.len();
+    let mut remove_idx: Option<usize> = None;
+    let mut clear_all = false;
+
+    let frame_resp = Frame::new()
+        .fill(t.elevated)
+        .corner_radius(CornerRadius {
+            nw: top_r,
+            ne: top_r,
+            sw: 0,
+            se: 0,
+        })
+        .inner_margin(Margin {
+            left: 12,
+            right: 12,
+            top: 8,
+            bottom: 8,
+        })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "{count} / {MAX_ATTACHMENTS} attached  ·  {}",
+                        fmt_size(total_bytes)
+                    ))
+                    .font(prop(12.0))
+                    .color(t.muted),
+                );
+                if count > 1 {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let btn = ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Clear all").font(prop(12.0)).color(t.muted),
+                                )
+                                .frame(false),
+                            )
+                            .on_hover_cursor(CursorIcon::PointingHand);
+                        if btn.clicked() {
+                            clear_all = true;
+                        }
+                    });
+                }
+            });
+            ui.add_space(6.0);
+            egui::ScrollArea::horizontal()
+                .id_salt(("composer_attach_tray", ch))
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        for (idx, file) in attachments.iter().enumerate() {
+                            if attachment_card(ui, t, idx, file) {
+                                remove_idx = Some(idx);
+                            }
+                        }
+                    });
+                });
+        });
+
+    // Subtle divider between tray and the composer input below.
+    let rect = frame_resp.response.rect;
+    ui.painter().line_segment(
+        [
+            Pos2::new(rect.left() + 12.0, rect.bottom()),
+            Pos2::new(rect.right() - 12.0, rect.bottom()),
+        ],
+        Stroke::new(1.0, t.divider),
+    );
+
+    if clear_all {
+        attachments.clear();
+    } else if let Some(idx) = remove_idx {
+        if idx < attachments.len() {
+            attachments.remove(idx);
+        }
+    }
+}
+
+/// Paint one compact attachment preview card; returns `true` if its `×` button was clicked.
+fn attachment_card(ui: &mut Ui, t: &Theme, idx: usize, file: &UploadFile) -> bool {
+    let (rect, card_resp) =
+        ui.allocate_exact_size(Vec2::new(ATTACH_CARD_W, ATTACH_CARD_H), Sense::hover());
+    let bg = super::presence::opaque_bg(t, t.sidebar);
+    let p = ui.painter();
+    p.rect(
+        rect,
+        CornerRadius::same(6),
+        bg,
+        Stroke::new(1.0, t.divider),
+        egui::StrokeKind::Inside,
+    );
+
+    // Left image / file badge.
+    let badge_rect = Rect::from_min_size(
+        Pos2::new(rect.left() + 8.0, rect.center().y - 17.0),
+        Vec2::splat(34.0),
+    );
+    if file.is_image() {
+        p.rect_filled(
+            badge_rect,
+            CornerRadius::same(5),
+            t.accent.gamma_multiply(0.22),
+        );
+        p.text(
+            badge_rect.center(),
+            Align2::CENTER_CENTER,
+            "IMG",
+            bold(10.5),
+            t.accent,
+        );
+    } else {
+        p.rect_filled(badge_rect, CornerRadius::same(5), t.hover);
+        if let Some(ext) = file_ext_badge(&file.filename) {
+            p.text(
+                badge_rect.center(),
+                Align2::CENTER_CENTER,
+                ext,
+                bold(10.0),
+                t.strong,
+            );
+        } else {
+            super::paint_icon(ui, Icon::File, badge_rect.shrink(4.0), t.muted);
+        }
+    }
+
+    // Remove `×` button at top-right.
+    let close_rect = Rect::from_min_size(
+        Pos2::new(rect.right() - 24.0, rect.top() + 5.0),
+        Vec2::splat(18.0),
+    );
+    let close_resp = ui
+        .interact(
+            close_rect,
+            ui.scope_id().with(("attach_rm", idx)),
+            Sense::click(),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text("Remove attachment");
+    if close_resp.hovered() {
+        ui.painter()
+            .circle_filled(close_rect.center(), 9.0, t.danger.gamma_multiply(0.24));
+    }
+    let x_col = if close_resp.hovered() {
+        t.danger
+    } else {
+        t.muted
+    };
+    let c = close_rect.center();
+    let d = 3.5;
+    let x_st = Stroke::new(1.6, x_col);
+    ui.painter()
+        .line_segment([c + Vec2::new(-d, -d), c + Vec2::new(d, d)], x_st);
+    ui.painter()
+        .line_segment([c + Vec2::new(-d, d), c + Vec2::new(d, -d)], x_st);
+
+    // Filename (ellipsized) + formatted byte size.
+    let text_left = badge_rect.right() + 8.0;
+    let max_text_w = (close_rect.left() - text_left - 4.0).max(24.0);
+    let mut name_job =
+        egui::text::LayoutJob::simple_singleline(file.filename.clone(), bold(12.5), t.strong);
+    name_job.wrap.max_width = max_text_w;
+    name_job.wrap.max_rows = 1;
+    name_job.wrap.break_anywhere = true;
+    name_job.wrap.overflow_character = Some('\u{2026}');
+    let galley = ui.painter().layout_job(name_job);
+    ui.painter()
+        .galley(Pos2::new(text_left, rect.top() + 9.0), galley, t.strong);
+
+    ui.painter().text(
+        Pos2::new(text_left, rect.bottom() - 15.0),
+        Align2::LEFT_CENTER,
+        fmt_size(file.bytes.len() as u64),
+        prop(11.5),
+        t.muted,
+    );
+
+    card_resp.on_hover_text(format!(
+        "{} ({}, {})",
+        file.filename,
+        fmt_size(file.bytes.len() as u64),
+        file.content_type
+    ));
+
+    close_resp.clicked()
+}
+
+/// Short uppercase extension label (1..=4 ASCII alphanumeric chars) for file badges.
+fn file_ext_badge(filename: &str) -> Option<String> {
+    let (stem, ext) = filename.rsplit_once('.')?;
+    if stem.is_empty() || ext.is_empty() || ext.len() > 4 {
+        return None;
+    }
+    ext.bytes()
+        .all(|b| b.is_ascii_alphanumeric())
+        .then(|| ext.to_ascii_uppercase())
+}
+
+/// Compact accent send button shown when attachments are staged so mouse-only sends work.
+fn send_button(ui: &mut Ui, t: &Theme) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
+    let fill = if resp.hovered() {
+        t.accent
+    } else {
+        t.accent.gamma_multiply(0.88)
+    };
+    let p = ui.painter();
+    p.rect_filled(rect, CornerRadius::same(6), fill);
+    // Crisp paper-plane / right-arrow glyph.
+    let c = rect.center();
+    p.add(Shape::convex_polygon(
+        vec![
+            c + Vec2::new(-6.0, -5.5),
+            c + Vec2::new(7.0, 0.0),
+            c + Vec2::new(-6.0, 5.5),
+            c + Vec2::new(-3.0, 0.0),
+        ],
+        t.on_accent,
+        Stroke::NONE,
+    ));
+    resp.on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text("Send message (Enter)")
+}
+
+/// Minimal executor for `rfd::AsyncFileDialog` on our helper thread (same pattern as `media.rs`).
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    use std::task::{Context, Poll, Wake, Waker};
+    struct Unpark(std::thread::Thread);
+    impl Wake for Unpark {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = Waker::from(std::sync::Arc::new(Unpark(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+            return v;
+        }
+        std::thread::park();
+    }
 }
 
 /// Highlight the smiley while the picker is open.
@@ -540,17 +1219,18 @@ fn submit(app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Action>) {
         app.composer.text.clear();
         return;
     }
-    if content.is_empty() {
+    if content.is_empty() && app.composer.attachments.is_empty() {
         return;
     }
     let reply_to = app.composer.reply_to.take();
+    let attachments = std::mem::take(&mut app.composer.attachments);
     app.composer.text.clear();
     app.composer.last_typing = None;
     actions.push(Action::Send {
         channel: ch,
         content,
         reply_to,
-        attachments: Vec::new(),
+        attachments,
     });
 }
 
@@ -591,4 +1271,110 @@ fn typing_line(ui: &mut Ui, app: &NixApp, ch: Snowflake) {
         bold(12.5),
         t.text,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stage_attachments_enforces_limits() {
+        let mut staged = Vec::new();
+
+        // Accept valid files.
+        let (added, errs) = stage_attachments(
+            &mut staged,
+            vec![
+                UploadFile::from_bytes("a.png", vec![1, 2, 3]),
+                UploadFile::from_bytes("b.txt", vec![4, 5]),
+            ],
+        );
+        assert_eq!(added, 2);
+        assert!(errs.is_empty());
+        assert_eq!(staged.len(), 2);
+
+        // Oversized single file is rejected while keeping existing staged items.
+        let (added, errs) = stage_attachments(
+            &mut staged,
+            vec![UploadFile::from_bytes(
+                "big.bin",
+                vec![0u8; MAX_FILE_BYTES + 1],
+            )],
+        );
+        assert_eq!(added, 0);
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("big.bin"));
+        assert_eq!(staged.len(), 2);
+
+        // Excess count capped at MAX_ATTACHMENTS.
+        let many: Vec<UploadFile> = (0..MAX_ATTACHMENTS)
+            .map(|i| UploadFile::from_bytes(format!("f{i}.txt"), vec![b'x']))
+            .collect();
+        let (added, errs) = stage_attachments(&mut staged, many);
+        assert_eq!(added, MAX_ATTACHMENTS - 2);
+        assert_eq!(staged.len(), MAX_ATTACHMENTS);
+        assert_eq!(errs.len(), 1);
+
+        // Combined byte cap enforced.
+        let mut big_staged = vec![
+            UploadFile::from_bytes("p1.bin", vec![0u8; 9 * 1024 * 1024]),
+            UploadFile::from_bytes("p2.bin", vec![0u8; 9 * 1024 * 1024]),
+        ];
+        let (added, errs) = stage_attachments(
+            &mut big_staged,
+            vec![UploadFile::from_bytes("p3.bin", vec![0u8; 9 * 1024 * 1024])],
+        );
+        assert_eq!(added, 0);
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("combined attachments"));
+    }
+
+    #[test]
+    fn file_ext_badge_formats_cleanly() {
+        assert_eq!(file_ext_badge("doc.pdf").as_deref(), Some("PDF"));
+        assert_eq!(file_ext_badge("main.rs").as_deref(), Some("RS"));
+        assert_eq!(file_ext_badge("archive.tar.gz").as_deref(), Some("GZ"));
+        assert_eq!(file_ext_badge("noext"), None);
+        assert_eq!(file_ext_badge(".env"), None);
+        assert_eq!(file_ext_badge("file.toolong"), None);
+    }
+
+    #[test]
+    fn load_paths_reads_valid_files_and_reports_missing() {
+        let dir = std::env::temp_dir().join(format!("nixcord-upload-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let ok_path = dir.join("hello.txt");
+        let missing_path = dir.join("does-not-exist.png");
+        std::fs::write(&ok_path, b"hello attachment").unwrap();
+
+        let (files, errs) = load_paths(&[ok_path.clone(), missing_path], 5);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].filename, "hello.txt");
+        assert_eq!(files[0].content_type, "text/plain; charset=utf-8");
+        assert_eq!(files[0].bytes, b"hello attachment");
+        assert_eq!(errs.len(), 1);
+
+        let _ = std::fs::remove_file(&ok_path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn headless_tray_and_drop_overlay_render_cleanly() {
+        let ctx = egui::Context::default();
+        let theme = crate::theme::by_name(crate::theme::DEFAULT_THEME);
+        let mut attachments = vec![
+            UploadFile::from_bytes("screenshot.png", vec![0u8; 2048]),
+            UploadFile::from_bytes("notes.txt", b"abc".to_vec()),
+            UploadFile::from_bytes("README", b"xyz".to_vec()),
+        ];
+
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            attachment_tray(ui, theme, Snowflake(102), false, &mut attachments);
+            paint_drop_overlay(ui.ctx(), theme, "#general", 2);
+        })
+        .textures_delta
+        .clear();
+
+        assert_eq!(attachments.len(), 3);
+    }
 }
