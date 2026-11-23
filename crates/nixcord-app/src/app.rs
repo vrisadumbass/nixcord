@@ -164,7 +164,7 @@ pub struct NixApp {
 
 impl NixApp {
     pub fn new(cc: &eframe::CreationContext<'_>, demo: bool) -> Self {
-        let prefs: Prefs = cc
+        let mut prefs: Prefs = cc
             .storage
             .and_then(|s| eframe::get_value(s, PREFS_KEY))
             .unwrap_or_default();
@@ -172,6 +172,7 @@ impl NixApp {
         install_fonts(&cc.egui_ctx);
         install_text_styles(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx, theme);
+        prefs.zoom = ui::settings::snap_zoom(prefs.zoom);
         cc.egui_ctx.set_zoom_factor(prefs.zoom);
 
         let backend = backend::spawn(cc.egui_ctx.clone(), demo);
@@ -708,9 +709,21 @@ impl eframe::App for NixApp {
             self.theme = wanted;
             theme::apply(&ctx, wanted);
         }
-        if (self.prefs.zoom - self.applied_zoom).abs() > f32::EPSILON {
-            self.applied_zoom = self.prefs.zoom;
-            ctx.set_zoom_factor(self.prefs.zoom);
+        // egui's built-in Ctrl +/-/0 changes the zoom factor directly; adopt that into prefs
+        // so the slider and the saved setting follow it.
+        let live = ctx.zoom_factor();
+        if (live - self.applied_zoom).abs() > 0.001 {
+            let z = ui::settings::snap_zoom(live);
+            self.prefs.zoom = z;
+            self.applied_zoom = z;
+            if (z - live).abs() > 0.001 {
+                ctx.set_zoom_factor(z);
+            }
+        } else if (self.prefs.zoom - self.applied_zoom).abs() > 0.001 {
+            let z = ui::settings::snap_zoom(self.prefs.zoom);
+            self.prefs.zoom = z;
+            self.applied_zoom = z;
+            ctx.set_zoom_factor(z);
         }
 
         theme::paint_background(&ctx, self.theme);

@@ -253,14 +253,64 @@ fn appearance(ui: &mut Ui, app: &mut NixApp) {
 
     ui.add_space(24.0);
     heading(ui, t, "Zoom");
+    // The whole UI (this slider included) rescales when zoom changes, so applying it while
+    // dragging makes the slider jump under the cursor. Drag a pending value and apply it
+    // on release; clicks, keyboard and the presets apply immediately.
+    let pending_id = egui::Id::unique("zoom-pending");
+    let mut pending: f32 = ui
+        .ctx()
+        .data(|d| d.get_temp(pending_id))
+        .unwrap_or(app.prefs.zoom);
     ui.horizontal(|ui| {
         ui.spacing_mut().slider_width = 260.0;
-        ui.add(
-            egui::Slider::new(&mut app.prefs.zoom, 0.75..=1.75)
+        let resp = ui.add(
+            egui::Slider::new(&mut pending, ZOOM_MIN..=ZOOM_MAX)
                 .step_by(0.05)
-                .fixed_decimals(2),
+                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                .custom_parser(|s| {
+                    s.trim()
+                        .trim_end_matches('%')
+                        .trim()
+                        .parse::<f64>()
+                        .ok()
+                        .map(|v| if v > 5.0 { v / 100.0 } else { v })
+                }),
         );
+        if resp.dragged() {
+            ui.ctx().data_mut(|d| d.insert_temp(pending_id, pending));
+        } else {
+            if resp.drag_stopped() || resp.changed() {
+                app.prefs.zoom = snap_zoom(pending);
+            }
+            ui.ctx().data_mut(|d| d.remove::<f32>(pending_id));
+        }
     });
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        for preset in [0.9, 1.0, 1.1, 1.25, 1.5] {
+            let on = (app.prefs.zoom - preset).abs() < 0.01;
+            if ui
+                .selectable_label(on, format!("{:.0}%", preset * 100.0))
+                .clicked()
+            {
+                app.prefs.zoom = preset;
+            }
+        }
+    });
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new("Ctrl + / Ctrl − / Ctrl 0 also work anywhere.")
+            .font(prop(12.0))
+            .color(t.muted),
+    );
+}
+
+pub const ZOOM_MIN: f32 = 0.75;
+pub const ZOOM_MAX: f32 = 1.75;
+
+/// Clamp to the supported range and snap to 5% steps (avoids 1.0500001 drift).
+pub fn snap_zoom(z: f32) -> f32 {
+    ((z.clamp(ZOOM_MIN, ZOOM_MAX) * 20.0).round() / 20.0).clamp(ZOOM_MIN, ZOOM_MAX)
 }
 
 fn swatches(ui: &mut Ui, app: &mut NixApp, themes: &[&'static Theme]) {
