@@ -34,16 +34,16 @@ are CC0, public domain or Apache-2.0; see [assets/demo/LICENSES.md](assets/demo/
 
 Early (v0.1). Working:
 
-- Login, servers, channels, DMs, history, and send/edit/delete/reply.
-- Reactions, typing indicators, and reconnect/resume.
-- Markdown with code highlighting, embeds, and bot components (V2 layouts, buttons, selects).
+- Login, servers, channels, active threads, DMs, history, and send/edit/delete/reply.
+- Reactions, typing indicators, unread/mention badges, in-app mention toasts, and `zlib-stream` reconnect/resume.
+- Markdown with code highlighting, embeds, and interactive bot components (V2 layouts, clickable buttons and string selects).
 - Avatars and server icons, color emoji (Twemoji) with a picker and `:shortcode:`
   autocomplete, and custom emoji.
 - An in-app image viewer, GIF/animated WebP playback, and inline H.264 video with audio.
-- Presence and status, the member list with role groups, and permission-aware channel lists.
+- Presence and status, floating user profile popouts, the member list with role groups, and permission-aware channel lists.
 - Themes.
 
-Not yet: voice, notifications, threads, and clicking bot buttons (interactions).
+Not yet: voice, OS desktop notifications, forum channels, and file uploads.
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design and roadmap.
 
 ## Network

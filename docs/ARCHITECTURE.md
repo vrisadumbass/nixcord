@@ -54,7 +54,10 @@ never depend on each other.
 
 ## Gateway details
 
-- `wss://gateway.discord.gg/?v=10&encoding=json`, no compression in v0.1.
+- `wss://gateway.discord.gg/?v=10&encoding=json&compress=zlib-stream`, with a streaming
+  zlib inflater (`nixcord-gateway/src/inflate.rs`) flushed on the `00 00 ff ff` suffix,
+  reset on every reconnect, capped at 4 MiB compressed / 16 MiB decompressed, and shrunk
+  back to <= 64 KiB after large frames (e.g. `READY`). Plain text frames are still accepted.
 - Hello (op 10) -> heartbeat every `heartbeat_interval` with jitter on the first beat;
   missed ACK (op 11) -> zombie connection -> reconnect + resume.
 - Identify (op 2) with a user token and plain `properties` (`os`, `browser: "nixcord"`,
@@ -68,12 +71,16 @@ never depend on each other.
   Discord allows 5 presence updates per 20 s), sent only after READY/RESUMED.
 - Decoded user-account events: PRESENCE_UPDATE, GUILD_MEMBER_LIST_UPDATE
   (SYNC/INSERT/UPDATE/DELETE/INVALIDATE), READY_SUPPLEMENTAL, RELATIONSHIP_ADD/REMOVE,
-  SESSIONS_REPLACE (own status), GUILD_MEMBER_UPDATE, PRESENCES_REPLACE and GUILD_CREATE
-  `presences` (applied as presence updates). Payload shapes and sources are
-  documented in `nixcord-gateway/src/protocol.rs`.
+  SESSIONS_REPLACE (own status), GUILD_MEMBER_UPDATE, PRESENCES_REPLACE, GUILD_CREATE
+  `presences`, MESSAGE_ACK, THREAD_CREATE/UPDATE/DELETE, and THREAD_LIST_SYNC. Payload
+  shapes and sources are documented in `nixcord-gateway/src/protocol.rs`.
 - Permissions: the store computes VIEW_CHANNEL / SEND_MESSAGES with Discord's documented
   algorithm from roles, overwrites and our own member (READY `guilds[].members` /
-  `merged_members`, GUILD_MEMBER_UPDATE). Unknown member data fails open.
+  `merged_members`, GUILD_MEMBER_UPDATE). Thread channels inherit permissions from their
+  parent channel; unknown member data fails open.
+- Read state & notifications: the store tracks per-channel `last_read_message_id` and
+  `mention_count` from `READY.read_state`, live `MESSAGE_CREATE`, `MESSAGE_ACK`, and local
+  `mark_read`, rolling unread and mention counts up per guild and across DMs.
 
 ## Themes
 

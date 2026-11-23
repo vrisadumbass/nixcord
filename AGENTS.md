@@ -60,11 +60,13 @@ Environment variables:
 crates/
   nixcord-model     serde types: Snowflake, User, Guild, Channel, Message, Embed, components,
                     Presence, member-list ops, permissions, GatewayEvent, CDN URL helpers
-  nixcord-gateway   websocket: identify, heartbeat/zombie detection, resume, backoff,
-                    close codes; op 37 guild subscriptions, op 3 presence; GatewayCommand
-  nixcord-http      REST: history, send/reply/edit/delete, reactions, typing; 429 handling
-  nixcord-store     pure state: messages (sliding window, cap 250/channel), presences
-                    (per-scope), member lists, permissions, reactions, typing, emoji
+  nixcord-gateway   websocket: zlib-stream decompression, identify, heartbeat/zombie detection,
+                    resume, backoff, close codes; op 37 guild subscriptions, op 3 presence; GatewayCommand
+  nixcord-http      REST: history, send/reply/edit/delete, reactions, typing, interactions,
+                    acks, relationships, message search; 429 handling
+  nixcord-store     pure state: messages (sliding window, cap 250/channel), read state &
+                    mention counts, threads, presences (per-scope), member lists, permissions,
+                    reactions, typing, emoji, profile helpers
   nixcord-markdown  Discord-flavored markdown -> AST (no egui), fuzz-tested
   nixcord-emoji     emoji table (emojibase), shortcodes, search, Twemoji filenames
   nixcord-media     fetch/decode/downscale, byte-capped LRU, disk cache, animations
@@ -76,7 +78,7 @@ crates/
     src/media.rs      textures, avatars, icons, Twemoji, image viewer state
     src/platform.rs   renderer choice (D3D12 on Windows with glow fallback), working-set trim
     src/ui/           sidebar, chat, composer, markdown, components, emoji_picker,
-                      emoji_text, presence, viewer, settings, login
+                      emoji_text, presence, profile, viewer, settings, login
 assets/demo/        CC0 / public-domain / Apache-2.0 demo avatars, icons, photos, GIFs, emoji
 docs/               ARCHITECTURE.md, screenshots/ (from --demo only)
 ```
@@ -89,16 +91,17 @@ then calls `request_repaint()`. The UI sends `Command`s to the backend. UI code 
 
 - **Core:**
   - Token login, saved in the OS keychain.
-  - Gateway reconnect/resume.
-  - Servers, channels and DMs.
+  - Gateway reconnect/resume with `zlib-stream` transport compression.
+  - Servers, channels, active threads and DMs.
   - History with scroll-back (a sliding window past the 250-message cap) and "Jump to present".
   - Send, edit (Up arrow), delete, reply.
-  - Reactions, typing indicators, unread markers.
+  - Reactions, typing indicators, unread & mention badges (channels, threads, DMs, server rail,
+    window title) and clickable in-app mention toasts.
 - **Rendering:**
-  - Markdown with syntax-highlighted code, spoilers, mention pills and timestamps.
+  - Markdown with syntax-highlighted code, spoilers, color-emoji mention pills and timestamps.
   - Embeds (rich and link) and attachments.
   - Message components: legacy action rows and V2 (container, section, gallery, file,
-    separator, buttons, selects).
+    separator, interactive buttons and string select menus).
   - Role colors, nicknames, APP badge.
 - **Media:**
   - Avatars and server icons.
@@ -107,13 +110,15 @@ then calls `request_repaint()`. The UI sends `Command`s to the backend. UI code 
   - Animated emoji and avatars on hover.
   - Inline H.264 video with audio.
 - **Emoji:**
-  - Twemoji color emoji everywhere text appears.
-  - A picker with search, categories, skin tones and server custom emoji.
+  - Twemoji color emoji everywhere text appears, including mention pills and reaction pills
+    (with missing-glyph fallbacks instead of box glyphs).
+  - A picker with ranked search, categories, skin tones and server custom emoji.
   - `:shortcode:` autocomplete.
-- **Presence:**
+- **Presence & Profiles:**
   - Status dots, activities and custom status.
   - Own status picker (op 3).
   - Real member list via op 37 and GUILD_MEMBER_LIST_UPDATE, with role groups and Online/Offline.
+  - Floating user profile popouts (avatar, status, custom status, activity, role pills, DM & copy actions).
   - Friends list from READY.
 - **Permissions:** channels you can't view are hidden; read-only channels show the notice
   up front.
@@ -138,23 +143,27 @@ demo mode only:
 - Video and GIFs from real Discord CDN attachments: the proxy poster, Range requests and
   `animated=true` on attachments.
 - Save/copy in the image viewer, and drag-to-pan.
+- `zlib-stream` gateway compression against live Discord.
+- Live component interactions (`POST /interactions`), message acks (`POST /channels/{c}/messages/{m}/ack`),
+  and `READY.read_state` / `MESSAGE_ACK` / `THREAD_*` events on real servers.
 
 Not built yet:
 - Voice and video calls, screen share.
-- Notifications (desktop toasts, mention badges, unread counts per server).
-- Threads and forum channels (they show as greyed-out channels).
-- Clicking bot buttons and selects (interactions need the session_id plumbing; they show a toast).
-- Sending attachments and uploads, stickers, the GIF picker, message search.
-- User profiles and popouts, Friends page actions (add, accept, remove), server settings.
+- Native OS desktop notifications (in-app mention toasts, mention badges, unread counts and
+  window title badges are built).
+- Forum channels and thread creation/archiving UI (active text-channel threads are viewable
+  and clickable).
+- Entity select menus (user/role/mentionable/channel) and modals for bot interactions
+  (buttons and string selects are interactive).
+- Sending attachments and uploads, stickers, the GIF picker, message search UI (search REST
+  routes exist in `nixcord-http`).
+- Friends page UI actions (REST routes exist in `nixcord-http`), full profile modals
+  (bio/banners/mutuals), server settings.
 - Saving status changes to the account (currently session-only), custom status editing.
 - Plugin API (planned: a stable Rust trait plus WASM).
-- zlib-stream gateway compression.
 
 UI polish backlog:
-- Emoji search ranking: hearts should rank first for "hea".
-- Emoji inside channel-mention pills render as monochrome glyphs.
 - The composer text box shows monochrome emoji (egui `TextEdit` can't draw textures).
-- A few reaction pills show a box glyph for emoji the bundled font lacks.
 - Demo still uses procedural images for "You", "Tamsin" and Coffee Break (assets not sourced).
 - HEVC/VP9/AV1 video falls back to "Open in browser" (no decoder, by design).
 
