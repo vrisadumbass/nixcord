@@ -9,6 +9,7 @@
 //! channel permissions (a read-only channel and hidden channels).
 
 use crate::backend::{AppEvent, Command, EventTx, HISTORY_PAGE};
+use crate::demo_assets::{avatar_hash, icon_hash, pool_avatar};
 use nixcord_gateway::GatewayCommand;
 use nixcord_model::permissions::{SEND_MESSAGES, VIEW_CHANNEL};
 use nixcord_model::CustomEmoji;
@@ -33,7 +34,7 @@ const ROLE_DEV: u64 = 2;
 const ROLE_ARTIST: u64 = 3;
 const ROLE_MOD: u64 = 4;
 
-/// Fake custom emoji ids (rendering them needs the CDN; the demo backend never fetches).
+/// Fake custom emoji ids (images come from `assets/demo/emoji`, see `crate::demo_assets`).
 const EMOJI_FERRIS: u64 = 1_150_000_000_000_000_001;
 const EMOJI_PARTY: u64 = 1_150_000_000_000_000_002;
 
@@ -63,9 +64,26 @@ fn user(id: u64, username: &str, global: Option<&str>) -> User {
         id: Snowflake(id),
         username: username.into(),
         global_name: global.map(Into::into),
-        avatar: None,
+        avatar: cast_avatar(id),
         bot: id == BOT,
     }
+}
+
+/// Fake avatar hash of a cast member (mapped to `assets/demo/avatars`). Pip has none, so
+/// the default avatar shows, as for many real users.
+fn cast_avatar(id: u64) -> Option<String> {
+    let file = match id {
+        ME => "you.webp",
+        BOT => "hearthbot.png",
+        1002 => "sol.png",
+        1003 => "quill.png",
+        1005 => "ferris.png",
+        1006 => "mira.png",
+        1007 => "tamsin.webp",
+        1008 => "otto.png",
+        _ => return None,
+    };
+    avatar_hash(file)
 }
 
 fn people() -> Vec<User> {
@@ -140,6 +158,14 @@ fn chan(
 }
 
 fn guild(id: u64, name: &str, channels: Vec<Channel>) -> Guild {
+    let icon = match id {
+        10 => "hearth.png",
+        20 => "rust-lounge.png",
+        30 => "pixel-art-club.png",
+        40 => "synthwave.png",
+        50 => "coffee-break.webp",
+        _ => "",
+    };
     let g = Snowflake(id);
     let role = |k: u64, name: &str, color: u32, position: i32| Role {
         id: role_id(g, k),
@@ -151,7 +177,7 @@ fn guild(id: u64, name: &str, channels: Vec<Channel>) -> Guild {
     Guild {
         id: g,
         name: name.into(),
-        icon: None,
+        icon: icon_hash(icon),
         channels,
         roles: vec![
             Role {
@@ -178,7 +204,7 @@ fn guild(id: u64, name: &str, channels: Vec<Channel>) -> Guild {
     }
 }
 
-/// Custom emoji of the demo servers (images are generated locally, see `Media`).
+/// Custom emoji of the demo servers (images from `assets/demo/emoji`, see `Media`).
 fn demo_guild_emojis(guild: u64) -> Vec<CustomEmoji> {
     let e = |id: u64, name: &str, animated: bool| CustomEmoji {
         id: Snowflake(id),
@@ -539,6 +565,26 @@ fn history_for(channel: Snowflake, people: &[User]) -> Vec<Message> {
     out
 }
 
+/// Natural sizes of the demo images (must match the files in `assets/demo`).
+const SHOT_W: u32 = 1200;
+const SHOT_H: u32 = 675;
+const GIF_CAT: (u32, u32) = (400, 180);
+const GIF_LOADING: (u32, u32) = (200, 200);
+const GIF_HORSE: (u32, u32) = (240, 160);
+
+/// A photo attachment (the file is `assets/demo/photos/<name>`).
+fn photo(t: u64, k: u64, name: &str, size: u64, (w, h): (u32, u32)) -> Attachment {
+    Attachment {
+        id: snowflake_at(t, 0x50_0000 + k),
+        filename: name.into(),
+        url: format!("https://cdn.discordapp.com/attachments/102/{k}/{name}"),
+        size,
+        content_type: Some("image/jpeg".into()),
+        width: Some(w),
+        height: Some(h),
+    }
+}
+
 /// One message per feature, newest in the channel so it is on screen when opened.
 fn showcase_messages(
     channel: Snowflake,
@@ -609,6 +655,12 @@ fn showcase_messages(
             text: "nixcord CI \u{2022} main".into(),
             icon_url: None,
         }),
+        image: Some(EmbedMedia {
+            url: "https://cdn.discordapp.com/attachments/102/482/nixcord-chat.jpg".into(),
+            proxy_url: None,
+            width: Some(SHOT_W),
+            height: Some(SHOT_H),
+        }),
         fields: vec![
             EmbedField {
                 name: "Duration".into(),
@@ -659,10 +711,10 @@ fn showcase_messages(
             icon_url: None,
         }),
         image: Some(EmbedMedia {
-            url: "https://opengraph.githubassets.com/demo/emilk/egui".into(),
+            url: "https://opengraph.githubassets.com/demo/emilk/egui/nixcord-dms.jpg".into(),
             proxy_url: None,
-            width: Some(1200),
-            height: Some(600),
+            width: Some(SHOT_W),
+            height: Some(SHOT_H),
         }),
         ..Default::default()
     });
@@ -729,13 +781,43 @@ fn showcase_messages(
     standup.mention_roles = vec![dev];
     out.push(standup);
 
+    // Photo attachments.
+    let (id, t) = at(5);
+    let mut desk = base_msg(
+        id,
+        channel,
+        &people[7],
+        "finally finished the desk setup. the cat approves (mostly)".into(),
+        t,
+    );
+    desk.attachments = vec![
+        photo(t, 0, "desk-setup.jpg", 88_580, (1200, 800)),
+        photo(t, 1, "cat-on-keyboard.jpg", 121_036, (1200, 675)),
+    ];
+    desk.reactions = vec![
+        reaction(unicode("\u{1F63B}"), 7, true),
+        reaction(custom_emoji(EMOJI_PARTY + 3, "heart_nix", false), 2, false),
+    ];
+    out.push(desk);
+    let (id, t) = at(4);
+    let mut lake = base_msg(
+        id,
+        channel,
+        &people[8],
+        "weekend hike, no signal and no regrets".into(),
+        t,
+    );
+    lake.attachments = vec![photo(t, 2, "lake-bohinj.jpg", 153_856, (1200, 801))];
+    lake.reactions = vec![reaction(unicode("\u{1F3D4}\u{FE0F}"), 4, false)];
+    out.push(lake);
+
     // Message components: a Components V2 rules post and a legacy action row.
     let (id, t) = at(3);
     out.push(rules_post(id, channel, bot, t, dev));
     let (id, t) = at(2);
     out.push(vote_buttons(id, channel, bot, t));
 
-    // GIFs: two attachments and a Tenor gifv embed (generated locally in demo mode).
+    // GIFs: two attachments and a Tenor gifv embed (files from `assets/demo/gifs`).
     let (id, t) = at(1);
     let mut gifs = base_msg(
         id,
@@ -744,22 +826,29 @@ fn showcase_messages(
         format!("gif test <a:party:{EMOJI_PARTY}>"),
         t,
     );
-    for (k, (w, h)) in [(240u32, 160u32), (200, 200)].into_iter().enumerate() {
+    for (k, (name, (w, h), size)) in [
+        ("cat-gallop.gif", GIF_CAT, 381_419u64),
+        ("loading.gif", GIF_LOADING, 21_258),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         gifs.attachments.push(Attachment {
             id: snowflake_at(t, 0x47_0000 + k as u64),
-            filename: format!("party-{k}.gif"),
-            url: format!("https://cdn.discordapp.com/attachments/104/{k}/party-{k}.gif"),
-            size: 180_000,
+            filename: name.into(),
+            url: format!("https://cdn.discordapp.com/attachments/104/{k}/{name}"),
+            size,
             content_type: Some("image/gif".into()),
             width: Some(w),
             height: Some(h),
         });
     }
-    let tenor =
-        |code: &str, ext: &str| format!("https://media.tenor.com/nixDemoGifAA{code}/dance.{ext}");
+    let tenor = |code: &str, ext: &str| {
+        format!("https://media.tenor.com/nixDemoHorseGallop{code}/horse-gallop.{ext}")
+    };
     gifs.embeds.push(Embed {
         kind: Some("gifv".into()),
-        url: Some("https://tenor.com/view/dance-gif-1234567".into()),
+        url: Some("https://tenor.com/view/horse-gallop-gif-1234567".into()),
         provider: Some(EmbedAuthor {
             name: "Tenor".into(),
             url: Some("https://tenor.co".into()),
@@ -768,14 +857,14 @@ fn showcase_messages(
         thumbnail: Some(EmbedMedia {
             url: tenor("Ae", "png"),
             proxy_url: None,
-            width: Some(300),
-            height: Some(170),
+            width: Some(GIF_HORSE.0),
+            height: Some(GIF_HORSE.1),
         }),
         video: Some(EmbedMedia {
             url: tenor("Po", "mp4"),
             proxy_url: None,
-            width: Some(300),
-            height: Some(170),
+            width: Some(GIF_HORSE.0),
+            height: Some(GIF_HORSE.1),
         }),
         ..Default::default()
     });
@@ -876,7 +965,7 @@ fn rules_post(id: Snowflake, channel: Snowflake, bot: &User, t: u64, dev: Snowfl
         components: vec![
             Component::MediaGallery(MediaGallery {
                 items: vec![MediaGalleryItem {
-                    media: media("https://cdn.example.com/nix/rules-banner.png", 1200, 400),
+                    media: media("https://cdn.example.com/nix/hearth-banner.jpg", 1200, 400),
                     description: Some("Hearth banner".into()),
                     spoiler: false,
                 }],
@@ -895,7 +984,7 @@ fn rules_post(id: Snowflake, channel: Snowflake, bot: &User, t: u64, dev: Snowfl
                      you a warning, then a timeout."
                 ))],
                 accessory: Some(Box::new(Component::Thumbnail(Thumbnail {
-                    media: media("https://cdn.example.com/nix/mod-badge.png", 256, 256),
+                    media: media("https://cdn.example.com/nix/mod-badge.png", 128, 128),
                     description: Some("Moderators".into()),
                     spoiler: false,
                 }))),
@@ -1074,8 +1163,12 @@ fn roster(guild: Snowflake) -> Vec<(User, PartialMember)> {
         } else {
             Vec::new()
         };
+        let u = User {
+            avatar: pool_avatar(i),
+            ..user(id, name, None)
+        };
         out.push((
-            user(id, name, None),
+            u,
             PartialMember {
                 roles,
                 ..Default::default()

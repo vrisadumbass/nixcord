@@ -183,6 +183,56 @@ pub fn paint_avatar(ui: &Ui, center: Pos2, diameter: f32, user: &User) {
     );
 }
 
+/// Background colors of the default avatar (users without an avatar), as on Discord.
+const DEFAULT_AVATAR_COLORS: [u32; 6] =
+    [0x5865f2, 0x757e8a, 0x3ba55c, 0xfaa61a, 0xed4245, 0xeb459f];
+
+/// Default avatar of a user without one: a colored circle with a white gamepad-like face.
+/// The color follows Discord's rule for new usernames (`(id >> 22) % 6`); ids too small to
+/// carry a timestamp (demo users) use `id % 5`.
+pub fn paint_default_avatar(ui: &Ui, center: Pos2, diameter: f32, user: Snowflake) {
+    let i = match user.0 >> 22 {
+        0 => user.0 % 5,
+        t => t % 6,
+    };
+    let c = DEFAULT_AVATAR_COLORS[i as usize];
+    let bg = Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8);
+    let p = ui.painter();
+    let d = diameter;
+    p.circle_filled(center, d / 2.0, bg);
+    // Body: a wide rounded block with two rounded grips below.
+    let body = Rect::from_center_size(
+        center + Vec2::new(0.0, -0.02 * d),
+        Vec2::new(0.54 * d, 0.3 * d),
+    );
+    p.rect_filled(
+        body,
+        CornerRadius::same((0.13 * d).round().clamp(0.0, 255.0) as u8),
+        Color32::WHITE,
+    );
+    for sx in [-1.0, 1.0] {
+        p.circle_filled(
+            center + Vec2::new(sx * 0.17 * d, 0.1 * d),
+            0.105 * d,
+            Color32::WHITE,
+        );
+    }
+    // Face: two round eyes and a small smile, cut out in the background color.
+    for sx in [-1.0, 1.0] {
+        p.circle_filled(center + Vec2::new(sx * 0.1 * d, -0.04 * d), 0.045 * d, bg);
+    }
+    let smile: Vec<Pos2> = (0..=8)
+        .map(|k| {
+            let a = std::f32::consts::PI * (0.2 + 0.6 * k as f32 / 8.0);
+            center + Vec2::new(a.cos() * 0.07 * d, 0.02 * d + a.sin() * 0.05 * d)
+        })
+        .collect();
+    p.add(eframe::egui::Shape::line(
+        smile,
+        Stroke::new((0.035 * d).max(1.0), bg),
+    ));
+}
+
 pub fn paint_status_dot(
     ui: &Ui,
     avatar_center: Pos2,

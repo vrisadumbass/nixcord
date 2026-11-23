@@ -32,6 +32,7 @@ use nixcord_media::anim::{Budget, Decoded};
 use nixcord_media::lru::ByteLru;
 use nixcord_media::{anim_url, demo_anim, url as murl, Key};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
@@ -51,11 +52,12 @@ enum TexMode {
     PerFrame,
 }
 
-/// Generated animation for demo mode.
-#[derive(Clone, Copy, Debug)]
+/// Animation for demo mode: the asset file if there is one (see `crate::demo_assets`),
+/// else generated from the seed.
+#[derive(Clone, Debug)]
 pub(super) enum DemoAnim {
-    Party(u64),
-    Emoji(u64),
+    Party(u64, Option<PathBuf>),
+    Emoji(u64, Option<PathBuf>),
 }
 
 struct Play {
@@ -430,11 +432,17 @@ impl Media {
                     let spawned = std::thread::Builder::new()
                         .name("nixcord-demo-anim".into())
                         .spawn(move || {
-                            let bytes = match kind {
-                                DemoAnim::Party(seed) => {
-                                    demo_anim::party_gif(seed, w, h, DEMO_FRAMES, DEMO_DELAY_MS)
-                                }
-                                DemoAnim::Emoji(seed) => demo_anim::emoji_gif(seed, w.min(h)),
+                            let (file, seed) = match &kind {
+                                DemoAnim::Party(s, f) | DemoAnim::Emoji(s, f) => (f, *s),
+                            };
+                            let bytes = match file.as_ref().and_then(|f| std::fs::read(f).ok()) {
+                                Some(b) => b,
+                                None => match kind {
+                                    DemoAnim::Party(..) => {
+                                        demo_anim::party_gif(seed, w, h, DEMO_FRAMES, DEMO_DELAY_MS)
+                                    }
+                                    DemoAnim::Emoji(..) => demo_anim::emoji_gif(seed, w.min(h)),
+                                },
                             };
                             let r =
                                 nixcord_media::anim::decode_anim(&bytes, w, h, Budget::default())
@@ -493,7 +501,12 @@ impl Media {
             id: local_id(7, id, px, px),
             urls: &urls,
             px: (px, px),
-            demo: Some(DemoAnim::Emoji(id)),
+            demo: Some(DemoAnim::Emoji(
+                id,
+                self.demo
+                    .then(|| crate::demo_assets::emoji_file(id))
+                    .flatten(),
+            )),
             hover,
             viewer: false,
         });
@@ -552,7 +565,7 @@ impl Media {
             id,
             urls: &urls,
             px: (bw, bh),
-            demo: Some(DemoAnim::Party(seed)),
+            demo: Some(DemoAnim::Party(seed, self.demo_url_file(&img.url))),
             hover: true,
             viewer: true,
         });

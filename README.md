@@ -16,11 +16,11 @@ A lightweight, native Discord client written in Rust. No Electron, no webview, n
 
 | | |
 |---|---|
-| ![Bot message components](docs/screenshots/components.png) | ![Emoji picker](docs/screenshots/emoji-picker.png) |
-| ![Gradient theme](docs/screenshots/gradient-theme.png) | ![Image viewer](docs/screenshots/image-viewer.png) |
-| ![DMs with presence](docs/screenshots/dm-home.png) | |
+| ![Photos and reactions](docs/screenshots/photos.png) | ![Bot message components](docs/screenshots/components.png) |
+| ![Emoji picker](docs/screenshots/emoji-picker.png) | ![DMs with presence](docs/screenshots/dm-home.png) |
 
-All screenshots are from `--demo` mode, using made-up servers, users and messages.
+All screenshots are from `--demo` mode, using made-up servers, users and messages. Demo images
+are CC0, public domain or Apache-2.0; see [assets/demo/LICENSES.md](assets/demo/LICENSES.md).
 </details>
 
 > [!WARNING]

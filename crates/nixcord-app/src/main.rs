@@ -4,6 +4,7 @@
 mod app;
 mod backend;
 mod demo;
+mod demo_assets;
 mod media;
 mod platform;
 mod theme;
