@@ -17,3 +17,8 @@ nixcord-store.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "persistence", "clipboard", "links", "wayland", "x11"] }
+egui = { version = "0.37", default-features = false, features = ["monochrome_emoji_fonts"] }
+keyring = "4.2"
+serde.workspace = true
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
