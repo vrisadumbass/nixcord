@@ -43,6 +43,10 @@ pub struct Prefs {
     pub saved_status: Option<String>,
     /// Saved custom status across restarts.
     pub custom_status: Option<nixcord_model::CustomStatus>,
+    /// Persisted server rail layout (standalone guilds and custom server folders).
+    pub guild_layout: Vec<nixcord_model::GuildFolder>,
+    /// Folder IDs that are currently collapsed on the server rail.
+    pub collapsed_folders: HashSet<u64>,
 }
 
 impl Default for Prefs {
@@ -57,6 +61,8 @@ impl Default for Prefs {
             autoplay_gifs: true,
             saved_status: None,
             custom_status: None,
+            guild_layout: Vec::new(),
+            collapsed_folders: HashSet::new(),
         }
     }
 }
@@ -167,6 +173,8 @@ pub struct ViewState {
     pub forum: ui::forum::ForumState,
     pub create_thread: Option<ui::forum::CreateThreadModal>,
     pub custom_status_modal: Option<ui::presence::CustomStatusModal>,
+    pub rail_drag: Option<ui::sidebar::RailDrag>,
+    pub folder_modal: Option<ui::sidebar::FolderModal>,
 }
 
 struct Toast {
@@ -1328,6 +1336,7 @@ impl eframe::App for NixApp {
                 ui::profile::show(&ctx, self, &mut actions);
                 ui::forum::create_modal(&ctx, self, &mut actions);
                 ui::presence::custom_status_modal(&ctx, self, &mut actions);
+                ui::sidebar::folder_modal(&ctx, self, &mut actions);
                 ui::settings::window(&ctx, self, &mut actions);
                 ui::chat::delete_modal(&ctx, self, &mut actions);
                 ui::viewer::show(&ctx, self);

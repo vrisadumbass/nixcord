@@ -93,7 +93,7 @@ then calls `request_repaint()`. The UI sends `Command`s to the backend. UI code 
 - **Core:**
   - Token login, saved in the OS keychain.
   - Gateway reconnect/resume with `zlib-stream` transport compression.
-  - Servers, channels, Forum post boards (tag filters & new posts), active threads (+ thread creation, archive/unarchive & lock/unlock controls) and DMs.
+  - Servers (with drag-and-drop rearranging, server folders, folder name/color editor), channels, Forum post boards (tag filters & new posts), active threads (+ thread creation, archive/unarchive & lock/unlock controls) and DMs.
   - History with scroll-back (a sliding window past the 250-message cap), "Jump to present",
     and Message Search (`Ctrl+F`, `from:` / `in:` filters, paginated results drawer, jump-to-message).
   - Send (including multipart file uploads via picker, drag-and-drop, or `Ctrl+V` clipboard image paste), edit (Up arrow), delete, reply.

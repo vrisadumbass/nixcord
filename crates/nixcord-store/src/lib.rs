@@ -16,8 +16,8 @@
 
 use nixcord_model::{
     permissions as perm, Channel, ChannelKind, CustomStatus, Emoji, GatewayEvent, Guild,
-    GuildMember, Message, MessageUpdate, OverwriteKind, PartialMember, Presence, Reaction,
-    Relationship, RelationshipKind, Role, Snowflake, Status, User,
+    GuildFolder, GuildMember, Message, MessageUpdate, OverwriteKind, PartialMember, Presence,
+    Reaction, Relationship, RelationshipKind, Role, Snowflake, Status, User,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -117,8 +117,10 @@ struct ChannelReadState {
 pub struct Store {
     connection: ConnectionState,
     me: Option<User>,
-    /// Guild ids in the order Discord sent them.
+    /// Guild ids in display order (from `guild_folders` / `guild_positions` or READY order).
     guild_order: Vec<Snowflake>,
+    /// Server folders and ordering reported in `READY`.
+    guild_folders: Vec<GuildFolder>,
     /// Guilds with `channels` and `threads` emptied (both live in `channels`).
     guilds: HashMap<Snowflake, Guild>,
     /// Regular channel ids per guild (unsorted; excludes threads).
@@ -184,6 +186,23 @@ impl Store {
                 }
                 for guild in &ready.guilds {
                     self.upsert_guild(guild, true, true);
+                }
+                self.guild_folders.clone_from(&ready.guild_folders);
+                if !self.guild_folders.is_empty() {
+                    let mut ordered = Vec::with_capacity(self.guild_order.len());
+                    for folder in &self.guild_folders {
+                        for &gid in &folder.guild_ids {
+                            if self.guilds.contains_key(&gid) && !ordered.contains(&gid) {
+                                ordered.push(gid);
+                            }
+                        }
+                    }
+                    for &gid in &self.guild_order {
+                        if !ordered.contains(&gid) {
+                            ordered.push(gid);
+                        }
+                    }
+                    self.guild_order = ordered;
                 }
                 for ch in &ready.private_channels {
                     self.upsert_channel(ch);
@@ -332,12 +351,17 @@ impl Store {
         self.me.as_ref()
     }
 
-    /// Guilds in the order Discord sent them.
+    /// Guilds in the order Discord sent them (or ordered by `guild_folders`).
     pub fn guilds(&self) -> Vec<&Guild> {
         self.guild_order
             .iter()
             .filter_map(|id| self.guilds.get(id))
             .collect()
+    }
+
+    /// Server folders / layout received from `READY`.
+    pub fn guild_folders(&self) -> &[GuildFolder] {
+        &self.guild_folders
     }
 
     /// Note: the returned guild's `channels` is always empty; use `guild_channels`.

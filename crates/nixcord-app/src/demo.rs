@@ -568,6 +568,7 @@ fn ready() -> Ready {
                 mention_count: 0,
             },
         ],
+        guild_folders: Vec::new(),
     }
 }
 

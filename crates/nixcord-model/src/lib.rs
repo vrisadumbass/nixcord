@@ -1045,6 +1045,39 @@ pub struct ReadState {
     pub mention_count: u32,
 }
 
+/// One entry in the server rail layout (from READY `user_settings.guild_folders` or local prefs).
+/// When `id.is_none()`, `name.is_none()`, and `guild_ids.len() == 1`, it represents a standalone
+/// server; otherwise it is a server folder.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GuildFolder {
+    #[serde(default)]
+    pub id: Option<u64>,
+    #[serde(default)]
+    pub guild_ids: Vec<Snowflake>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub color: Option<u32>,
+}
+
+impl GuildFolder {
+    /// True when this entry should be rendered as a folder rather than a standalone server.
+    pub fn is_folder(&self) -> bool {
+        self.id.is_some()
+            || self.guild_ids.len() > 1
+            || self.name.as_deref().is_some_and(|n| !n.trim().is_empty())
+    }
+
+    /// Display title for tooltips and menus.
+    pub fn display_name(&self) -> &str {
+        self.name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Server Folder")
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Ready {
     pub user: User,
@@ -1066,6 +1099,9 @@ pub struct Ready {
     /// Per-channel read states (last read message id and mention count).
     #[serde(default)]
     pub read_state: Vec<ReadState>,
+    /// Server folders and ordering from `user_settings.guild_folders` / `guild_positions`.
+    #[serde(default)]
+    pub guild_folders: Vec<GuildFolder>,
 }
 
 /// High-level events the gateway crate hands to the app.

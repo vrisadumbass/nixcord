@@ -4,10 +4,10 @@
 use std::collections::HashMap;
 
 use nixcord_model::{
-    Activity, Channel, ClientStatus, CustomStatus, Emoji, GatewayEvent, Guild, GuildMember,
-    ListMember, MemberListGroup, MemberListItem, MemberListOp, MemberListUpdate, Message,
-    MessageUpdate, Presence, ReadState, Ready, ReadySupplemental, Relationship, Snowflake, Status,
-    User,
+    Activity, Channel, ClientStatus, CustomStatus, Emoji, GatewayEvent, Guild, GuildFolder,
+    GuildMember, ListMember, MemberListGroup, MemberListItem, MemberListOp, MemberListUpdate,
+    Message, MessageUpdate, Presence, ReadState, Ready, ReadySupplemental, Relationship, Snowflake,
+    Status, User,
 };
 use serde::de::{DeserializeOwned, Error as _};
 use serde::Deserialize;
@@ -631,6 +631,11 @@ pub fn decode_ready(d: &str) -> Result<Ready, JsonError> {
     }
 
     let read_state = decode_read_state(&extras.read_state);
+    let guild_folders = extras
+        .user_settings
+        .as_ref()
+        .map(decode_guild_folders)
+        .unwrap_or_default();
 
     Ok(Ready {
         user: raw.user,
@@ -642,7 +647,64 @@ pub fn decode_ready(d: &str) -> Result<Ready, JsonError> {
         relationships,
         status,
         read_state,
+        guild_folders,
     })
+}
+
+/// Decode `user_settings.guild_folders` (or fall back to `user_settings.guild_positions`).
+fn decode_guild_folders(settings: &Value) -> Vec<GuildFolder> {
+    if let Some(folders) = settings.get("guild_folders").and_then(Value::as_array) {
+        let out: Vec<GuildFolder> = folders
+            .iter()
+            .filter_map(|f| {
+                let guild_ids: Vec<Snowflake> = f
+                    .get("guild_ids")
+                    .and_then(Value::as_array)?
+                    .iter()
+                    .filter_map(snowflake)
+                    .collect();
+                if guild_ids.is_empty() {
+                    return None;
+                }
+                let id = f.get("id").and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                });
+                let name = f
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+                let color = f
+                    .get("color")
+                    .and_then(Value::as_u64)
+                    .map(|c| (c & 0xFF_FFFF) as u32);
+                Some(GuildFolder {
+                    id,
+                    guild_ids,
+                    name,
+                    color,
+                })
+            })
+            .collect();
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    if let Some(positions) = settings.get("guild_positions").and_then(Value::as_array) {
+        return positions
+            .iter()
+            .filter_map(snowflake)
+            .map(|gid| GuildFolder {
+                id: None,
+                guild_ids: vec![gid],
+                name: None,
+                color: None,
+            })
+            .collect();
+    }
+    Vec::new()
 }
 
 /// Leniently decode READY `read_state`. Discord sends either a top-level array of channel
@@ -1963,5 +2025,30 @@ mod emoji_tests {
         let act_emoji: Activity =
             serde_json::from_value(p_emoji["d"]["activities"][0].clone()).unwrap();
         assert_eq!(act_emoji.label().as_deref(), Some("☕"));
+    }
+
+    #[test]
+    fn decode_ready_parses_guild_folders_and_positions() {
+        let d = r#"{"user":{"id":"10","username":"alice","global_name":"Alice","avatar":null},"session_id":"s",
+            "user_settings":{
+                "status":"online",
+                "guild_folders":[
+                    {"id":123,"guild_ids":["20","10"],"name":"Rust","color":15158332},
+                    {"id":null,"guild_ids":["30"],"name":null,"color":null}
+                ]
+            }
+        }"#;
+        let r = decode_ready(d).unwrap();
+        assert_eq!(r.guild_folders.len(), 2);
+        assert_eq!(r.guild_folders[0].id, Some(123));
+        assert_eq!(r.guild_folders[0].name.as_deref(), Some("Rust"));
+        assert_eq!(r.guild_folders[0].color, Some(15158332));
+        assert_eq!(
+            r.guild_folders[0].guild_ids,
+            vec![Snowflake(20), Snowflake(10)]
+        );
+        assert!(r.guild_folders[0].is_folder());
+        assert!(!r.guild_folders[1].is_folder());
+        assert_eq!(r.guild_folders[1].guild_ids, vec![Snowflake(30)]);
     }
 }

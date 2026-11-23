@@ -1,17 +1,19 @@
 //! Guild rail, channel column (guild channels or DM list) and the user panel.
 
 use super::{
-    bold, emoji_text, icon_button, initials, paint_chevron, paint_plus, paint_search,
+    bold, emoji_text, icon_button, id_color, initials, paint_chevron, paint_plus, paint_search,
     paint_status_dot, prop, Action, Icon,
 };
 use crate::app::NixApp;
 use crate::theme::Theme;
 use eframe::egui::{
-    self, Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, Pos2, Rect, RichText, Sense,
-    Stroke, Ui, Vec2,
+    self, Align, Align2, Color32, CornerRadius, CursorIcon, Frame, Id, Key, Layout, Margin, Modal,
+    Order, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, TextEdit, Ui, Vec2,
 };
-use nixcord_model::{Channel, ChannelKind, Guild, Snowflake};
+use nixcord_model::{Channel, ChannelKind, Guild, GuildFolder, Snowflake};
 use nixcord_store::ConnectionState;
+use std::borrow::Cow;
+use std::collections::HashSet;
 
 // ---- mention badge ------------------------------------------------------------------
 
@@ -70,13 +72,129 @@ fn badge_reserve(count: u32) -> f32 {
     }
 }
 
-// ---- right-click context menu -------------------------------------------------------
+// ---- right-click context menu & server rail layout ---------------------------------
+
+/// Item currently being dragged on the server rail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RailDrag {
+    Guild(Snowflake),
+    Folder(u64),
+}
+
+/// Drop zone hovered while dragging a server or folder on the rail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RailDropTarget {
+    BeforeTopGuild(Snowflake),
+    AfterTopGuild(Snowflake),
+    GroupWithGuild(Snowflake),
+    BeforeFolder(u64),
+    AfterFolder(u64),
+    IntoFolder(u64),
+    InsideFolderBefore {
+        folder_id: u64,
+        target_guild: Snowflake,
+    },
+    InsideFolderAfter {
+        folder_id: u64,
+        target_guild: Snowflake,
+    },
+}
+
+/// Mutation to the server rail's folder/order layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RailOp {
+    ToggleFolder(u64),
+    MoveGuild {
+        guild_id: Snowflake,
+        delta: i32,
+    },
+    CreateFolder(Snowflake),
+    MoveGuildToFolder {
+        guild_id: Snowflake,
+        folder_id: u64,
+    },
+    RemoveFromFolder(Snowflake),
+    MoveFolder {
+        folder_id: u64,
+        delta: i32,
+    },
+    EditFolder(u64),
+    UngroupFolder(u64),
+    MarkFolderRead(u64),
+    Drop {
+        source: RailDrag,
+        target: RailDropTarget,
+    },
+}
+
+/// Modal state for editing a server folder's name and color.
+#[derive(Debug, Clone)]
+pub struct FolderModal {
+    pub folder_id: u64,
+    pub name: String,
+    pub color: Option<u32>,
+    pub focus_name: bool,
+}
+
+pub const FOLDER_SWATCHES: &[(Option<u32>, &str)] = &[
+    (None, "Theme Accent"),
+    (Some(0x5865F2), "Blurple"),
+    (Some(0x3BA55C), "Emerald"),
+    (Some(0xFAA61A), "Amber"),
+    (Some(0xED4245), "Coral"),
+    (Some(0xEB459E), "Fuchsia"),
+    (Some(0x1ABC9C), "Teal"),
+    (Some(0x9B59B6), "Amethyst"),
+];
+
+fn rgb_u32(c: u32) -> Color32 {
+    Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
+}
+
+#[derive(Debug, Clone)]
+enum MenuEffect {
+    Action(Action),
+    Rail(RailOp),
+}
 
 struct ContextMenuItem {
-    label: &'static str,
+    label: Cow<'static, str>,
     enabled: bool,
     action: Option<Action>,
+    rail_op: Option<RailOp>,
     divider_after: bool,
+}
+
+impl ContextMenuItem {
+    fn action(
+        label: impl Into<Cow<'static, str>>,
+        enabled: bool,
+        action: Option<Action>,
+        divider_after: bool,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            enabled,
+            action,
+            rail_op: None,
+            divider_after,
+        }
+    }
+
+    fn rail(
+        label: impl Into<Cow<'static, str>>,
+        enabled: bool,
+        op: Option<RailOp>,
+        divider_after: bool,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            enabled,
+            action: None,
+            rail_op: op,
+            divider_after,
+        }
+    }
 }
 
 fn show_context_menu(
@@ -85,8 +203,19 @@ fn show_context_menu(
     items: &[ContextMenuItem],
     actions: &mut Vec<Action>,
 ) {
-    let mut picked: Option<Action> = None;
-    egui::Popup::context_menu(resp).width(196.0).show(|ui| {
+    let mut rail_ops = Vec::new();
+    show_context_menu_full(resp, t, items, actions, &mut rail_ops);
+}
+
+fn show_context_menu_full(
+    resp: &egui::Response,
+    t: &Theme,
+    items: &[ContextMenuItem],
+    actions: &mut Vec<Action>,
+    rail_ops: &mut Vec<RailOp>,
+) {
+    let mut picked: Option<MenuEffect> = None;
+    egui::Popup::context_menu(resp).width(212.0).show(|ui| {
         ui.spacing_mut().item_spacing.y = 2.0;
         for item in items {
             let (rect, r) = ui.allocate_exact_size(
@@ -111,14 +240,18 @@ fn show_context_menu(
             ui.painter().text(
                 Pos2::new(rect.left() + 10.0, rect.center().y),
                 Align2::LEFT_CENTER,
-                item.label,
+                item.label.as_ref(),
                 prop(13.5),
                 fg,
             );
             if item.enabled {
-                let r = r.on_hover_cursor(egui::CursorIcon::PointingHand);
+                let r = r.on_hover_cursor(CursorIcon::PointingHand);
                 if r.clicked() {
-                    picked = item.action.clone();
+                    if let Some(a) = &item.action {
+                        picked = Some(MenuEffect::Action(a.clone()));
+                    } else if let Some(op) = &item.rail_op {
+                        picked = Some(MenuEffect::Rail(op.clone()));
+                    }
                 }
             }
             if item.divider_after {
@@ -134,43 +267,149 @@ fn show_context_menu(
             }
         }
     });
-    if let Some(a) = picked {
-        actions.push(a);
+    if let Some(eff) = picked {
+        match eff {
+            MenuEffect::Action(a) => actions.push(a),
+            MenuEffect::Rail(op) => rail_ops.push(op),
+        }
         egui::Popup::close_all(&resp.ctx);
     }
 }
 
-fn guild_context_items(guild_id: Snowflake, can_mark_read: bool) -> [ContextMenuItem; 2] {
-    [
-        ContextMenuItem {
-            label: "Mark Server as Read",
-            enabled: can_mark_read,
-            action: can_mark_read.then_some(Action::MarkGuildRead(guild_id)),
-            divider_after: true,
-        },
-        ContextMenuItem {
-            label: "Copy Server ID",
-            enabled: true,
-            action: Some(Action::Copy(guild_id.to_string())),
-            divider_after: false,
-        },
+fn guild_rail_context_items(
+    guild_id: Snowflake,
+    can_mark_read: bool,
+    layout: &[GuildFolder],
+) -> Vec<ContextMenuItem> {
+    let (can_up, can_down, in_folder) = can_move_guild(layout, guild_id);
+    let other_folders: Vec<(u64, String)> = layout
+        .iter()
+        .filter(|f| f.is_folder())
+        .filter_map(|f| {
+            let fid = f.id?;
+            (Some(fid) != in_folder).then(|| (fid, f.display_name().to_string()))
+        })
+        .take(4)
+        .collect();
+
+    let mut items = vec![
+        ContextMenuItem::action(
+            "Mark Server as Read",
+            can_mark_read,
+            can_mark_read.then_some(Action::MarkGuildRead(guild_id)),
+            true,
+        ),
+        ContextMenuItem::rail(
+            "Move Server Up",
+            can_up,
+            can_up.then_some(RailOp::MoveGuild {
+                guild_id,
+                delta: -1,
+            }),
+            false,
+        ),
+        ContextMenuItem::rail(
+            "Move Server Down",
+            can_down,
+            can_down.then_some(RailOp::MoveGuild { guild_id, delta: 1 }),
+            true,
+        ),
+        ContextMenuItem::rail(
+            "Create Folder with Server…",
+            true,
+            Some(RailOp::CreateFolder(guild_id)),
+            other_folders.is_empty() && in_folder.is_none(),
+        ),
+    ];
+    for (idx, (fid, fname)) in other_folders.iter().enumerate() {
+        let last = idx + 1 == other_folders.len() && in_folder.is_none();
+        items.push(ContextMenuItem::rail(
+            format!("Move to {fname}"),
+            true,
+            Some(RailOp::MoveGuildToFolder {
+                guild_id,
+                folder_id: *fid,
+            }),
+            last,
+        ));
+    }
+    if in_folder.is_some() {
+        items.push(ContextMenuItem::rail(
+            "Remove from Folder",
+            true,
+            Some(RailOp::RemoveFromFolder(guild_id)),
+            true,
+        ));
+    }
+    items.push(ContextMenuItem::action(
+        "Copy Server ID",
+        true,
+        Some(Action::Copy(guild_id.to_string())),
+        false,
+    ));
+    items
+}
+
+fn folder_context_items(
+    folder_id: u64,
+    can_mark_read: bool,
+    layout: &[GuildFolder],
+) -> Vec<ContextMenuItem> {
+    let (can_up, can_down) = can_move_folder(layout, folder_id);
+    vec![
+        ContextMenuItem::rail(
+            "Mark Folder as Read",
+            can_mark_read,
+            can_mark_read.then_some(RailOp::MarkFolderRead(folder_id)),
+            true,
+        ),
+        ContextMenuItem::rail(
+            "Folder Settings…",
+            true,
+            Some(RailOp::EditFolder(folder_id)),
+            true,
+        ),
+        ContextMenuItem::rail(
+            "Move Folder Up",
+            can_up,
+            can_up.then_some(RailOp::MoveFolder {
+                folder_id,
+                delta: -1,
+            }),
+            false,
+        ),
+        ContextMenuItem::rail(
+            "Move Folder Down",
+            can_down,
+            can_down.then_some(RailOp::MoveFolder {
+                folder_id,
+                delta: 1,
+            }),
+            true,
+        ),
+        ContextMenuItem::rail(
+            "Ungroup Folder",
+            true,
+            Some(RailOp::UngroupFolder(folder_id)),
+            false,
+        ),
     ]
 }
 
 fn channel_context_items(channel_id: Snowflake, can_mark_read: bool) -> [ContextMenuItem; 2] {
     [
-        ContextMenuItem {
-            label: "Mark as Read",
-            enabled: can_mark_read,
-            action: can_mark_read.then_some(Action::MarkChannelRead(channel_id)),
-            divider_after: true,
-        },
-        ContextMenuItem {
-            label: "Copy ID",
-            enabled: true,
-            action: Some(Action::Copy(channel_id.to_string())),
-            divider_after: false,
-        },
+        ContextMenuItem::action(
+            "Mark as Read",
+            can_mark_read,
+            can_mark_read.then_some(Action::MarkChannelRead(channel_id)),
+            true,
+        ),
+        ContextMenuItem::action(
+            "Copy ID",
+            true,
+            Some(Action::Copy(channel_id.to_string())),
+            false,
+        ),
     ]
 }
 
@@ -181,53 +420,457 @@ fn thread_context_items(
     is_locked: bool,
 ) -> [ContextMenuItem; 4] {
     [
-        ContextMenuItem {
-            label: "Mark as Read",
-            enabled: can_mark_read,
-            action: can_mark_read.then_some(Action::MarkChannelRead(thread_id)),
-            divider_after: true,
-        },
-        ContextMenuItem {
-            label: if is_archived {
+        ContextMenuItem::action(
+            "Mark as Read",
+            can_mark_read,
+            can_mark_read.then_some(Action::MarkChannelRead(thread_id)),
+            true,
+        ),
+        ContextMenuItem::action(
+            if is_archived {
                 "Unarchive Thread"
             } else {
                 "Archive Thread"
             },
-            enabled: true,
-            action: Some(Action::UpdateThread {
+            true,
+            Some(Action::UpdateThread {
                 thread_id,
                 archived: Some(!is_archived),
                 locked: None,
             }),
-            divider_after: false,
-        },
-        ContextMenuItem {
-            label: if is_locked {
+            false,
+        ),
+        ContextMenuItem::action(
+            if is_locked {
                 "Unlock Thread"
             } else {
                 "Lock Thread"
             },
-            enabled: true,
-            action: Some(Action::UpdateThread {
+            true,
+            Some(Action::UpdateThread {
                 thread_id,
                 archived: None,
                 locked: Some(!is_locked),
             }),
-            divider_after: true,
-        },
-        ContextMenuItem {
-            label: "Copy ID",
-            enabled: true,
-            action: Some(Action::Copy(thread_id.to_string())),
-            divider_after: false,
-        },
+            true,
+        ),
+        ContextMenuItem::action(
+            "Copy ID",
+            true,
+            Some(Action::Copy(thread_id.to_string())),
+            false,
+        ),
     ]
+}
+
+// ---- pure server rail layout engine -------------------------------------------------
+
+fn next_folder_id(layout: &[GuildFolder]) -> u64 {
+    let max_id = layout.iter().filter_map(|f| f.id).max().unwrap_or(100);
+    max_id.saturating_add(1)
+}
+
+/// Synchronize persisted `layout` with the available guilds in the store (seeding from
+/// `remote_folders` when `layout` is empty). Removes left guilds, deduplicates, assigns
+/// missing folder IDs, and appends newly joined guilds at the bottom.
+pub fn reconcile_guild_layout(
+    layout: &mut Vec<GuildFolder>,
+    remote_folders: &[GuildFolder],
+    available_guilds: &[Snowflake],
+) {
+    if layout.is_empty() && !remote_folders.is_empty() {
+        *layout = remote_folders.to_vec();
+    }
+    let avail: HashSet<Snowflake> = available_guilds.iter().copied().collect();
+    let mut seen: HashSet<Snowflake> = HashSet::with_capacity(available_guilds.len());
+    let mut max_fid = layout.iter().filter_map(|f| f.id).max().unwrap_or(100);
+
+    for entry in layout.iter_mut() {
+        let was_folder = entry.is_folder();
+        entry
+            .guild_ids
+            .retain(|gid| avail.contains(gid) && seen.insert(*gid));
+        if was_folder && entry.id.is_none() && !entry.guild_ids.is_empty() {
+            max_fid = max_fid.saturating_add(1);
+            entry.id = Some(max_fid);
+        }
+    }
+    layout.retain(|entry| !entry.guild_ids.is_empty());
+
+    for &gid in available_guilds {
+        if seen.insert(gid) {
+            layout.push(GuildFolder {
+                id: None,
+                guild_ids: vec![gid],
+                name: None,
+                color: None,
+            });
+        }
+    }
+}
+
+/// Returns `(can_move_up, can_move_down, enclosing_folder_id)` for `guild_id`.
+pub fn can_move_guild(layout: &[GuildFolder], guild_id: Snowflake) -> (bool, bool, Option<u64>) {
+    for (top_idx, entry) in layout.iter().enumerate() {
+        if let Some(pos) = entry.guild_ids.iter().position(|&g| g == guild_id) {
+            if entry.is_folder() {
+                if entry.guild_ids.len() > 1 {
+                    return (pos > 0, pos + 1 < entry.guild_ids.len(), entry.id);
+                }
+                return (top_idx > 0, top_idx + 1 < layout.len(), entry.id);
+            }
+            return (top_idx > 0, top_idx + 1 < layout.len(), None);
+        }
+    }
+    (false, false, None)
+}
+
+/// Returns `(can_move_up, can_move_down)` for `folder_id`.
+pub fn can_move_folder(layout: &[GuildFolder], folder_id: u64) -> (bool, bool) {
+    if let Some(idx) = layout.iter().position(|f| f.id == Some(folder_id)) {
+        (idx > 0, idx + 1 < layout.len())
+    } else {
+        (false, false)
+    }
+}
+
+/// Remove `guild_id` from wherever it lives in `layout`, cleaning up any emptied entries.
+/// If a folder without a custom name or color drops to 1 guild, it unwraps back to a
+/// standalone server automatically.
+fn detach_guild(layout: &mut Vec<GuildFolder>, guild_id: Snowflake) {
+    for entry in layout.iter_mut() {
+        entry.guild_ids.retain(|&g| g != guild_id);
+        let unnamed = entry.name.as_deref().is_none_or(|s| s.trim().is_empty());
+        if entry.guild_ids.len() == 1 && unnamed && entry.color.is_none() {
+            entry.id = None;
+            entry.name = None;
+        }
+    }
+    layout.retain(|entry| !entry.guild_ids.is_empty());
+}
+
+/// Apply one [`RailOp`] to `layout` and `collapsed`. Returns `Some(folder_id)` if the
+/// caller should open the Folder Settings modal for `folder_id`.
+pub fn apply_rail_op(
+    layout: &mut Vec<GuildFolder>,
+    collapsed: &mut HashSet<u64>,
+    op: RailOp,
+) -> Option<u64> {
+    match op {
+        RailOp::ToggleFolder(fid) => {
+            if !collapsed.remove(&fid) {
+                collapsed.insert(fid);
+            }
+            None
+        }
+        RailOp::EditFolder(fid) => Some(fid),
+        RailOp::MarkFolderRead(_) => None,
+        RailOp::MoveGuild { guild_id, delta } => {
+            for i in 0..layout.len() {
+                if let Some(pos) = layout[i].guild_ids.iter().position(|&g| g == guild_id) {
+                    if layout[i].is_folder() && layout[i].guild_ids.len() > 1 {
+                        let new_pos = (pos as i32 + delta)
+                            .clamp(0, layout[i].guild_ids.len() as i32 - 1)
+                            as usize;
+                        layout[i].guild_ids.swap(pos, new_pos);
+                    } else {
+                        let new_i = (i as i32 + delta).clamp(0, layout.len() as i32 - 1) as usize;
+                        layout.swap(i, new_i);
+                    }
+                    break;
+                }
+            }
+            None
+        }
+        RailOp::MoveFolder { folder_id, delta } => {
+            if let Some(i) = layout.iter().position(|f| f.id == Some(folder_id)) {
+                let new_i = (i as i32 + delta).clamp(0, layout.len() as i32 - 1) as usize;
+                layout.swap(i, new_i);
+            }
+            None
+        }
+        RailOp::CreateFolder(guild_id) => {
+            let new_id = next_folder_id(layout);
+            for i in 0..layout.len() {
+                if layout[i].guild_ids.contains(&guild_id) {
+                    if !layout[i].is_folder() {
+                        layout[i].id = Some(new_id);
+                        layout[i].name = Some("Server Folder".into());
+                    } else {
+                        layout[i].guild_ids.retain(|&g| g != guild_id);
+                        let insert_at = if layout[i].guild_ids.is_empty() {
+                            layout.remove(i);
+                            i
+                        } else {
+                            i + 1
+                        };
+                        layout.insert(
+                            insert_at,
+                            GuildFolder {
+                                id: Some(new_id),
+                                guild_ids: vec![guild_id],
+                                name: Some("Server Folder".into()),
+                                color: None,
+                            },
+                        );
+                    }
+                    collapsed.remove(&new_id);
+                    return Some(new_id);
+                }
+            }
+            None
+        }
+        RailOp::MoveGuildToFolder {
+            guild_id,
+            folder_id,
+        } => {
+            if layout.iter().any(|f| f.id == Some(folder_id)) {
+                detach_guild(layout, guild_id);
+                if let Some(folder) = layout.iter_mut().find(|f| f.id == Some(folder_id)) {
+                    if !folder.guild_ids.contains(&guild_id) {
+                        folder.guild_ids.push(guild_id);
+                    }
+                }
+                collapsed.remove(&folder_id);
+            }
+            None
+        }
+        RailOp::RemoveFromFolder(guild_id) => {
+            if let Some(i) = layout
+                .iter()
+                .position(|f| f.is_folder() && f.guild_ids.contains(&guild_id))
+            {
+                layout[i].guild_ids.retain(|&g| g != guild_id);
+                let unnamed = layout[i]
+                    .name
+                    .as_deref()
+                    .is_none_or(|s| s.trim().is_empty());
+                if layout[i].guild_ids.len() == 1 && unnamed && layout[i].color.is_none() {
+                    layout[i].id = None;
+                    layout[i].name = None;
+                }
+                let insert_at = if layout[i].guild_ids.is_empty() {
+                    layout.remove(i);
+                    i
+                } else {
+                    i + 1
+                };
+                layout.insert(
+                    insert_at,
+                    GuildFolder {
+                        id: None,
+                        guild_ids: vec![guild_id],
+                        name: None,
+                        color: None,
+                    },
+                );
+            }
+            None
+        }
+        RailOp::UngroupFolder(folder_id) => {
+            if let Some(i) = layout.iter().position(|f| f.id == Some(folder_id)) {
+                let folder = layout.remove(i);
+                collapsed.remove(&folder_id);
+                for (offset, gid) in folder.guild_ids.into_iter().enumerate() {
+                    layout.insert(
+                        i + offset,
+                        GuildFolder {
+                            id: None,
+                            guild_ids: vec![gid],
+                            name: None,
+                            color: None,
+                        },
+                    );
+                }
+            }
+            None
+        }
+        RailOp::Drop { source, target } => {
+            apply_rail_drop(layout, collapsed, source, target);
+            None
+        }
+    }
+}
+
+fn apply_rail_drop(
+    layout: &mut Vec<GuildFolder>,
+    collapsed: &mut HashSet<u64>,
+    source: RailDrag,
+    target: RailDropTarget,
+) {
+    match (source, target) {
+        (RailDrag::Guild(src_gid), RailDropTarget::BeforeTopGuild(dst_gid))
+            if src_gid != dst_gid =>
+        {
+            detach_guild(layout, src_gid);
+            if let Some(i) = layout.iter().position(|f| f.guild_ids.contains(&dst_gid)) {
+                layout.insert(
+                    i,
+                    GuildFolder {
+                        id: None,
+                        guild_ids: vec![src_gid],
+                        name: None,
+                        color: None,
+                    },
+                );
+            }
+        }
+        (RailDrag::Guild(src_gid), RailDropTarget::AfterTopGuild(dst_gid))
+            if src_gid != dst_gid =>
+        {
+            detach_guild(layout, src_gid);
+            if let Some(i) = layout.iter().position(|f| f.guild_ids.contains(&dst_gid)) {
+                layout.insert(
+                    i + 1,
+                    GuildFolder {
+                        id: None,
+                        guild_ids: vec![src_gid],
+                        name: None,
+                        color: None,
+                    },
+                );
+            }
+        }
+        (RailDrag::Guild(src_gid), RailDropTarget::GroupWithGuild(dst_gid))
+            if src_gid != dst_gid =>
+        {
+            let new_fid = next_folder_id(layout);
+            detach_guild(layout, src_gid);
+            if let Some(entry) = layout.iter_mut().find(|f| f.guild_ids.contains(&dst_gid)) {
+                let fid = *entry.id.get_or_insert(new_fid);
+                if let Some(pos) = entry.guild_ids.iter().position(|&g| g == dst_gid) {
+                    entry.guild_ids.insert(pos + 1, src_gid);
+                } else {
+                    entry.guild_ids.push(src_gid);
+                }
+                collapsed.remove(&fid);
+            }
+        }
+        (RailDrag::Guild(src_gid), RailDropTarget::BeforeFolder(fid)) => {
+            detach_guild(layout, src_gid);
+            if let Some(i) = layout.iter().position(|f| f.id == Some(fid)) {
+                layout.insert(
+                    i,
+                    GuildFolder {
+                        id: None,
+                        guild_ids: vec![src_gid],
+                        name: None,
+                        color: None,
+                    },
+                );
+            }
+        }
+        (RailDrag::Guild(src_gid), RailDropTarget::AfterFolder(fid)) => {
+            detach_guild(layout, src_gid);
+            if let Some(i) = layout.iter().position(|f| f.id == Some(fid)) {
+                layout.insert(
+                    i + 1,
+                    GuildFolder {
+                        id: None,
+                        guild_ids: vec![src_gid],
+                        name: None,
+                        color: None,
+                    },
+                );
+            }
+        }
+        (RailDrag::Guild(src_gid), RailDropTarget::IntoFolder(fid)) => {
+            if layout.iter().any(|f| f.id == Some(fid)) {
+                detach_guild(layout, src_gid);
+                if let Some(folder) = layout.iter_mut().find(|f| f.id == Some(fid)) {
+                    if !folder.guild_ids.contains(&src_gid) {
+                        folder.guild_ids.push(src_gid);
+                    }
+                }
+                collapsed.remove(&fid);
+            }
+        }
+        (
+            RailDrag::Guild(src_gid),
+            RailDropTarget::InsideFolderBefore {
+                folder_id,
+                target_guild,
+            },
+        ) if src_gid != target_guild => {
+            detach_guild(layout, src_gid);
+            if let Some(folder) = layout.iter_mut().find(|f| f.id == Some(folder_id)) {
+                let pos = folder
+                    .guild_ids
+                    .iter()
+                    .position(|&g| g == target_guild)
+                    .unwrap_or(folder.guild_ids.len());
+                folder.guild_ids.insert(pos, src_gid);
+            }
+        }
+        (
+            RailDrag::Guild(src_gid),
+            RailDropTarget::InsideFolderAfter {
+                folder_id,
+                target_guild,
+            },
+        ) if src_gid != target_guild => {
+            detach_guild(layout, src_gid);
+            if let Some(folder) = layout.iter_mut().find(|f| f.id == Some(folder_id)) {
+                let pos = folder
+                    .guild_ids
+                    .iter()
+                    .position(|&g| g == target_guild)
+                    .map_or(folder.guild_ids.len(), |p| p + 1);
+                folder.guild_ids.insert(pos, src_gid);
+            }
+        }
+        (RailDrag::Folder(src_fid), target) => {
+            let Some(src_idx) = layout.iter().position(|f| f.id == Some(src_fid)) else {
+                return;
+            };
+            let is_same = matches!(
+                target,
+                RailDropTarget::BeforeFolder(fid)
+                    | RailDropTarget::AfterFolder(fid)
+                    | RailDropTarget::IntoFolder(fid)
+                    if fid == src_fid
+            );
+            if is_same {
+                return;
+            }
+            let folder = layout.remove(src_idx);
+            let insert_idx = match target {
+                RailDropTarget::BeforeTopGuild(gid) => {
+                    layout.iter().position(|f| f.guild_ids.contains(&gid))
+                }
+                RailDropTarget::AfterTopGuild(gid) | RailDropTarget::GroupWithGuild(gid) => layout
+                    .iter()
+                    .position(|f| f.guild_ids.contains(&gid))
+                    .map(|i| i + 1),
+                RailDropTarget::BeforeFolder(fid) => layout.iter().position(|f| f.id == Some(fid)),
+                RailDropTarget::AfterFolder(fid)
+                | RailDropTarget::IntoFolder(fid)
+                | RailDropTarget::InsideFolderBefore { folder_id: fid, .. }
+                | RailDropTarget::InsideFolderAfter { folder_id: fid, .. } => {
+                    layout.iter().position(|f| f.id == Some(fid)).map(|i| i + 1)
+                }
+            }
+            .unwrap_or(src_idx.min(layout.len()));
+            layout.insert(insert_idx, folder);
+        }
+        _ => {}
+    }
 }
 
 // ---- guild rail ---------------------------------------------------------------------
 
 pub fn rail(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
     let t = app.theme;
+    let avail_guilds: Vec<Snowflake> = app
+        .store
+        .guilds()
+        .into_iter()
+        .filter(|g| !g.unavailable)
+        .map(|g| g.id)
+        .collect();
+    let remote_folders = app.store.guild_folders().to_vec();
+    reconcile_guild_layout(&mut app.prefs.guild_layout, &remote_folders, &avail_guilds);
+
     egui::Panel::bottom("rail_add")
         .exact_size(64.0)
         .show_separator_line(false)
@@ -249,9 +892,15 @@ pub fn rail(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
                     16.0,
                     if hovered { Color32::WHITE } else { t.online },
                 );
-                resp.on_hover_text("Joining servers isn't supported yet");
+                resp.on_hover_text("Drag servers to reorder or drop onto another server to group");
             });
         });
+
+    let layout_snapshot = app.prefs.guild_layout.clone();
+    let mut rail_ops: Vec<RailOp> = Vec::new();
+    let mut new_drag: Option<RailDrag> = app.view.rail_drag;
+    let mut hover_target: Option<RailDropTarget> = None;
+    let pointer_pos = ui.ctx().input(|i| i.pointer.interact_pos());
 
     ui.vertical_centered(|ui| {
         ui.add_space(12.0);
@@ -291,35 +940,666 @@ pub fn rail(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
             .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     let app: &NixApp = app;
-                    for guild in app.store.guilds() {
-                        if guild.unavailable {
+                    for entry in &layout_snapshot {
+                        if !entry.is_folder() {
+                            let Some(&gid) = entry.guild_ids.first() else {
+                                continue;
+                            };
+                            let Some(guild) = app.store.guild(gid) else {
+                                continue;
+                            };
+                            let sel = app.view.guild == Some(guild.id);
+                            let mentions = app.store.guild_mention_count(guild.id);
+                            let has_unread = app.guild_unread(guild.id) || mentions > 0;
+                            let unread = !sel && has_unread;
+                            let label = initials(&guild.name, 3);
+                            let resp = rail_item_draggable(
+                                ui,
+                                app,
+                                sel,
+                                unread,
+                                mentions,
+                                &guild.name,
+                                &label,
+                                Some(guild),
+                            );
+                            if resp.drag_started() {
+                                new_drag = Some(RailDrag::Guild(guild.id));
+                            }
+                            if let (Some(drag), Some(pos)) = (new_drag, pointer_pos) {
+                                if resp.rect.expand2(Vec2::new(8.0, 4.0)).contains(pos) {
+                                    let rel = ((pos.y - resp.rect.top()) / resp.rect.height())
+                                        .clamp(0.0, 1.0);
+                                    match drag {
+                                        RailDrag::Guild(s) if s != guild.id => {
+                                            if rel < 0.25 {
+                                                hover_target =
+                                                    Some(RailDropTarget::BeforeTopGuild(guild.id));
+                                                paint_drop_line(
+                                                    ui,
+                                                    resp.rect.top() - 4.0,
+                                                    t.accent,
+                                                );
+                                            } else if rel > 0.75 {
+                                                hover_target =
+                                                    Some(RailDropTarget::AfterTopGuild(guild.id));
+                                                paint_drop_line(
+                                                    ui,
+                                                    resp.rect.bottom() + 4.0,
+                                                    t.accent,
+                                                );
+                                            } else {
+                                                hover_target =
+                                                    Some(RailDropTarget::GroupWithGuild(guild.id));
+                                                paint_group_ring(ui, resp.rect, t.accent);
+                                            }
+                                        }
+                                        RailDrag::Folder(_) => {
+                                            if rel < 0.5 {
+                                                hover_target =
+                                                    Some(RailDropTarget::BeforeTopGuild(guild.id));
+                                                paint_drop_line(
+                                                    ui,
+                                                    resp.rect.top() - 4.0,
+                                                    t.accent,
+                                                );
+                                            } else {
+                                                hover_target =
+                                                    Some(RailDropTarget::AfterTopGuild(guild.id));
+                                                paint_drop_line(
+                                                    ui,
+                                                    resp.rect.bottom() + 4.0,
+                                                    t.accent,
+                                                );
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            if resp.clicked() {
+                                actions.push(Action::SelectGuild(guild.id));
+                            }
+                            let items =
+                                guild_rail_context_items(guild.id, has_unread, &layout_snapshot);
+                            show_context_menu_full(&resp, t, &items, actions, &mut rail_ops);
+                            ui.add_space(8.0);
                             continue;
                         }
-                        let sel = app.view.guild == Some(guild.id);
-                        let mentions = app.store.guild_mention_count(guild.id);
-                        let has_unread = app.guild_unread(guild.id) || mentions > 0;
-                        let unread = !sel && has_unread;
-                        let label = initials(&guild.name, 3);
-                        let resp = rail_item(
-                            ui,
-                            app,
-                            sel,
-                            unread,
-                            mentions,
-                            &guild.name,
-                            &label,
-                            Some(guild),
-                        );
-                        if resp.clicked() {
-                            actions.push(Action::SelectGuild(guild.id));
+
+                        // Server folder (collapsed or expanded).
+                        let fid = entry.id.unwrap_or(1);
+                        let f_color = entry.color.map(rgb_u32).unwrap_or(t.accent);
+                        let is_collapsed = app.prefs.collapsed_folders.contains(&fid);
+                        let f_guilds: Vec<&Guild> = entry
+                            .guild_ids
+                            .iter()
+                            .filter_map(|id| app.store.guild(*id))
+                            .collect();
+                        if f_guilds.is_empty() {
+                            continue;
                         }
-                        let items = guild_context_items(guild.id, has_unread);
-                        show_context_menu(&resp, t, &items, actions);
-                        ui.add_space(8.0);
+                        let f_mentions: u32 = f_guilds
+                            .iter()
+                            .map(|g| app.store.guild_mention_count(g.id))
+                            .sum();
+                        let f_has_unread =
+                            f_mentions > 0 || f_guilds.iter().any(|g| app.guild_unread(g.id));
+                        let f_any_selected = f_guilds.iter().any(|g| app.view.guild == Some(g.id));
+                        let f_tooltip = format!(
+                            "{} ({} {})",
+                            entry.display_name(),
+                            f_guilds.len(),
+                            if f_guilds.len() == 1 {
+                                "server"
+                            } else {
+                                "servers"
+                            }
+                        );
+
+                        if is_collapsed {
+                            let resp = collapsed_folder_item(
+                                ui,
+                                app,
+                                fid,
+                                f_color,
+                                f_any_selected,
+                                !f_any_selected && f_has_unread,
+                                f_mentions,
+                                &f_tooltip,
+                                &f_guilds,
+                            );
+                            if resp.drag_started() {
+                                new_drag = Some(RailDrag::Folder(fid));
+                            }
+                            if let (Some(drag), Some(pos)) = (new_drag, pointer_pos) {
+                                if resp.rect.expand2(Vec2::new(8.0, 4.0)).contains(pos) {
+                                    let rel = ((pos.y - resp.rect.top()) / resp.rect.height())
+                                        .clamp(0.0, 1.0);
+                                    match drag {
+                                        RailDrag::Guild(_) => {
+                                            if rel < 0.24 {
+                                                hover_target =
+                                                    Some(RailDropTarget::BeforeFolder(fid));
+                                                paint_drop_line(ui, resp.rect.top() - 4.0, f_color);
+                                            } else if rel > 0.76 {
+                                                hover_target =
+                                                    Some(RailDropTarget::AfterFolder(fid));
+                                                paint_drop_line(
+                                                    ui,
+                                                    resp.rect.bottom() + 4.0,
+                                                    f_color,
+                                                );
+                                            } else {
+                                                hover_target =
+                                                    Some(RailDropTarget::IntoFolder(fid));
+                                                paint_group_ring(ui, resp.rect, f_color);
+                                            }
+                                        }
+                                        RailDrag::Folder(sfid) if sfid != fid => {
+                                            if rel < 0.5 {
+                                                hover_target =
+                                                    Some(RailDropTarget::BeforeFolder(fid));
+                                                paint_drop_line(ui, resp.rect.top() - 4.0, f_color);
+                                            } else {
+                                                hover_target =
+                                                    Some(RailDropTarget::AfterFolder(fid));
+                                                paint_drop_line(
+                                                    ui,
+                                                    resp.rect.bottom() + 4.0,
+                                                    f_color,
+                                                );
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            if resp.clicked() {
+                                rail_ops.push(RailOp::ToggleFolder(fid));
+                            }
+                            let items = folder_context_items(fid, f_has_unread, &layout_snapshot);
+                            show_context_menu_full(&resp, t, &items, actions, &mut rail_ops);
+                            ui.add_space(8.0);
+                        } else {
+                            // Expanded folder: header + member guilds enclosed in a vertical pill.
+                            let pill_h = 48.0 + (f_guilds.len() as f32) * 54.0 + 4.0;
+                            let pill_top = ui.cursor().top();
+                            let pill_center_x = ui.max_rect().center().x;
+                            let pill_rect = Rect::from_min_size(
+                                Pos2::new(pill_center_x - 24.0, pill_top),
+                                Vec2::new(48.0, pill_h),
+                            );
+                            let pill_fill = super::presence::over(
+                                f_color.gamma_multiply(0.18),
+                                t.elevated.gamma_multiply(0.85),
+                            );
+                            ui.painter()
+                                .rect_filled(pill_rect, CornerRadius::same(16), pill_fill);
+
+                            let hdr_resp =
+                                expanded_folder_header(ui, app, fid, f_color, &f_tooltip);
+                            if hdr_resp.drag_started() {
+                                new_drag = Some(RailDrag::Folder(fid));
+                            }
+                            if let (Some(drag), Some(pos)) = (new_drag, pointer_pos) {
+                                if hdr_resp.rect.expand2(Vec2::new(8.0, 4.0)).contains(pos) {
+                                    let rel = ((pos.y - hdr_resp.rect.top())
+                                        / hdr_resp.rect.height())
+                                    .clamp(0.0, 1.0);
+                                    match drag {
+                                        RailDrag::Guild(_) => {
+                                            if rel < 0.28 {
+                                                hover_target =
+                                                    Some(RailDropTarget::BeforeFolder(fid));
+                                                paint_drop_line(
+                                                    ui,
+                                                    hdr_resp.rect.top() - 4.0,
+                                                    f_color,
+                                                );
+                                            } else {
+                                                hover_target =
+                                                    Some(RailDropTarget::IntoFolder(fid));
+                                                paint_group_ring(ui, hdr_resp.rect, f_color);
+                                            }
+                                        }
+                                        RailDrag::Folder(sfid) if sfid != fid => {
+                                            if rel < 0.5 {
+                                                hover_target =
+                                                    Some(RailDropTarget::BeforeFolder(fid));
+                                                paint_drop_line(
+                                                    ui,
+                                                    hdr_resp.rect.top() - 4.0,
+                                                    f_color,
+                                                );
+                                            } else {
+                                                hover_target =
+                                                    Some(RailDropTarget::AfterFolder(fid));
+                                                paint_drop_line(
+                                                    ui,
+                                                    pill_rect.bottom() + 4.0,
+                                                    f_color,
+                                                );
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            if hdr_resp.clicked() {
+                                rail_ops.push(RailOp::ToggleFolder(fid));
+                            }
+                            let f_items = folder_context_items(fid, f_has_unread, &layout_snapshot);
+                            show_context_menu_full(&hdr_resp, t, &f_items, actions, &mut rail_ops);
+
+                            ui.add_space(6.0);
+                            for (g_idx, guild) in f_guilds.iter().enumerate() {
+                                let sel = app.view.guild == Some(guild.id);
+                                let mentions = app.store.guild_mention_count(guild.id);
+                                let has_unread = app.guild_unread(guild.id) || mentions > 0;
+                                let unread = !sel && has_unread;
+                                let label = initials(&guild.name, 3);
+                                let resp = rail_item_draggable(
+                                    ui,
+                                    app,
+                                    sel,
+                                    unread,
+                                    mentions,
+                                    &guild.name,
+                                    &label,
+                                    Some(guild),
+                                );
+                                if resp.drag_started() {
+                                    new_drag = Some(RailDrag::Guild(guild.id));
+                                }
+                                if let (Some(RailDrag::Guild(s)), Some(pos)) =
+                                    (new_drag, pointer_pos)
+                                {
+                                    if s != guild.id
+                                        && resp.rect.expand2(Vec2::new(8.0, 3.0)).contains(pos)
+                                    {
+                                        let rel = ((pos.y - resp.rect.top()) / resp.rect.height())
+                                            .clamp(0.0, 1.0);
+                                        if rel < 0.5 {
+                                            hover_target =
+                                                Some(RailDropTarget::InsideFolderBefore {
+                                                    folder_id: fid,
+                                                    target_guild: guild.id,
+                                                });
+                                            paint_drop_line(ui, resp.rect.top() - 3.0, f_color);
+                                        } else {
+                                            hover_target =
+                                                Some(RailDropTarget::InsideFolderAfter {
+                                                    folder_id: fid,
+                                                    target_guild: guild.id,
+                                                });
+                                            paint_drop_line(ui, resp.rect.bottom() + 3.0, f_color);
+                                        }
+                                    }
+                                }
+                                if resp.clicked() {
+                                    actions.push(Action::SelectGuild(guild.id));
+                                }
+                                let items = guild_rail_context_items(
+                                    guild.id,
+                                    has_unread,
+                                    &layout_snapshot,
+                                );
+                                show_context_menu_full(&resp, t, &items, actions, &mut rail_ops);
+                                if g_idx + 1 < f_guilds.len() {
+                                    ui.add_space(6.0);
+                                } else {
+                                    ui.add_space(4.0);
+                                }
+                            }
+                            ui.add_space(8.0);
+                        }
                     }
                 });
             });
     });
+
+    // Floating drag indicator & drop completion.
+    if let Some(drag) = new_drag {
+        ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        if let Some(pos) = pointer_pos {
+            let layer = egui::LayerId::new(Order::Tooltip, Id::unique("rail_drag_ghost"));
+            let p = ui.ctx().layer_painter(layer);
+            let badge = Rect::from_center_size(pos + Vec2::new(20.0, 16.0), Vec2::splat(32.0));
+            p.rect_filled(badge, CornerRadius::same(10), t.accent.gamma_multiply(0.88));
+            let label = match drag {
+                RailDrag::Guild(gid) => app
+                    .store
+                    .guild(gid)
+                    .map(|g| initials(&g.name, 2))
+                    .unwrap_or_else(|| "S".into()),
+                RailDrag::Folder(_) => "📁".into(),
+            };
+            p.text(
+                badge.center(),
+                Align2::CENTER_CENTER,
+                label,
+                bold(12.0),
+                t.on_accent,
+            );
+        }
+        let released = ui.ctx().input(|i| i.pointer.any_released());
+        let escaped = ui.ctx().input(|i| i.key_pressed(Key::Escape));
+        if escaped {
+            new_drag = None;
+        } else if released {
+            if let Some(target) = hover_target {
+                rail_ops.push(RailOp::Drop {
+                    source: drag,
+                    target,
+                });
+            }
+            new_drag = None;
+        }
+    }
+    app.view.rail_drag = new_drag;
+
+    for op in rail_ops {
+        if let RailOp::MarkFolderRead(fid) = &op {
+            if let Some(f) = app.prefs.guild_layout.iter().find(|f| f.id == Some(*fid)) {
+                for &gid in &f.guild_ids {
+                    actions.push(Action::MarkGuildRead(gid));
+                }
+            }
+        }
+        if let Some(edit_fid) = apply_rail_op(
+            &mut app.prefs.guild_layout,
+            &mut app.prefs.collapsed_folders,
+            op,
+        ) {
+            if let Some(folder) = app
+                .prefs
+                .guild_layout
+                .iter()
+                .find(|f| f.id == Some(edit_fid))
+            {
+                app.view.folder_modal = Some(FolderModal {
+                    folder_id: edit_fid,
+                    name: folder.name.clone().unwrap_or_default(),
+                    color: folder.color,
+                    focus_name: true,
+                });
+            }
+        }
+    }
+}
+
+fn paint_drop_line(ui: &Ui, y: f32, color: Color32) {
+    let cx = ui.max_rect().center().x;
+    let bar = Rect::from_center_size(Pos2::new(cx, y), Vec2::new(42.0, 3.5));
+    ui.painter().rect_filled(bar, CornerRadius::same(2), color);
+}
+
+fn paint_group_ring(ui: &Ui, rect: Rect, color: Color32) {
+    ui.painter().rect_stroke(
+        rect.expand(2.5),
+        CornerRadius::same(16),
+        Stroke::new(2.2, color),
+        StrokeKind::Outside,
+    );
+}
+
+fn paint_folder_icon(ui: &Ui, center: Pos2, size: f32, color: Color32) {
+    let p = ui.painter();
+    let w = size;
+    let h = size * 0.78;
+    let body = Rect::from_center_size(center + Vec2::new(0.0, size * 0.06), Vec2::new(w, h));
+    let tab = Rect::from_min_size(
+        Pos2::new(body.left(), body.top() - size * 0.14),
+        Vec2::new(w * 0.44, size * 0.22),
+    );
+    p.rect_filled(tab, CornerRadius::same(3), color);
+    p.rect_filled(body, CornerRadius::same(4), color);
+}
+
+fn expanded_folder_header(
+    ui: &mut Ui,
+    app: &NixApp,
+    folder_id: u64,
+    folder_color: Color32,
+    tooltip: &str,
+) -> egui::Response {
+    let t = app.theme;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(48.0), Sense::click_and_drag());
+    let _ = folder_id;
+    if resp.hovered() {
+        ui.painter().rect_filled(
+            rect.shrink(4.0),
+            CornerRadius::same(12),
+            t.hover.gamma_multiply(0.75),
+        );
+    }
+    paint_folder_icon(ui, rect.center(), 20.0, folder_color);
+    resp.on_hover_text(tooltip)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collapsed_folder_item(
+    ui: &mut Ui,
+    app: &NixApp,
+    folder_id: u64,
+    folder_color: Color32,
+    selected: bool,
+    unread: bool,
+    mentions: u32,
+    tooltip: &str,
+    guilds: &[&Guild],
+) -> egui::Response {
+    let t = app.theme;
+    let _ = folder_id;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(48.0), Sense::click_and_drag());
+    let hovered = resp.hovered();
+    let bg = super::presence::over(
+        folder_color.gamma_multiply(if hovered { 0.38 } else { 0.26 }),
+        t.elevated,
+    );
+    ui.painter().rect_filled(rect, CornerRadius::same(16), bg);
+
+    // 2x2 mini-grid of up to 4 servers inside the folder.
+    let offsets = [
+        Vec2::new(-10.0, -10.0),
+        Vec2::new(10.0, -10.0),
+        Vec2::new(-10.0, 10.0),
+        Vec2::new(10.0, 10.0),
+    ];
+    for (g, off) in guilds.iter().take(4).zip(offsets) {
+        let mini = Rect::from_center_size(rect.center() + off, Vec2::splat(16.0));
+        let mini_round = CornerRadius::same(8);
+        let has_icon = app
+            .media
+            .borrow_mut()
+            .paint_guild_icon(ui, mini, g, mini_round);
+        if !has_icon {
+            ui.painter().rect_filled(mini, mini_round, id_color(g.id));
+            ui.painter().text(
+                mini.center(),
+                Align2::CENTER_CENTER,
+                initials(&g.name, 1),
+                bold(9.5),
+                Color32::WHITE,
+            );
+        }
+    }
+
+    if mentions > 0 {
+        let ring = super::presence::opaque_bg(t, t.rail);
+        paint_mention_badge(
+            ui,
+            Pos2::new(rect.right() + 2.0, rect.bottom() - 7.0),
+            mentions,
+            Some(ring),
+            t,
+        );
+    }
+    let pill_h = if selected {
+        40.0
+    } else if hovered {
+        20.0
+    } else if unread {
+        8.0
+    } else {
+        0.0
+    };
+    if pill_h > 0.0 {
+        let left = rect.left() - 12.0;
+        let pill = Rect::from_center_size(Pos2::new(left, rect.center().y), Vec2::new(8.0, pill_h));
+        ui.painter()
+            .rect_filled(pill, CornerRadius::same(4), t.strong);
+    }
+    resp.on_hover_text(tooltip)
+}
+
+/// Modal dialog for renaming and recoloring a server folder.
+pub fn folder_modal(ctx: &egui::Context, app: &mut NixApp, _actions: &mut Vec<Action>) {
+    let Some(mut state) = app.view.folder_modal.take() else {
+        return;
+    };
+    let t = app.theme;
+    let mut keep_open = true;
+    let mut save_clicked = false;
+    let mut ungroup_clicked = false;
+
+    let modal = Modal::new(Id::unique("folder_settings_modal")).show(ctx, |ui| {
+        ui.set_width(340.0);
+        Frame::new()
+            .fill(t.sidebar)
+            .stroke(Stroke::new(1.0, t.divider))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::same(18))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("Folder Settings")
+                        .font(bold(17.5))
+                        .color(t.strong),
+                );
+                ui.add_space(12.0);
+                ui.label(RichText::new("FOLDER NAME").font(bold(11.5)).color(t.muted));
+                ui.add_space(4.0);
+                let te_resp = Frame::new()
+                    .fill(t.elevated)
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.add(
+                            TextEdit::singleline(&mut state.name)
+                                .hint_text("Server Folder")
+                                .char_limit(32)
+                                .frame(Frame::NONE)
+                                .font(prop(14.5))
+                                .desired_width(f32::INFINITY),
+                        )
+                    })
+                    .inner;
+                if std::mem::take(&mut state.focus_name) {
+                    te_resp.request_focus();
+                }
+                if te_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    save_clicked = true;
+                }
+
+                ui.add_space(14.0);
+                ui.label(
+                    RichText::new("FOLDER COLOR")
+                        .font(bold(11.5))
+                        .color(t.muted),
+                );
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::splat(8.0);
+                    for &(swatch, label) in FOLDER_SWATCHES {
+                        let col = swatch.map(rgb_u32).unwrap_or(t.accent);
+                        let active = state.color == swatch;
+                        let (r, resp) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+                        ui.painter().circle_filled(r.center(), 12.0, col);
+                        if active {
+                            ui.painter().circle_stroke(
+                                r.center(),
+                                13.5,
+                                Stroke::new(2.0, t.strong),
+                            );
+                        }
+                        if resp
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .on_hover_text(label)
+                            .clicked()
+                        {
+                            state.color = swatch;
+                        }
+                    }
+                });
+
+                ui.add_space(18.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(ui.available_width(), 32.0),
+                    Layout::right_to_left(Align::Center),
+                    |ui| {
+                        let save_btn = ui.add(
+                            egui::Button::new(
+                                RichText::new("Save").font(bold(13.5)).color(t.on_accent),
+                            )
+                            .fill(t.accent)
+                            .corner_radius(CornerRadius::same(6))
+                            .min_size(Vec2::new(72.0, 32.0)),
+                        );
+                        if save_btn.clicked() {
+                            save_clicked = true;
+                        }
+                        let cancel_btn = ui.add(
+                            egui::Button::new(
+                                RichText::new("Cancel").font(prop(13.5)).color(t.text),
+                            )
+                            .fill(t.elevated)
+                            .corner_radius(CornerRadius::same(6))
+                            .min_size(Vec2::new(72.0, 32.0)),
+                        );
+                        if cancel_btn.clicked() {
+                            keep_open = false;
+                        }
+                        let ungroup_btn = ui.add(
+                            egui::Button::new(
+                                RichText::new("Ungroup").font(prop(13.5)).color(t.danger),
+                            )
+                            .fill(t.elevated)
+                            .corner_radius(CornerRadius::same(6))
+                            .min_size(Vec2::new(78.0, 32.0)),
+                        );
+                        if ungroup_btn.clicked() {
+                            ungroup_clicked = true;
+                        }
+                    },
+                );
+            });
+    });
+
+    if modal.should_close() {
+        keep_open = false;
+    }
+
+    if ungroup_clicked {
+        apply_rail_op(
+            &mut app.prefs.guild_layout,
+            &mut app.prefs.collapsed_folders,
+            RailOp::UngroupFolder(state.folder_id),
+        );
+    } else if save_clicked {
+        if let Some(folder) = app
+            .prefs
+            .guild_layout
+            .iter_mut()
+            .find(|f| f.id == Some(state.folder_id))
+        {
+            let trimmed = state.name.trim();
+            folder.name = (!trimmed.is_empty()).then(|| trimmed.to_string());
+            folder.color = state.color;
+        }
+    } else if keep_open {
+        app.view.folder_modal = Some(state);
+    }
 }
 
 /// One 48px rail icon (server icon, or initials on a circle) that rounds into a squircle
@@ -336,8 +1616,57 @@ fn rail_item(
     text: &str,
     guild: Option<&Guild>,
 ) -> egui::Response {
+    rail_item_with_sense(
+        ui,
+        app,
+        selected,
+        unread,
+        mentions,
+        tooltip,
+        text,
+        guild,
+        Sense::click(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rail_item_draggable(
+    ui: &mut Ui,
+    app: &NixApp,
+    selected: bool,
+    unread: bool,
+    mentions: u32,
+    tooltip: &str,
+    text: &str,
+    guild: Option<&Guild>,
+) -> egui::Response {
+    rail_item_with_sense(
+        ui,
+        app,
+        selected,
+        unread,
+        mentions,
+        tooltip,
+        text,
+        guild,
+        Sense::click_and_drag(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rail_item_with_sense(
+    ui: &mut Ui,
+    app: &NixApp,
+    selected: bool,
+    unread: bool,
+    mentions: u32,
+    tooltip: &str,
+    text: &str,
+    guild: Option<&Guild>,
+    sense: Sense,
+) -> egui::Response {
     let t = app.theme;
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(48.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(48.0), sense);
     let hovered = resp.hovered();
     let active = selected || hovered;
     // Circle -> squircle morph, animated (egui only repaints while it runs).
@@ -1056,18 +2385,19 @@ mod tests {
     #[test]
     fn context_menu_items_reflect_read_and_thread_state() {
         let gid = Snowflake(10);
-        let g_read = guild_context_items(gid, false);
+        let g_read = guild_rail_context_items(gid, false, &[]);
         assert_eq!(g_read[0].label, "Mark Server as Read");
         assert!(!g_read[0].enabled);
         assert!(g_read[0].action.is_none());
-        assert_eq!(g_read[1].label, "Copy Server ID");
-        assert!(g_read[1].enabled);
+        let copy_item = g_read.last().unwrap();
+        assert_eq!(copy_item.label, "Copy Server ID");
+        assert!(copy_item.enabled);
         assert!(matches!(
-            g_read[1].action,
+            copy_item.action,
             Some(Action::Copy(ref s)) if s == "10"
         ));
 
-        let g_unread = guild_context_items(gid, true);
+        let g_unread = guild_rail_context_items(gid, true, &[]);
         assert!(g_unread[0].enabled);
         assert!(matches!(
             g_unread[0].action,
@@ -1130,5 +2460,104 @@ mod tests {
                 locked: Some(false),
             })
         ));
+    }
+
+    #[test]
+    fn reconcile_and_rearrange_server_folders() {
+        let g1 = Snowflake(10);
+        let g2 = Snowflake(20);
+        let g3 = Snowflake(30);
+        let g4 = Snowflake(40);
+        let mut layout = Vec::new();
+        let mut collapsed = HashSet::new();
+
+        // Initial seed from remote folders + newly joined g4.
+        let remote = vec![
+            GuildFolder {
+                id: Some(500),
+                guild_ids: vec![g2, g1],
+                name: Some("Rust".into()),
+                color: Some(0xE74C3C),
+            },
+            GuildFolder {
+                id: None,
+                guild_ids: vec![g3],
+                name: None,
+                color: None,
+            },
+        ];
+        reconcile_guild_layout(&mut layout, &remote, &[g1, g2, g3, g4]);
+        assert_eq!(layout.len(), 3);
+        assert!(layout[0].is_folder());
+        assert_eq!(layout[0].guild_ids, vec![g2, g1]);
+        assert!(!layout[1].is_folder());
+        assert_eq!(layout[1].guild_ids, vec![g3]);
+        assert_eq!(layout[2].guild_ids, vec![g4]);
+
+        // Reorder within folder: Move g1 up inside folder 500 -> [g1, g2].
+        apply_rail_op(
+            &mut layout,
+            &mut collapsed,
+            RailOp::MoveGuild {
+                guild_id: g1,
+                delta: -1,
+            },
+        );
+        assert_eq!(layout[0].guild_ids, vec![g1, g2]);
+
+        // Drag g4 onto g3 to group them into a new folder.
+        apply_rail_op(
+            &mut layout,
+            &mut collapsed,
+            RailOp::Drop {
+                source: RailDrag::Guild(g4),
+                target: RailDropTarget::GroupWithGuild(g3),
+            },
+        );
+        assert_eq!(layout.len(), 2);
+        assert!(layout[1].is_folder());
+        assert_eq!(layout[1].guild_ids, vec![g3, g4]);
+        let second_fid = layout[1].id.unwrap();
+        assert_ne!(second_fid, 500);
+
+        // Move second folder above first folder.
+        apply_rail_op(
+            &mut layout,
+            &mut collapsed,
+            RailOp::MoveFolder {
+                folder_id: second_fid,
+                delta: -1,
+            },
+        );
+        assert_eq!(layout[0].id, Some(second_fid));
+        assert_eq!(layout[1].id, Some(500));
+
+        // Remove g4 from the unnamed folder -> unnamed folder unwraps back to standalone g3.
+        apply_rail_op(&mut layout, &mut collapsed, RailOp::RemoveFromFolder(g4));
+        assert_eq!(layout.len(), 3);
+        assert!(!layout[0].is_folder());
+        assert_eq!(layout[0].guild_ids, vec![g3]);
+        assert!(!layout[1].is_folder());
+        assert_eq!(layout[1].guild_ids, vec![g4]);
+        assert_eq!(layout[2].id, Some(500));
+
+        // Drag g3 before g4, then after folder 500.
+        apply_rail_op(
+            &mut layout,
+            &mut collapsed,
+            RailOp::Drop {
+                source: RailDrag::Guild(g3),
+                target: RailDropTarget::AfterFolder(500),
+            },
+        );
+        assert_eq!(layout[0].guild_ids, vec![g4]);
+        assert_eq!(layout[1].id, Some(500));
+        assert_eq!(layout[2].guild_ids, vec![g3]);
+
+        // Ungroup folder 500 -> unpacks [g1, g2] in place.
+        apply_rail_op(&mut layout, &mut collapsed, RailOp::UngroupFolder(500));
+        let top_ids: Vec<Snowflake> = layout.iter().map(|f| f.guild_ids[0]).collect();
+        assert_eq!(top_ids, vec![g4, g1, g2, g3]);
+        assert!(layout.iter().all(|f| !f.is_folder()));
     }
 }
