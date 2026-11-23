@@ -96,6 +96,50 @@ pub fn sized_url(url: &str, w: u32, h: u32) -> String {
     out
 }
 
+/// Last path segment of a URL (query and fragment dropped, `%XX` decoded), made safe as a
+/// file name. Empty if the URL has no usable segment.
+pub fn file_name(url: &str) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let path = path.split_once("://").map_or(path, |(_, rest)| rest);
+    let seg = match path.split_once('/') {
+        Some((_, p)) => p.rsplit('/').find(|s| !s.is_empty()).unwrap_or(""),
+        None => "",
+    };
+    let bytes = seg.as_bytes();
+    let mut raw = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(a), Some(b)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                raw.push((a * 16 + b) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        raw.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&raw)
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect::<String>()
+        .trim_matches([' ', '.'])
+        .to_owned()
+}
+
+/// Does the URL point at an animated or video format we only show the first frame of?
+pub fn is_animated(url: &str) -> bool {
+    let name = file_name(url).to_ascii_lowercase();
+    [".gif", ".gifv", ".mp4", ".webm", ".mov", ".apng"]
+        .iter()
+        .any(|ext| name.ends_with(ext))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +202,23 @@ mod tests {
             ),
             "https://images-ext-1.discordapp.net/external/abc/https/example.com/a.jpg?width=64&height=32"
         );
+    }
+
+    #[test]
+    fn file_names() {
+        assert_eq!(
+            file_name("https://cdn.discordapp.com/attachments/1/2/my%20cat.png?ex=a&hm=b"),
+            "my cat.png"
+        );
+        assert_eq!(file_name("https://example.com/a/b/"), "b");
+        assert_eq!(file_name("https://example.com"), "");
+        assert_eq!(
+            file_name("https://example.com/x%3A%2Fy.jpg#frag"),
+            "x__y.jpg"
+        );
+        assert_eq!(file_name("https://example.com/bad%zz.png"), "bad%zz.png");
+        assert!(is_animated("https://media.tenor.com/abc/Funny.GIF?x=1"));
+        assert!(!is_animated("https://example.com/a.png"));
     }
 
     #[test]

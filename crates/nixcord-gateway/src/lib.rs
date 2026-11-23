@@ -7,6 +7,8 @@
 //!   Resumed, Disconnected, AuthFailed) are sent too.
 //! - Returns `Ok(())` on shutdown, `Err(GatewayError::AuthFailed)` after sending
 //!   `GatewayEvent::AuthFailed`.
+//! - `run_with_commands` is `run` plus a [`GatewayCommand`] receiver (op 37 guild
+//!   subscriptions, op 3 presence), throttled by [`commands::Outbox`].
 //!
 //! Layout: [`protocol`] (payloads + dispatch decoding) and [`session`] (op/close-code
 //! state machine, backoff) are pure and unit-tested; this file is the thin network driver.
@@ -14,8 +16,11 @@
 //! `shutdown` fires when its value becomes `true`. Dropping the sender without sending
 //! `true` does not stop the gateway.
 
+pub mod commands;
 pub mod protocol;
 pub mod session;
+
+pub use commands::GatewayCommand;
 
 use std::future::pending;
 use std::time::Duration;
@@ -50,8 +55,24 @@ pub enum GatewayError {
 pub async fn run(
     token: String,
     events: mpsc::UnboundedSender<GatewayEvent>,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<(), GatewayError> {
+    let (_none, commands) = mpsc::unbounded_channel();
+    run_with_commands(token, events, shutdown, commands).await
+}
+
+/// Like [`run`], and also sends the [`GatewayCommand`]s received on `commands`
+/// (subscriptions, presence), throttled by [`commands::Outbox`]. Commands sent while
+/// disconnected are kept and sent once the next session is ready. Dropping the command
+/// sender is fine; the gateway keeps running.
+pub async fn run_with_commands(
+    token: String,
+    events: mpsc::UnboundedSender<GatewayEvent>,
+    mut shutdown: watch::Receiver<bool>,
+    commands: mpsc::UnboundedReceiver<GatewayCommand>,
+) -> Result<(), GatewayError> {
+    let mut commands = Some(commands);
+    let mut outbox = commands::Outbox::new();
     // tokio-tungstenite's rustls config needs a process-default crypto provider.
     // Err just means one is already installed.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -76,7 +97,13 @@ pub async fn run(
         let end = match connected {
             Ok(Ok((ws, _response))) => {
                 session.on_connected();
-                drive(ws, &token, &mut session, &mut backoff, &emit, &mut shutdown).await?
+                let mut io = DriveIo {
+                    emit: &emit,
+                    shutdown: &mut shutdown,
+                    commands: &mut commands,
+                    outbox: &mut outbox,
+                };
+                drive(ws, &token, &mut session, &mut backoff, &mut io).await?
             }
             Ok(Err(e)) => ConnEnd::Retry {
                 reason: format!("connect failed: {e}"),
@@ -130,17 +157,47 @@ enum ConnEnd {
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// Everything `drive` borrows from `run_with_commands` besides the session itself.
+struct DriveIo<'a, E> {
+    emit: &'a E,
+    shutdown: &'a mut watch::Receiver<bool>,
+    commands: &'a mut Option<mpsc::UnboundedReceiver<GatewayCommand>>,
+    outbox: &'a mut commands::Outbox,
+}
+
+/// Next command, or pending forever once the sender is gone (`None` is recorded).
+async fn next_command(
+    rx: &mut Option<mpsc::UnboundedReceiver<GatewayCommand>>,
+) -> Option<GatewayCommand> {
+    match rx {
+        Some(r) => r.recv().await,
+        None => pending().await,
+    }
+}
+
+async fn sleep_until_opt(at: Option<std::time::Instant>) {
+    match at {
+        Some(t) => tokio::time::sleep_until(Instant::from_std(t)).await,
+        None => pending().await,
+    }
+}
+
 /// Run one websocket connection until it ends.
-async fn drive(
+async fn drive<E>(
     ws: Ws,
     token: &str,
     session: &mut Session,
     backoff: &mut Backoff,
-    emit: &impl Fn(GatewayEvent) -> Result<(), GatewayError>,
-    shutdown: &mut watch::Receiver<bool>,
-) -> Result<ConnEnd, GatewayError> {
+    io: &mut DriveIo<'_, E>,
+) -> Result<ConnEnd, GatewayError>
+where
+    E: Fn(GatewayEvent) -> Result<(), GatewayError>,
+{
+    let emit = io.emit;
     let (mut sink, mut stream) = ws.split();
     let mut heartbeat: Option<Interval> = None;
+    // Commands are only sent once READY / RESUMED arrived on this connection.
+    let mut ready = false;
     let hello_deadline = sleep(HELLO_TIMEOUT);
     tokio::pin!(hello_deadline);
 
@@ -157,8 +214,13 @@ async fn drive(
     }
 
     loop {
+        let due = if ready {
+            io.outbox.next_due(std::time::Instant::now())
+        } else {
+            None
+        };
         let actions = tokio::select! {
-            _ = wait_for_shutdown(shutdown) => {
+            _ = wait_for_shutdown(io.shutdown) => {
                 close(&mut sink, CloseCode::Normal).await;
                 return Ok(ConnEnd::Shutdown);
             }
@@ -167,6 +229,19 @@ async fn drive(
                 return Ok(ConnEnd::Retry { reason: "no Hello from gateway".into(), delay: RetryDelay::Backoff });
             }
             _ = tick(&mut heartbeat) => session.on_heartbeat_tick(),
+            cmd = next_command(io.commands) => {
+                match cmd {
+                    Some(c) => io.outbox.push(c),
+                    None => *io.commands = None,
+                }
+                Vec::new()
+            }
+            _ = sleep_until_opt(due) => io
+                .outbox
+                .take_due(std::time::Instant::now())
+                .into_iter()
+                .map(Action::SendRaw)
+                .collect(),
             msg = stream.next() => match msg {
                 Some(Ok(Message::Text(text))) => session.handle_text(text.as_str()),
                 Some(Ok(Message::Close(frame))) => {
@@ -205,9 +280,20 @@ async fn drive(
                         });
                     }
                 }
+                Action::SendRaw(payload) => {
+                    if let Err(e) = sink.send(Message::text(payload)).await {
+                        return Ok(ConnEnd::Retry {
+                            reason: format!("send failed: {e}"),
+                            delay: RetryDelay::Backoff,
+                        });
+                    }
+                }
                 Action::Emit(ev) => {
                     if matches!(ev, GatewayEvent::Ready(_) | GatewayEvent::Resumed) {
                         backoff.reset();
+                        ready = true;
+                        io.outbox
+                            .on_session_start(matches!(ev, GatewayEvent::Ready(_)));
                     }
                     emit(ev)?;
                 }

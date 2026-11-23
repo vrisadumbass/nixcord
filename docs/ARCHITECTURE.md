@@ -37,7 +37,10 @@ never depend on each other.
 
 - Messages: `MAX_MESSAGES_PER_CHANNEL = 250`, oldest evicted.
 - Only rendered fields are deserialized (unknown JSON ignored).
-- No member lists or presences in v0.1 (largest RAM consumers in the official client).
+- Presences: one per user, kept only while online or with an activity. Member list: only
+  the focused guild, at most `MEMBER_LIST_MAX_ROWS = 300` rows (three 100-row ranges);
+  switching guilds drops the old list and the presences only it referenced. Rows hold
+  user ids only.
 - Avatars/images: not in v0.1. Later: lazy-load, LRU texture cache with a byte cap.
 
 ## Gateway details
@@ -50,6 +53,17 @@ never depend on each other.
 - Resume (op 6) using `session_id`, `seq`, `resume_gateway_url`. Op 7 -> resume; op 9
   (invalid session) -> wait 1-5 s, re-identify unless `d == true`.
 - Close codes 4004 -> `AuthFailed`, stop. 4010-4014 -> fatal, stop. Others -> backoff retry.
+- App -> gateway commands (`run_with_commands`): op 37 Guild Subscriptions Bulk (member
+  list ranges, typing, activities for the open guild channel) and op 3 Presence Update
+  (own status). Coalesced and throttled (op 37 at most every 750 ms, op 3 every 4 s;
+  Discord allows 5 presence updates per 20 s), sent only after READY/RESUMED.
+- Decoded user-account events: PRESENCE_UPDATE, GUILD_MEMBER_LIST_UPDATE
+  (SYNC/INSERT/UPDATE/DELETE/INVALIDATE), READY_SUPPLEMENTAL, RELATIONSHIP_ADD/REMOVE,
+  SESSIONS_REPLACE (own status), GUILD_MEMBER_UPDATE. Payload shapes and sources are
+  documented in `nixcord-gateway/src/protocol.rs`.
+- Permissions: the store computes VIEW_CHANNEL / SEND_MESSAGES with Discord's documented
+  algorithm from roles, overwrites and our own member (READY `guilds[].members` /
+  `merged_members`, GUILD_MEMBER_UPDATE). Unknown member data fails open.
 
 ## Themes
 

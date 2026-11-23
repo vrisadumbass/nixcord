@@ -4,7 +4,7 @@
 use crate::disk::DiskCache;
 use crate::{decode, url, Failure, Image, Key, Loaded};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -42,11 +42,26 @@ impl Default for Config {
 
 /// Handle to the background fetcher. Dropping it shuts the runtime down.
 pub struct Fetcher {
-    tx: mpsc::UnboundedSender<Key>,
+    tx: mpsc::UnboundedSender<Req>,
     rx: std_mpsc::Receiver<Loaded>,
 }
 
 type Wake = Arc<dyn Fn() + Send + Sync>;
+
+/// Called once a [`Fetcher::save`] finishes: bytes written, or a short reason.
+pub type SaveDone = Box<dyn FnOnce(Result<u64, String>) + Send>;
+
+/// Largest file [`Fetcher::save`] writes (Discord's biggest upload limit).
+const MAX_SAVE_BYTES: u64 = 500 * 1024 * 1024;
+
+enum Req {
+    Load(Key),
+    Save {
+        url: String,
+        path: PathBuf,
+        done: SaveDone,
+    },
+}
 
 struct Shared {
     client: reqwest::Client,
@@ -65,7 +80,7 @@ impl Fetcher {
     /// Start the fetcher thread. `wake` is called after every finished request (pass
     /// `move || ctx.request_repaint()`).
     pub fn spawn(config: Config, wake: impl Fn() + Send + Sync + 'static) -> std::io::Result<Self> {
-        let (tx, mut req_rx) = mpsc::unbounded_channel::<Key>();
+        let (tx, mut req_rx) = mpsc::unbounded_channel::<Req>();
         let (out, rx) = std_mpsc::channel();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -108,11 +123,22 @@ impl Fetcher {
                             }
                         });
                     }
-                    while let Some(key) = req_rx.recv().await {
-                        if !lock(&shared.in_flight).insert(key.clone()) {
-                            continue; // already being fetched
+                    while let Some(req) = req_rx.recv().await {
+                        match req {
+                            Req::Load(key) => {
+                                if !lock(&shared.in_flight).insert(key.clone()) {
+                                    continue; // already being fetched
+                                }
+                                tokio::spawn(job(shared.clone(), key));
+                            }
+                            Req::Save { url, path, done } => {
+                                let s = shared.clone();
+                                tokio::spawn(async move {
+                                    done(save_to(&s.client, &url, &path).await);
+                                    (s.wake)();
+                                });
+                            }
                         }
-                        tokio::spawn(job(shared.clone(), key));
                     }
                 });
             })?;
@@ -121,7 +147,18 @@ impl Fetcher {
 
     /// Fire-and-forget. Duplicate requests for an in-flight key are ignored.
     pub fn request(&self, key: Key) {
-        let _ = self.tx.send(key);
+        let _ = self.tx.send(Req::Load(key));
+    }
+
+    /// Download `url` as-is (original bytes, no decode, no disk cache) into `path`, streaming
+    /// to the file. `done` runs on the fetcher thread when it finishes; a partial file is
+    /// removed on failure.
+    pub fn save(&self, url: impl Into<String>, path: PathBuf, done: SaveDone) {
+        let _ = self.tx.send(Req::Save {
+            url: url.into(),
+            path,
+            done,
+        });
     }
 
     /// Next finished request, if any. Never blocks.
@@ -211,6 +248,48 @@ async fn download(client: &reqwest::Client, url: &str, max: usize) -> Result<Vec
     }
     buf.shrink_to_fit();
     Ok(buf)
+}
+
+async fn save_to(client: &reqwest::Client, url: &str, path: &Path) -> Result<u64, String> {
+    use std::io::Write;
+    let mut resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|_| "network error".to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status().as_u16()));
+    }
+    if resp.content_length().unwrap_or(0) > MAX_SAVE_BYTES {
+        return Err("file is too large".into());
+    }
+    let mut file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    let mut written = 0u64;
+    let result = async {
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|_| "download interrupted".to_string())?
+        {
+            written += chunk.len() as u64;
+            if written > MAX_SAVE_BYTES {
+                return Err("file is too large".to_string());
+            }
+            // Chunks are small (tens of KB); a buffered write here is cheaper than a hop to
+            // the blocking pool.
+            file.write_all(&chunk).map_err(|e| e.to_string())?;
+        }
+        file.flush().map_err(|e| e.to_string())
+    }
+    .await;
+    drop(file);
+    match result {
+        Ok(()) => Ok(written),
+        Err(e) => {
+            let _ = std::fs::remove_file(path);
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]

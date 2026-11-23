@@ -26,6 +26,7 @@ fn chan(id: u64, kind: ChannelKind, guild: Option<u64>, parent: Option<u64>, pos
         parent_id: parent.map(sf),
         recipients: Vec::new(),
         last_message_id: None,
+        ..Default::default()
     }
 }
 
@@ -46,6 +47,7 @@ fn guild(id: u64, channels: Vec<Channel>) -> Guild {
         channels,
         roles: Vec::new(),
         unavailable: false,
+        ..Default::default()
     }
 }
 
@@ -72,6 +74,7 @@ fn ready(me: u64, guilds: Vec<Guild>, private: Vec<Channel>) -> GatewayEvent {
         private_channels: private,
         session_id: "s".into(),
         resume_gateway_url: None,
+        ..Default::default()
     }))
 }
 
@@ -671,6 +674,7 @@ fn role(id: u64, color: u32, position: i32) -> nixcord_model::Role {
         name: format!("r{id}"),
         color,
         position,
+        ..Default::default()
     }
 }
 
@@ -991,4 +995,504 @@ fn member_top_role_ignores_color() {
         Some(sf(501))
     );
     assert!(s.member_top_role(sf(100), sf(99)).is_none());
+}
+
+// ---- presence, relationships --------------------------------------------------------
+
+use nixcord_model::{
+    ListMember, MemberListGroup, MemberListItem, MemberListOp, MemberListUpdate, Overwrite,
+    OverwriteKind, Presence, ReadySupplemental, Relationship, RelationshipKind, Status,
+};
+
+fn presence(user: u64, status: Status) -> Presence {
+    Presence {
+        user_id: sf(user),
+        status,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn presences_from_ready_updates_and_offline_drop() {
+    let mut s = Store::new();
+    s.apply(&GatewayEvent::Ready(Box::new(Ready {
+        user: user(1),
+        session_id: "s".into(),
+        presences: vec![presence(2, Status::Online)],
+        relationships: vec![
+            Relationship {
+                id: sf(2),
+                kind: RelationshipKind::Friend,
+                user: Some(user(2)),
+                nickname: None,
+            },
+            Relationship {
+                id: sf(3),
+                kind: RelationshipKind::Blocked,
+                user: Some(user(3)),
+                nickname: None,
+            },
+        ],
+        status: Some(Status::Dnd),
+        ..Default::default()
+    })));
+    assert_eq!(s.status(sf(2)), Status::Online);
+    assert_eq!(s.status(sf(99)), Status::Offline);
+    assert_eq!(s.my_status(), Status::Dnd);
+    assert_eq!(s.status(sf(1)), Status::Dnd, "own status from settings");
+    let friends: Vec<u64> = s.friends().iter().map(|u| u.id.0).collect();
+    assert_eq!(friends, vec![2]);
+
+    s.apply(&GatewayEvent::PresenceUpdate {
+        presence: Box::new(presence(2, Status::Idle)),
+        user: None,
+    });
+    assert_eq!(s.status(sf(2)), Status::Idle);
+    s.apply(&GatewayEvent::PresenceUpdate {
+        presence: Box::new(presence(2, Status::Offline)),
+        user: None,
+    });
+    assert!(
+        s.presence(sf(2)).is_none(),
+        "offline without activity not stored"
+    );
+
+    s.apply(&GatewayEvent::ReadySupplemental(Box::new(
+        ReadySupplemental {
+            presences: vec![presence(4, Status::Dnd)],
+        },
+    )));
+    assert_eq!(s.status(sf(4)), Status::Dnd);
+    s.apply(&GatewayEvent::OwnStatus(Status::Invisible));
+    assert_eq!(
+        s.status(sf(1)),
+        Status::Offline,
+        "invisible shows as offline"
+    );
+    s.apply(&GatewayEvent::RelationshipRemove { user_id: sf(2) });
+    assert!(s.friends().is_empty());
+}
+
+// ---- member list ---------------------------------------------------------------------
+
+fn group(id: &str, count: u32) -> MemberListItem {
+    MemberListItem::Group(MemberListGroup {
+        id: id.into(),
+        count,
+    })
+}
+
+fn member_item(id: u64, status: Option<Status>) -> MemberListItem {
+    MemberListItem::Member(Box::new(ListMember {
+        member: nixcord_model::GuildMember {
+            user: Some(user(id)),
+            roles: vec![sf(500)],
+            nick: (id == 11).then(|| "Nick".to_string()),
+            ..Default::default()
+        },
+        presence: status.map(|st| presence(id, st)),
+    }))
+}
+
+fn list_update(guild: u64, ops: Vec<MemberListOp>) -> GatewayEvent {
+    GatewayEvent::MemberListUpdate(Box::new(MemberListUpdate {
+        id: "everyone".into(),
+        guild_id: sf(guild),
+        member_count: 3,
+        online_count: 2,
+        groups: vec![
+            MemberListGroup {
+                id: "online".into(),
+                count: 2,
+            },
+            MemberListGroup {
+                id: "offline".into(),
+                count: 1,
+            },
+        ],
+        ops,
+    }))
+}
+
+fn rows(s: &Store, g: u64) -> Vec<String> {
+    s.member_list(sf(g))
+        .unwrap()
+        .rows()
+        .iter()
+        .map(|r| match r {
+            Some(ListRow::Group(g)) => format!("[{}]", g.id),
+            Some(ListRow::Member(id)) => id.0.to_string(),
+            None => "-".into(),
+        })
+        .collect()
+}
+
+fn synced_store() -> Store {
+    let mut s = Store::new();
+    s.apply(&ready(1, vec![guild(7, vec![])], vec![]));
+    s.set_member_list_focus(Some(sf(7)));
+    s.apply(&list_update(
+        7,
+        vec![MemberListOp::Sync {
+            range: (0, 99),
+            items: vec![
+                group("online", 2),
+                member_item(10, Some(Status::Online)),
+                member_item(11, Some(Status::Dnd)),
+                group("offline", 1),
+                member_item(12, None),
+            ],
+        }],
+    ));
+    s
+}
+
+#[test]
+fn member_list_sync_caches_members_and_presences() {
+    let s = synced_store();
+    assert_eq!(rows(&s, 7), vec!["[online]", "10", "11", "[offline]", "12"]);
+    assert_eq!(s.status(sf(11)), Status::Dnd);
+    assert_eq!(s.status(sf(12)), Status::Offline);
+    assert_eq!(s.member_nick(sf(7), sf(11)), Some("Nick"));
+    assert_eq!(s.user(sf(12)).unwrap().username, "user12");
+    let list = s.member_list(sf(7)).unwrap();
+    assert_eq!(list.total_rows(), 5);
+    let sections = list.sections();
+    assert_eq!(sections.len(), 2);
+    assert_eq!(sections[0].group.id, "online");
+    assert_eq!(sections[0].group.count, 2);
+    assert_eq!(sections[0].members, vec![sf(10), sf(11)]);
+    assert_eq!(sections[1].members, vec![sf(12)]);
+}
+
+#[test]
+fn member_list_insert_update_delete_invalidate() {
+    let mut s = synced_store();
+    // 12 comes online: Discord deletes the offline row and inserts it under online.
+    s.apply(&list_update(
+        7,
+        vec![
+            MemberListOp::Delete { index: 4 },
+            MemberListOp::Insert {
+                index: 1,
+                item: member_item(12, Some(Status::Idle)),
+            },
+        ],
+    ));
+    assert_eq!(rows(&s, 7), vec!["[online]", "12", "10", "11", "[offline]"]);
+    assert_eq!(s.status(sf(12)), Status::Idle);
+
+    s.apply(&list_update(
+        7,
+        vec![MemberListOp::Update {
+            index: 2,
+            item: member_item(10, Some(Status::Dnd)),
+        }],
+    ));
+    assert_eq!(s.status(sf(10)), Status::Dnd);
+    assert_eq!(rows(&s, 7).len(), 5);
+
+    // Out-of-range ops are harmless.
+    s.apply(&list_update(
+        7,
+        vec![
+            MemberListOp::Delete { index: 50 },
+            MemberListOp::Update {
+                index: 7,
+                item: MemberListItem::Unknown,
+            },
+        ],
+    ));
+    assert_eq!(rows(&s, 7).len(), 5, "trailing unknown rows trimmed");
+
+    s.apply(&list_update(
+        7,
+        vec![MemberListOp::Invalidate { range: (0, 99) }],
+    ));
+    assert!(rows(&s, 7).is_empty());
+}
+
+#[test]
+fn member_list_resync_shorter_and_second_range() {
+    let mut s = synced_store();
+    s.apply(&list_update(
+        7,
+        vec![MemberListOp::Sync {
+            range: (0, 99),
+            items: vec![group("online", 1), member_item(10, Some(Status::Online))],
+        }],
+    ));
+    assert_eq!(rows(&s, 7), vec!["[online]", "10"], "stale tail dropped");
+    s.apply(&list_update(
+        7,
+        vec![MemberListOp::Sync {
+            range: (100, 199),
+            items: vec![member_item(20, None)],
+        }],
+    ));
+    let r = rows(&s, 7);
+    assert_eq!(r.len(), 101);
+    assert_eq!(r[100], "20");
+    assert_eq!(r[50], "-");
+}
+
+#[test]
+fn member_list_is_capped() {
+    let mut s = synced_store();
+    let items: Vec<MemberListItem> = (0..100).map(|i| member_item(1000 + i, None)).collect();
+    for start in [100u32, 200, 300, 400] {
+        s.apply(&list_update(
+            7,
+            vec![MemberListOp::Sync {
+                range: (start, start + 99),
+                items: items.clone(),
+            }],
+        ));
+    }
+    assert_eq!(rows(&s, 7).len(), MEMBER_LIST_MAX_ROWS);
+    s.apply(&list_update(
+        7,
+        vec![MemberListOp::Insert {
+            index: 0,
+            item: group("x", 1),
+        }],
+    ));
+    assert_eq!(
+        rows(&s, 7).len(),
+        MEMBER_LIST_MAX_ROWS,
+        "insert keeps the cap"
+    );
+}
+
+#[test]
+fn member_list_focus_ignores_and_drops_other_guilds() {
+    let mut s = synced_store();
+    // Updates for an unfocused guild are ignored.
+    s.apply(&list_update(
+        8,
+        vec![MemberListOp::Sync {
+            range: (0, 99),
+            items: vec![member_item(30, Some(Status::Online))],
+        }],
+    ));
+    assert!(s.member_list(sf(8)).is_none());
+    assert!(s.presence(sf(30)).is_none());
+
+    // A list with a different id needs a SYNC before it replaces the current one.
+    let mut other = match list_update(7, vec![MemberListOp::Delete { index: 0 }]) {
+        GatewayEvent::MemberListUpdate(u) => u,
+        _ => unreachable!(),
+    };
+    other.id = "123".into();
+    s.apply(&GatewayEvent::MemberListUpdate(other));
+    assert_eq!(s.member_list(sf(7)).unwrap().id, "everyone");
+
+    s.set_member_list_focus(Some(sf(8)));
+    assert!(s.member_list(sf(7)).is_none(), "old list dropped");
+    assert!(s.presence(sf(10)).is_none(), "its presences dropped");
+    assert_eq!(
+        s.member_nick(sf(7), sf(11)),
+        None,
+        "its member rows dropped"
+    );
+}
+
+#[test]
+fn member_list_drop_keeps_friends_and_message_members() {
+    let mut s = synced_store();
+    s.apply(&GatewayEvent::RelationshipAdd(Box::new(Relationship {
+        id: sf(10),
+        kind: RelationshipKind::Friend,
+        user: None,
+        nickname: None,
+    })));
+    let ch = chan(70, ChannelKind::Text, Some(7), None, 0);
+    s.apply(&GatewayEvent::ChannelCreate(Box::new(ch)));
+    let mut m = msg(1, 70, 11);
+    m.guild_id = Some(sf(7));
+    m.member = Some(nixcord_model::PartialMember {
+        nick: Some("FromMsg".into()),
+        ..Default::default()
+    });
+    s.insert_history(sf(70), vec![m]);
+    s.set_member_list_focus(None);
+    assert_eq!(s.status(sf(10)), Status::Online, "friend presence kept");
+    assert_eq!(s.member_nick(sf(7), sf(11)), Some("FromMsg"));
+}
+
+#[test]
+fn ready_bumps_epoch() {
+    let mut s = Store::new();
+    assert_eq!(s.epoch(), 0);
+    s.apply(&ready(1, vec![], vec![]));
+    s.apply(&ready(1, vec![], vec![]));
+    assert_eq!(s.epoch(), 2);
+}
+
+// ---- permissions -----------------------------------------------------------------------
+
+use nixcord_model::permissions::{ADMINISTRATOR, SEND_MESSAGES, VIEW_CHANNEL};
+
+const ME: u64 = 1;
+const G: u64 = 900;
+const ROLE_A: u64 = 901;
+const ROLE_B: u64 = 902;
+
+fn prole(id: u64, perms: u64) -> nixcord_model::Role {
+    nixcord_model::Role {
+        id: sf(id),
+        name: format!("r{id}"),
+        permissions: perms,
+        ..Default::default()
+    }
+}
+
+fn ow(id: u64, kind: OverwriteKind, allow: u64, deny: u64) -> Overwrite {
+    Overwrite {
+        id: sf(id),
+        kind,
+        allow,
+        deny,
+    }
+}
+
+fn pchan(id: u64, parent: Option<u64>, ows: Vec<Overwrite>) -> Channel {
+    Channel {
+        permission_overwrites: ows,
+        ..chan(id, ChannelKind::Text, Some(G), parent, id as i32)
+    }
+}
+
+/// Guild G: @everyone can view + send; ROLE_A has nothing extra; ROLE_B is admin.
+fn perm_store(my_roles: &[u64], owner: Option<u64>, channels: Vec<Channel>) -> Store {
+    let mut g = guild(G, channels);
+    g.owner_id = owner.map(sf);
+    g.roles = vec![
+        prole(G, VIEW_CHANNEL | SEND_MESSAGES),
+        prole(ROLE_A, 0),
+        prole(ROLE_B, ADMINISTRATOR),
+    ];
+    g.members = vec![nixcord_model::GuildMember {
+        user: Some(user(ME)),
+        roles: my_roles.iter().copied().map(sf).collect(),
+        ..Default::default()
+    }];
+    let mut s = Store::new();
+    s.apply(&ready(ME, vec![g], vec![dm(5, None, 2)]));
+    s
+}
+
+fn deny_everyone_view() -> Overwrite {
+    ow(G, OverwriteKind::Role, 0, VIEW_CHANNEL)
+}
+
+#[test]
+fn permissions_everyone_deny_with_role_allow() {
+    let ows = vec![
+        deny_everyone_view(),
+        ow(ROLE_A, OverwriteKind::Role, VIEW_CHANNEL, 0),
+    ];
+    let s = perm_store(
+        &[ROLE_A],
+        None,
+        vec![pchan(10, None, ows.clone()), pchan(11, None, vec![])],
+    );
+    assert!(s.can_view(sf(10)), "role allow beats @everyone deny");
+    assert!(s.can_send(sf(10)));
+    assert!(s.can_view(sf(11)));
+    let s = perm_store(&[], None, vec![pchan(10, None, ows)]);
+    assert!(!s.can_view(sf(10)));
+    assert!(!s.can_send(sf(10)), "no send without view");
+}
+
+#[test]
+fn permissions_role_deny_and_member_overwrite() {
+    // A role deny of SEND makes the channel read-only ...
+    let ro = vec![ow(ROLE_A, OverwriteKind::Role, 0, SEND_MESSAGES)];
+    let s = perm_store(&[ROLE_A], None, vec![pchan(10, None, ro.clone())]);
+    assert!(s.can_view(sf(10)));
+    assert!(!s.can_send(sf(10)));
+    // ... and a member overwrite wins over role overwrites.
+    let mut with_member = ro;
+    with_member.push(ow(ME, OverwriteKind::Member, SEND_MESSAGES, 0));
+    let s = perm_store(&[ROLE_A], None, vec![pchan(10, None, with_member)]);
+    assert!(s.can_send(sf(10)), "member allow beats role deny");
+    let ows = vec![
+        deny_everyone_view(),
+        ow(ME, OverwriteKind::Member, VIEW_CHANNEL | SEND_MESSAGES, 0),
+    ];
+    let s = perm_store(&[], None, vec![pchan(10, None, ows)]);
+    assert!(s.can_view(sf(10)));
+    assert!(s.can_send(sf(10)));
+    let ows = vec![
+        ow(ROLE_A, OverwriteKind::Role, VIEW_CHANNEL, 0),
+        ow(ME, OverwriteKind::Member, 0, VIEW_CHANNEL),
+    ];
+    let s = perm_store(&[ROLE_A], None, vec![pchan(10, None, ows)]);
+    assert!(!s.can_view(sf(10)), "member deny beats role allow");
+    // A role overwrite for a role I don't have does nothing.
+    let ows = vec![ow(ROLE_A, OverwriteKind::Role, 0, VIEW_CHANNEL)];
+    let s = perm_store(&[], None, vec![pchan(10, None, ows)]);
+    assert!(s.can_view(sf(10)));
+}
+
+#[test]
+fn permissions_admin_and_owner_see_everything() {
+    let ows = vec![
+        deny_everyone_view(),
+        ow(ME, OverwriteKind::Member, 0, VIEW_CHANNEL),
+    ];
+    let s = perm_store(&[ROLE_B], None, vec![pchan(10, None, ows.clone())]);
+    assert!(s.can_view(sf(10)) && s.can_send(sf(10)), "administrator");
+    let s = perm_store(&[], Some(ME), vec![pchan(10, None, ows)]);
+    assert!(s.can_view(sf(10)) && s.can_send(sf(10)), "owner");
+}
+
+#[test]
+fn permissions_fail_open_and_dms() {
+    let ows = vec![deny_everyone_view()];
+    let mut g = guild(G, vec![pchan(10, None, ows)]);
+    g.roles = vec![prole(G, VIEW_CHANNEL)];
+    let mut s = Store::new();
+    s.apply(&ready(ME, vec![g], vec![dm(5, None, 2)]));
+    assert_eq!(s.channel_permissions(sf(10)), None, "my member unknown");
+    assert!(s.can_view(sf(10)) && s.can_send(sf(10)));
+    assert!(s.can_view(sf(5)) && s.can_send(sf(5)), "DMs always");
+    assert!(!s.can_view(sf(12345)), "unknown channel");
+
+    // GUILD_MEMBER_UPDATE for me makes permissions known.
+    s.apply(&GatewayEvent::GuildMemberUpdate {
+        guild_id: sf(G),
+        member: Box::new(nixcord_model::GuildMember {
+            user: Some(user(ME)),
+            ..Default::default()
+        }),
+    });
+    assert!(!s.can_view(sf(10)));
+}
+
+#[test]
+fn visible_channels_hide_denied_hidden_and_empty_categories() {
+    let cat = |id: u64| Channel {
+        kind: ChannelKind::Category,
+        ..pchan(id, None, vec![])
+    };
+    let mut hidden_name = pchan(13, Some(100), vec![]);
+    hidden_name.name = Some(HIDDEN_CHANNEL_NAME.into());
+    let channels = vec![
+        cat(100),
+        pchan(11, Some(100), vec![]),
+        pchan(12, Some(100), vec![deny_everyone_view()]),
+        hidden_name,
+        cat(200),
+        pchan(21, Some(200), vec![deny_everyone_view()]),
+        cat(300),
+    ];
+    let s = perm_store(&[], None, channels);
+    let ids: Vec<u64> = s
+        .visible_guild_channels(sf(G))
+        .iter()
+        .map(|c| c.id.0)
+        .collect();
+    assert_eq!(ids, vec![100, 11]);
 }

@@ -127,7 +127,9 @@ pub fn header(ui: &mut Ui, app: &mut NixApp, ch: Snowflake) {
             ui.spacing_mut().item_spacing.x = 6.0;
             match &dm_user {
                 Some(u) => {
-                    app.media.borrow_mut().avatar(ui, u, None, 24.0);
+                    let r = app.media.borrow_mut().avatar(ui, u, None, 24.0).rect;
+                    let ring = super::presence::opaque_bg(t, t.header);
+                    super::presence::paint_user_status(ui, app, u.id, r.center(), 24.0, ring);
                 }
                 None => {
                     ui.label(
@@ -194,10 +196,9 @@ pub fn empty_state(ui: &mut Ui, app: &mut NixApp) {
 /// Group of the member panel: (role position, role id) for sorting, header, members.
 type MemberGroup<'a> = (Option<(i32, Snowflake)>, &'a str, Vec<&'a Message>);
 
-/// No member list in v0.1: unique authors of the loaded messages (newest first), grouped
-/// under their highest role like Discord's list.
+/// The member panel: Discord's member list for guild channels (from
+/// GUILD_MEMBER_LIST_UPDATE), the participants for DMs.
 pub fn members(ui: &mut Ui, app: &mut NixApp, ch: Snowflake) {
-    let app: &NixApp = app;
     let t = app.theme;
     let outer = ui.max_rect().expand(8.0);
     ui.painter().vline(
@@ -205,6 +206,20 @@ pub fn members(ui: &mut Ui, app: &mut NixApp, ch: Snowflake) {
         outer.y_range(),
         Stroke::new(1.0, t.divider),
     );
+    match app.store.channel(ch).and_then(|c| c.guild_id) {
+        Some(g) => {
+            if !super::presence::guild_member_list(ui, app, g, ch) {
+                recent_authors(ui, app, ch);
+            }
+        }
+        None => super::presence::private_member_list(ui, app, ch),
+    }
+}
+
+/// Until the member list arrives (or if Discord never sends one): unique authors of the
+/// loaded messages (newest first), grouped under their highest role.
+fn recent_authors(ui: &mut Ui, app: &NixApp, ch: Snowflake) {
+    let t = app.theme;
     let guild = app.store.channel(ch).and_then(|c| c.guild_id);
     let mut seen = HashSet::new();
     let mut groups: Vec<MemberGroup<'_>> = Vec::new();
@@ -357,6 +372,7 @@ fn estimate(row: Row, msgs: &[Message], width: f32) -> f32 {
                 h += if is_image(a) { 304.0 } else { 72.0 };
             }
             h += m.embeds.len() as f32 * 160.0;
+            h += super::components::estimate(&m.components, w);
             if !m.reactions.is_empty() {
                 h += 32.0;
             }
@@ -724,12 +740,15 @@ fn message_row(
     if !m.content.is_empty() {
         mentions_me = content(&mut child, app, m, actions);
     }
-    for a in &m.attachments {
+    // Components V2 messages show attachments only where a component references them.
+    let v2 = m.flags & nixcord_model::components::IS_COMPONENTS_V2 != 0;
+    for a in m.attachments.iter().filter(|_| !v2) {
         attachment(&mut child, app, a);
     }
     for (i, e) in m.embeds.iter().enumerate() {
         embed_card(&mut child, app, m, i, e, actions);
     }
+    mentions_me |= super::components::show(&mut child, app, m, actions);
     reactions_row(&mut child, app, m, actions);
 
     let bottom = child.min_rect().bottom().max(first_line_y + 20.0) + 3.0;

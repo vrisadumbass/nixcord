@@ -1,0 +1,209 @@
+//! Commands the app sends *to* the gateway, and the pure outbox that throttles and
+//! coalesces them. Holds no token and does no I/O.
+//!
+//! - Guild subscriptions are merged per guild (latest wins) and flushed as one op 37
+//!   (Guild Subscriptions Bulk) at most every [`SUBSCRIBE_INTERVAL`].
+//! - Presence updates (op 3) are rate limited by Discord to 5 per 20 s; we send at most
+//!   one every [`PRESENCE_INTERVAL`], keeping only the latest wanted status. After a fresh
+//!   session (READY, not RESUMED) the last status is sent again, since a new session
+//!   starts with the account's default status.
+//! - Nothing is sent before the session is ready.
+
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
+
+use nixcord_model::{Snowflake, Status};
+
+use crate::protocol::{self, GuildSubscription};
+
+pub const SUBSCRIBE_INTERVAL: Duration = Duration::from_millis(750);
+pub const PRESENCE_INTERVAL: Duration = Duration::from_secs(4);
+/// The official client never sends more than a handful of ranges per channel.
+pub const MAX_RANGES: usize = 5;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayCommand {
+    /// Subscribe to a guild's events and the member list of `channel_id` for the given
+    /// inclusive row ranges (normally `[(0, 99)]`). Empty `ranges` unsubscribes.
+    SubscribeGuild {
+        guild_id: Snowflake,
+        channel_id: Snowflake,
+        ranges: Vec<(u32, u32)>,
+    },
+    /// Set our own status (op 3).
+    SetPresence { status: Status },
+}
+
+#[derive(Debug, Default)]
+pub struct Outbox {
+    subs: BTreeMap<Snowflake, GuildSubscription>,
+    presence: Option<Status>,
+    last_presence: Option<Status>,
+    sub_sent: Option<Instant>,
+    presence_sent: Option<Instant>,
+}
+
+impl Outbox {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, cmd: GatewayCommand) {
+        match cmd {
+            GatewayCommand::SubscribeGuild {
+                guild_id,
+                channel_id,
+                ranges,
+            } => {
+                let mut ranges: Vec<(u32, u32)> =
+                    ranges.into_iter().filter(|(a, b)| a <= b).collect();
+                ranges.truncate(MAX_RANGES);
+                self.subs
+                    .insert(guild_id, GuildSubscription { channel_id, ranges });
+            }
+            GatewayCommand::SetPresence { status } => {
+                self.presence = Some(status);
+                self.last_presence = Some(status);
+            }
+        }
+    }
+
+    /// A session became usable. `fresh` is true after READY (new session), false after
+    /// RESUMED.
+    pub fn on_session_start(&mut self, fresh: bool) {
+        if fresh && self.presence.is_none() {
+            self.presence = self.last_presence;
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.subs.is_empty() && self.presence.is_none()
+    }
+
+    /// Earliest time something can be sent, `None` if nothing is pending.
+    pub fn next_due(&self, now: Instant) -> Option<Instant> {
+        let due = |last: Option<Instant>, every: Duration| last.map_or(now, |t| t + every);
+        let subs = (!self.subs.is_empty()).then(|| due(self.sub_sent, SUBSCRIBE_INTERVAL));
+        let pres = self
+            .presence
+            .is_some()
+            .then(|| due(self.presence_sent, PRESENCE_INTERVAL));
+        match (subs, pres) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Payloads that may be sent at `now`.
+    pub fn take_due(&mut self, now: Instant) -> Vec<String> {
+        let mut out = Vec::new();
+        let ready = |last: Option<Instant>, every: Duration| last.is_none_or(|t| now >= t + every);
+        if !self.subs.is_empty() && ready(self.sub_sent, SUBSCRIBE_INTERVAL) {
+            out.push(protocol::guild_subscriptions_payload(&self.subs));
+            self.subs.clear();
+            self.sub_sent = Some(now);
+        }
+        if self.presence.is_some() && ready(self.presence_sent, PRESENCE_INTERVAL) {
+            if let Some(status) = self.presence.take() {
+                out.push(protocol::presence_payload(status));
+                self.presence_sent = Some(now);
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    fn sub(g: u64, c: u64, ranges: Vec<(u32, u32)>) -> GatewayCommand {
+        GatewayCommand::SubscribeGuild {
+            guild_id: Snowflake(g),
+            channel_id: Snowflake(c),
+            ranges,
+        }
+    }
+
+    fn v(s: &str) -> Value {
+        serde_json::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn coalesces_and_throttles_subscriptions() {
+        let t0 = Instant::now();
+        let mut o = Outbox::new();
+        assert!(o.next_due(t0).is_none());
+        o.push(sub(1, 10, vec![(0, 99)]));
+        o.push(sub(1, 11, vec![(0, 99), (100, 199)]));
+        o.push(sub(2, 20, vec![]));
+        assert_eq!(o.next_due(t0), Some(t0));
+        let sent = o.take_due(t0);
+        assert_eq!(sent.len(), 1, "one bulk op for all guilds");
+        let p = v(&sent[0]);
+        assert_eq!(p["op"], 37);
+        let s = &p["d"]["subscriptions"];
+        assert_eq!(s["1"]["channels"]["11"], v("[[0,99],[100,199]]"));
+        assert!(s["1"]["channels"].get("10").is_none(), "latest wins");
+        assert_eq!(s["1"]["typing"], true);
+        assert_eq!(s["2"]["channels"], v("{}"));
+        assert!(o.is_empty());
+
+        // Next one waits for the interval.
+        o.push(sub(1, 12, vec![(0, 99)]));
+        assert!(o.take_due(t0).is_empty());
+        assert_eq!(o.next_due(t0), Some(t0 + SUBSCRIBE_INTERVAL));
+        assert_eq!(o.take_due(t0 + SUBSCRIBE_INTERVAL).len(), 1);
+    }
+
+    #[test]
+    fn ranges_are_sanitized() {
+        let mut o = Outbox::new();
+        o.push(sub(
+            1,
+            10,
+            (0..9).map(|i| (i * 100, i * 100 + 99)).collect(),
+        ));
+        o.push(sub(2, 20, vec![(50, 10), (0, 99)]));
+        let p = v(&o.take_due(Instant::now())[0]);
+        let s = &p["d"]["subscriptions"];
+        assert_eq!(
+            s["1"]["channels"]["10"].as_array().unwrap().len(),
+            MAX_RANGES
+        );
+        assert_eq!(s["2"]["channels"]["20"], v("[[0,99]]"));
+    }
+
+    #[test]
+    fn presence_is_rate_limited_and_resent_on_fresh_session() {
+        let t0 = Instant::now();
+        let mut o = Outbox::new();
+        o.push(GatewayCommand::SetPresence {
+            status: Status::Dnd,
+        });
+        let sent = o.take_due(t0);
+        assert_eq!(
+            v(&sent[0]),
+            v(r#"{"op":3,"d":{"status":"dnd","since":0,"activities":[],"afk":false}}"#)
+        );
+        o.push(GatewayCommand::SetPresence {
+            status: Status::Idle,
+        });
+        o.push(GatewayCommand::SetPresence {
+            status: Status::Offline,
+        });
+        assert!(o.take_due(t0 + Duration::from_secs(1)).is_empty());
+        let sent = o.take_due(t0 + PRESENCE_INTERVAL);
+        assert_eq!(
+            v(&sent[0])["d"]["status"],
+            "invisible",
+            "latest, sendable form"
+        );
+
+        o.on_session_start(false);
+        assert!(o.is_empty(), "resume keeps the server-side presence");
+        o.on_session_start(true);
+        assert!(!o.is_empty(), "fresh session re-sends the last status");
+    }
+}

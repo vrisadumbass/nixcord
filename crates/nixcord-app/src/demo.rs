@@ -4,12 +4,19 @@
 //! The data deliberately exercises everything the model can carry: member roles and role
 //! colors, nicknames, reactions (some by me), rich and link embeds, replies, mentions of
 //! me (direct and via a role), unicode and custom emoji, and markdown-heavy content.
+//! It also carries presences (every status, custom statuses, activities), friends, a
+//! member list answered per subscription like Discord's GUILD_MEMBER_LIST_UPDATE, and
+//! channel permissions (a read-only channel and hidden channels).
 
 use crate::backend::{AppEvent, Command, EventTx, HISTORY_PAGE};
+use nixcord_gateway::GatewayCommand;
+use nixcord_model::permissions::{SEND_MESSAGES, VIEW_CHANNEL};
 use nixcord_model::{
-    Attachment, Channel, ChannelKind, Embed, EmbedAuthor, EmbedField, EmbedFooter, EmbedMedia,
-    Emoji, GatewayEvent, Guild, Message, MessageReference, MessageUpdate, PartialMember, Reaction,
-    Ready, Role, Snowflake, User,
+    Activity, ActivityKind, Attachment, Channel, ChannelKind, Embed, EmbedAuthor, EmbedField,
+    EmbedFooter, EmbedMedia, Emoji, GatewayEvent, Guild, GuildMember, ListMember, MemberListGroup,
+    MemberListItem, MemberListOp, MemberListUpdate, Message, MessageReference, MessageUpdate,
+    Overwrite, OverwriteKind, PartialMember, Presence, Reaction, Ready, Relationship,
+    RelationshipKind, Role, Snowflake, Status, User,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -127,6 +134,7 @@ fn chan(
         parent_id: parent.map(Snowflake),
         recipients: Vec::new(),
         last_message_id: None,
+        ..Default::default()
     }
 }
 
@@ -137,6 +145,7 @@ fn guild(id: u64, name: &str, channels: Vec<Channel>) -> Guild {
         name: name.into(),
         color,
         position,
+        ..Default::default()
     };
     Guild {
         id: g,
@@ -149,6 +158,7 @@ fn guild(id: u64, name: &str, channels: Vec<Channel>) -> Guild {
                 name: "@everyone".into(),
                 color: 0,
                 position: 0,
+                permissions: VIEW_CHANNEL | SEND_MESSAGES,
             },
             role(ROLE_HELPER, "helper", 0x2ECC71, 1),
             role(ROLE_DEV, "dev", 0xF1C40F, 2),
@@ -156,13 +166,20 @@ fn guild(id: u64, name: &str, channels: Vec<Channel>) -> Guild {
             role(ROLE_MOD, "mod", 0xE74C3C, 4),
         ],
         unavailable: false,
+        owner_id: (id == 10).then_some(Snowflake(1002)),
+        // My own member: its roles drive the permission checks.
+        members: vec![GuildMember {
+            user: Some(user(ME, "you", Some("You"))),
+            roles: member_for(Snowflake(ME), g).roles,
+            ..Default::default()
+        }],
     }
 }
 
 fn ready() -> Ready {
     use ChannelKind::*;
     let t = Some;
-    let nix = guild(
+    let mut nix = guild(
         10,
         "Hearth",
         vec![
@@ -209,6 +226,24 @@ fn ready() -> Ready {
             chan(108, t(10), Voice, "Lounge", t(105), 2, None),
         ],
     );
+    // Permissions: #changelog is read-only for non-mods, #mod-only is hidden from me (I am
+    // "dev"), and a literal "__hidden__" placeholder is always filtered out.
+    let everyone = Snowflake(10);
+    let mods = role_id(everyone, ROLE_MOD);
+    let ow = |id: Snowflake, allow: u64, deny: u64| Overwrite {
+        id,
+        kind: OverwriteKind::Role,
+        allow,
+        deny,
+    };
+    nix.channels[0].permission_overwrites =
+        vec![ow(everyone, 0, SEND_MESSAGES), ow(mods, SEND_MESSAGES, 0)];
+    nix.channels.push(Channel {
+        permission_overwrites: vec![ow(everyone, 0, VIEW_CHANNEL), ow(mods, VIEW_CHANNEL, 0)],
+        ..chan(109, t(10), Text, "mod-only", t(105), 3, None)
+    });
+    nix.channels
+        .push(chan(110, t(10), Text, "__hidden__", t(101), 3, None));
     let rust = guild(
         20,
         "Rust Lounge",
@@ -292,6 +327,7 @@ fn ready() -> Ready {
         parent_id: None,
         recipients: who.iter().filter_map(|&i| p.get(i).cloned()).collect(),
         last_message_id: Some(snowflake_at(now_ms() - id * 60_000, 0)),
+        ..Default::default()
     };
 
     Ready {
@@ -307,6 +343,17 @@ fn ready() -> Ready {
         ],
         session_id: "demo".into(),
         resume_gateway_url: None,
+        presences: people_presences(),
+        relationships: [1002u64, 1003, 1005, 1008]
+            .iter()
+            .map(|&id| Relationship {
+                id: Snowflake(id),
+                kind: RelationshipKind::Friend,
+                user: p.iter().find(|u| u.id.0 == id).cloned(),
+                nickname: None,
+            })
+            .collect(),
+        status: Some(Status::Online),
     }
 }
 
@@ -632,7 +679,334 @@ fn showcase_messages(
     standup.mention_roles = vec![dev];
     out.push(standup);
 
+    // Message components: a Components V2 rules post and a legacy action row.
+    let (id, t) = at(3);
+    out.push(rules_post(id, channel, bot, t, dev));
+    let (id, t) = at(2);
+    out.push(vote_buttons(id, channel, bot, t));
+
     out
+}
+
+/// Components V2 rules post: container with accent bar, banner, text, separators, buttons.
+fn rules_post(id: Snowflake, channel: Snowflake, bot: &User, t: u64, dev: Snowflake) -> Message {
+    use nixcord_model::components::*;
+    let media = |url: &str, width: u32, height: u32| UnfurledMedia {
+        url: url.into(),
+        width: Some(width),
+        height: Some(height),
+        content_type: Some("image/png".into()),
+        ..Default::default()
+    };
+    let text = |s: String| Component::TextDisplay(TextDisplay { content: s });
+    let sep = |divider: bool, spacing: u8| Component::Separator(Separator { divider, spacing });
+    let link = |label: &str, emoji: Emoji, url: &str| {
+        Component::Button(Button {
+            style: ButtonStyle::Link,
+            label: Some(label.into()),
+            emoji: Some(emoji),
+            url: Some(url.into()),
+            ..Default::default()
+        })
+    };
+    let mut m = base_msg(id, channel, bot, String::new(), t);
+    m.flags = IS_COMPONENTS_V2;
+    m.components = vec![Component::Container(Container {
+        accent_color: Some(0x9B59B6),
+        spoiler: false,
+        components: vec![
+            Component::MediaGallery(MediaGallery {
+                items: vec![MediaGalleryItem {
+                    media: media("https://cdn.example.com/nix/rules-banner.png", 1200, 400),
+                    description: Some("Hearth banner".into()),
+                    spoiler: false,
+                }],
+            }),
+            text("# \u{1F4DC} Server Rules\nWelcome to **Hearth**! Read these before chatting in <#102>.".into()),
+            sep(true, 1),
+            text(format!(
+                "### 1. Be respectful\nNo harassment, hate speech or personal attacks. \
+                 <:ferris:{EMOJI_FERRIS}>\n### 2. Stay on topic\nBot help goes in <#104>, \
+                 ideas in <#103>.\n### 3. No spam\n- no unsolicited DMs or ads\n- no mass mentions"
+            )),
+            sep(true, 2),
+            Component::Section(Section {
+                components: vec![text(format!(
+                    "**Need help?**\nAsk in <#104> or ping <@&{dev}>. Breaking the rules gets \
+                     you a warning, then a timeout."
+                ))],
+                accessory: Some(Box::new(Component::Thumbnail(Thumbnail {
+                    media: media("https://cdn.example.com/nix/mod-badge.png", 256, 256),
+                    description: Some("Moderators".into()),
+                    spoiler: false,
+                }))),
+            }),
+            sep(false, 1),
+            Component::ActionRow(ActionRow {
+                components: vec![
+                    link("Terms of Service", unicode("\u{1F4DC}"), "https://discord.com/terms"),
+                    link("Guidelines", unicode("\u{1F6E1}"), "https://discord.com/guidelines"),
+                    link(
+                        "Source",
+                        custom_emoji(EMOJI_FERRIS, "ferris", false),
+                        "https://github.com/emilk/egui",
+                    ),
+                ],
+            }),
+        ],
+    })];
+    m
+}
+
+/// Legacy (non-V2) message: content plus action rows of buttons and a select.
+fn vote_buttons(id: Snowflake, channel: Snowflake, bot: &User, t: u64) -> Message {
+    use nixcord_model::components::*;
+    let button = |style: ButtonStyle, label: &str, emoji: Option<Emoji>, disabled: bool| {
+        Component::Button(Button {
+            style,
+            label: Some(label.into()),
+            emoji,
+            custom_id: Some(label.to_lowercase()),
+            disabled,
+            ..Default::default()
+        })
+    };
+    let mut m = base_msg(
+        id,
+        channel,
+        bot,
+        "**Poll:** what should nixcord build next?".into(),
+        t,
+    );
+    m.components = vec![
+        Component::ActionRow(ActionRow {
+            components: vec![
+                button(
+                    ButtonStyle::Primary,
+                    "Voice",
+                    Some(unicode("\u{1F3A4}")),
+                    false,
+                ),
+                button(ButtonStyle::Secondary, "Threads", None, false),
+                button(ButtonStyle::Success, "Both", None, false),
+                button(ButtonStyle::Danger, "Neither", None, true),
+            ],
+        }),
+        Component::ActionRow(ActionRow {
+            components: vec![Component::Select(SelectMenu {
+                kind: SelectKind::String,
+                custom_id: Some("theme".into()),
+                placeholder: Some("Pick your favorite theme".into()),
+                options: vec![SelectOption {
+                    label: "Midnight".into(),
+                    value: "midnight".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })],
+        }),
+    ];
+    m
+}
+
+// ---- presences and member lists ---------------------------------------------------------
+
+fn activity(kind: ActivityKind, name: &str, state: Option<&str>, emoji: Option<&str>) -> Activity {
+    Activity {
+        kind,
+        name: name.into(),
+        state: state.map(Into::into),
+        details: (kind == ActivityKind::Streaming).then(|| "Speedrunning Celeste".into()),
+        emoji: emoji.map(unicode),
+        url: None,
+    }
+}
+
+/// Fake presence of a demo user (`None` = offline).
+fn presence_of(id: u64) -> Option<Presence> {
+    use ActivityKind::*;
+    let (status, activities) = match id {
+        ME => (Status::Online, vec![]),
+        BOT => (Status::Online, vec![activity(Playing, "/help", None, None)]),
+        1002 => (
+            Status::Online,
+            vec![activity(
+                Custom,
+                "Custom Status",
+                Some("rewriting it in Rust"),
+                Some("\u{2615}"),
+            )],
+        ),
+        1003 => (
+            Status::Online,
+            vec![activity(Playing, "Factorio", None, None)],
+        ),
+        1004 => (Status::Idle, vec![]),
+        1005 => (
+            Status::Online,
+            vec![activity(Listening, "Spotify", None, None)],
+        ),
+        1006 => (
+            Status::Dnd,
+            vec![activity(Custom, "Custom Status", Some("deep focus"), None)],
+        ),
+        1007 => return None,
+        1008 => (
+            Status::Online,
+            vec![activity(Streaming, "Twitch", None, None)],
+        ),
+        n => match n % 6 {
+            0 => (Status::Online, vec![]),
+            1 => (Status::Idle, vec![]),
+            2 => (Status::Dnd, vec![]),
+            3 => (
+                Status::Online,
+                vec![activity(Watching, "YouTube Together", None, None)],
+            ),
+            _ => return None,
+        },
+    };
+    Some(Presence {
+        user_id: Snowflake(id),
+        status,
+        activities,
+        ..Default::default()
+    })
+}
+
+fn people_presences() -> Vec<Presence> {
+    people()
+        .iter()
+        .filter(|u| u.id.0 != ME)
+        .filter_map(|u| presence_of(u.id.0))
+        .collect()
+}
+
+const EXTRA_NAMES: &[&str] = &[
+    "aurora", "basil", "cypress", "delta", "ember", "fjord", "garnet", "harbor", "indigo",
+    "juniper", "kestrel", "lumen", "marlow", "nimbus", "onyx", "pixel", "quill", "raven", "sable",
+    "tundra", "umber", "vesper", "willow", "xenon", "yarrow", "zephyr", "acorn", "bramble",
+    "cinder", "dune", "echo", "flint", "glade", "hollow", "iris", "jasper",
+];
+
+/// Everyone in a demo guild: the cast plus generated members (more in bigger guilds).
+fn roster(guild: Snowflake) -> Vec<(User, PartialMember)> {
+    let extra = match guild.0 {
+        10 => EXTRA_NAMES.len(),
+        20 => 20,
+        _ => 8,
+    };
+    let mut out: Vec<(User, PartialMember)> = people()
+        .into_iter()
+        .map(|u| {
+            let m = member_for(u.id, guild);
+            (u, m)
+        })
+        .collect();
+    for (i, name) in EXTRA_NAMES.iter().take(extra).enumerate() {
+        let id = 5000 + i as u64;
+        let roles = if i % 4 == 0 {
+            vec![role_id(guild, ROLE_HELPER)]
+        } else {
+            Vec::new()
+        };
+        out.push((
+            user(id, name, None),
+            PartialMember {
+                roles,
+                ..Default::default()
+            },
+        ));
+    }
+    out
+}
+
+/// The full member list of a demo guild, as Discord lays it out: hoisted roles (mod,
+/// dev) for online members, then "Online", then "Offline"; names sorted in each group.
+fn member_list_rows(guild: Snowflake) -> (Vec<MemberListItem>, Vec<MemberListGroup>, u32) {
+    let hoisted = [ROLE_MOD, ROLE_DEV];
+    let mut groups: Vec<(String, Vec<MemberListItem>)> = hoisted
+        .iter()
+        .map(|&k| (role_id(guild, k).to_string(), Vec::new()))
+        .chain([
+            ("online".to_string(), Vec::new()),
+            ("offline".to_string(), Vec::new()),
+        ])
+        .collect();
+    let mut people = roster(guild);
+    let name = |u: &User, m: &PartialMember| {
+        m.nick
+            .clone()
+            .unwrap_or_else(|| u.display_name().to_string())
+            .to_lowercase()
+    };
+    people.sort_by_key(|(u, m)| name(u, m));
+    let mut online = 0;
+    for (u, m) in people {
+        let presence = presence_of(u.id.0);
+        let slot = match &presence {
+            None => groups.len() - 1,
+            Some(_) => {
+                online += 1;
+                hoisted
+                    .iter()
+                    .position(|&k| m.roles.contains(&role_id(guild, k)))
+                    .unwrap_or(groups.len() - 2)
+            }
+        };
+        let item = MemberListItem::Member(Box::new(ListMember {
+            member: GuildMember {
+                user: Some(u),
+                roles: m.roles,
+                nick: m.nick,
+                avatar: None,
+                ..Default::default()
+            },
+            presence,
+        }));
+        groups[slot].1.push(item);
+    }
+    let mut rows = Vec::new();
+    let mut summary = Vec::new();
+    for (id, members) in groups {
+        if members.is_empty() {
+            continue;
+        }
+        let g = MemberListGroup {
+            id,
+            count: members.len() as u32,
+        };
+        summary.push(g.clone());
+        rows.push(MemberListItem::Group(g));
+        rows.extend(members);
+    }
+    (rows, summary, online)
+}
+
+/// Answer a subscription like Discord: one SYNC per requested range.
+fn member_list_sync(guild: Snowflake, ranges: &[(u32, u32)]) -> GatewayEvent {
+    let (rows, groups, online) = member_list_rows(guild);
+    let total = groups.iter().map(|g| g.count).sum();
+    let ops = ranges
+        .iter()
+        .map(|&(a, b)| MemberListOp::Sync {
+            range: (a, b),
+            items: rows
+                .iter()
+                .skip(a as usize)
+                .take((b - a + 1) as usize)
+                .cloned()
+                .collect(),
+        })
+        .collect();
+    GatewayEvent::MemberListUpdate(Box::new(MemberListUpdate {
+        id: "everyone".into(),
+        guild_id: guild,
+        member_count: total,
+        online_count: online,
+        groups,
+        ops,
+    }))
 }
 
 pub async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx) {
@@ -813,6 +1187,23 @@ pub async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx
                 }));
             }
             Command::Typing { .. } => {}
+            Command::Gateway(GatewayCommand::SubscribeGuild {
+                guild_id, ranges, ..
+            }) => {
+                if ranges.is_empty() {
+                    continue;
+                }
+                let events = events.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    events.send(AppEvent::Gateway(member_list_sync(guild_id, &ranges)));
+                });
+            }
+            // The store already shows the new status; Discord would echo it through
+            // SESSIONS_REPLACE.
+            Command::Gateway(GatewayCommand::SetPresence { status }) => {
+                events.send(AppEvent::Gateway(GatewayEvent::OwnStatus(status)));
+            }
         }
     }
 }
@@ -859,6 +1250,41 @@ mod tests {
         );
         assert_eq!(store.member_color(g, Snowflake(1004)), None);
         assert!(h.iter().filter(|m| store.is_mentioned(m)).count() >= 2);
+    }
+
+    #[test]
+    fn demo_permissions_and_member_list() {
+        let mut store = nixcord_store::Store::new();
+        store.apply(&GatewayEvent::Ready(Box::new(ready())));
+        let g = Snowflake(10);
+        let visible: Vec<u64> = store
+            .visible_guild_channels(g)
+            .iter()
+            .map(|c| c.id.0)
+            .collect();
+        assert!(!visible.contains(&109), "mod-only hidden");
+        assert!(!visible.contains(&110), "__hidden__ hidden");
+        assert!(visible.contains(&102));
+        assert!(store.can_view(Snowflake(100)) && !store.can_send(Snowflake(100)));
+        assert!(store.can_send(Snowflake(102)));
+        assert_eq!(store.status(Snowflake(1006)), Status::Dnd);
+        assert_eq!(store.friends().len(), 4);
+
+        store.set_member_list_focus(Some(g));
+        store.apply(&member_list_sync(g, &[(0, 99)]));
+        let list = store.member_list(g).unwrap();
+        let sections = list.sections();
+        let ids: Vec<&str> = sections.iter().map(|s| s.group.id.as_str()).collect();
+        let mods = role_id(g, ROLE_MOD).to_string();
+        let devs = role_id(g, ROLE_DEV).to_string();
+        assert_eq!(ids, vec![mods.as_str(), devs.as_str(), "online", "offline"]);
+        assert!(sections
+            .iter()
+            .all(|s| s.group.count as usize >= s.members.len()));
+        assert_eq!(
+            store.status_text(Snowflake(1002)).as_deref(),
+            Some("\u{2615} rewriting it in Rust")
+        );
     }
 
     #[test]

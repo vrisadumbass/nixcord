@@ -7,6 +7,7 @@
 //! Every event send is followed by `ctx.request_repaint()` so an idle UI wakes up.
 
 use eframe::egui;
+use nixcord_gateway::GatewayCommand;
 use nixcord_http::{Http, HttpError};
 use nixcord_model::{Emoji, GatewayEvent, Message, MessageUpdate, Snowflake, User};
 use std::sync::mpsc as std_mpsc;
@@ -81,6 +82,9 @@ pub enum Command {
         channel: Snowflake,
         message: Snowflake,
     },
+    /// Forwarded to the gateway (op 37 subscriptions, op 3 presence). Dropped while
+    /// logged out.
+    Gateway(GatewayCommand),
     Typing {
         channel: Snowflake,
     },
@@ -147,6 +151,8 @@ pub fn spawn(ctx: egui::Context, demo: bool) -> Backend {
 struct Session {
     http: Http,
     shutdown: watch::Sender<bool>,
+    /// Commands for this session's gateway connection.
+    gateway: mpsc::UnboundedSender<GatewayCommand>,
 }
 
 impl Session {
@@ -166,12 +172,21 @@ async fn worker(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx)
                 }
                 let http = Http::new(token.clone());
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let (gw_cmd_tx, gw_cmd_rx) = mpsc::unbounded_channel();
                 session = Some(Session {
                     http: http.clone(),
                     shutdown: shutdown_tx,
+                    gateway: gw_cmd_tx,
                 });
                 let events = events.clone();
-                tokio::spawn(login(http, token, shutdown_rx, events));
+                tokio::spawn(login(http, token, shutdown_rx, gw_cmd_rx, events));
+            }
+            Command::Gateway(cmd) => {
+                // The gateway queues commands until its session is ready; a send error
+                // only means it already stopped.
+                if let Some(s) = &session {
+                    let _ = s.gateway.send(cmd);
+                }
             }
             Command::Logout => {
                 if let Some(old) = session.take() {
@@ -199,7 +214,13 @@ async fn worker(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx)
 }
 
 /// Validate the token over REST, then run the gateway until shutdown.
-async fn login(http: Http, token: String, shutdown: watch::Receiver<bool>, events: EventTx) {
+async fn login(
+    http: Http,
+    token: String,
+    shutdown: watch::Receiver<bool>,
+    gateway_commands: mpsc::UnboundedReceiver<GatewayCommand>,
+    events: EventTx,
+) {
     match http.current_user().await {
         Ok(user) => events.send(AppEvent::LoginOk(user)),
         Err(e) => {
@@ -223,7 +244,9 @@ async fn login(http: Http, token: String, shutdown: watch::Receiver<bool>, event
             }
         })
     };
-    if let Err(e) = nixcord_gateway::run(token, gw_tx, shutdown).await {
+    if let Err(e) =
+        nixcord_gateway::run_with_commands(token, gw_tx, shutdown, gateway_commands).await
+    {
         tracing::warn!("gateway stopped: {e}");
     }
     // The gateway dropped its sender; the forwarder drains what is left and exits.
@@ -294,7 +317,7 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
                 tracing::debug!("typing failed: {e}");
             }
         }
-        Command::Login(_) | Command::Logout => {}
+        Command::Login(_) | Command::Logout | Command::Gateway(_) => {}
     }
 }
 

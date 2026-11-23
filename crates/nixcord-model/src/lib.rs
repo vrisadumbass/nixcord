@@ -6,6 +6,8 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
+pub mod components;
+
 /// Discord snowflake ID. Sent as a JSON string, stored as u64.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct Snowflake(pub u64);
@@ -70,9 +72,10 @@ impl User {
 }
 
 /// Channel types we care about. Anything else becomes `Other(n)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(from = "u8", into = "u8")]
 pub enum ChannelKind {
+    #[default]
     Text,
     Dm,
     Voice,
@@ -122,7 +125,79 @@ impl ChannelKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Permission bits used by the client (Discord's documented values).
+pub mod permissions {
+    pub const ADMINISTRATOR: u64 = 1 << 3;
+    pub const VIEW_CHANNEL: u64 = 1 << 10;
+    pub const SEND_MESSAGES: u64 = 1 << 11;
+    pub const ALL: u64 = u64::MAX;
+}
+
+/// Permission bitfields are sent as decimal strings; accept numbers too, and treat
+/// anything unparseable as 0 rather than failing the whole object.
+fn de_bits<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(match v {
+        Some(serde_json::Value::String(s)) => s.parse().unwrap_or(0),
+        Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(0),
+        _ => 0,
+    })
+}
+
+/// A list where undecodable entries are skipped instead of failing the parent object.
+fn de_lenient_vec<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let v = Option::<Vec<serde_json::Value>>::deserialize(d)?.unwrap_or_default();
+    Ok(v.into_iter()
+        .filter_map(|x| serde_json::from_value(x).ok())
+        .collect())
+}
+
+/// Overwrite target: 0 = role, 1 = member. (Very old payloads used "role"/"member".)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(into = "u8")]
+pub enum OverwriteKind {
+    #[default]
+    Role,
+    Member,
+}
+
+impl From<OverwriteKind> for u8 {
+    fn from(k: OverwriteKind) -> u8 {
+        match k {
+            OverwriteKind::Role => 0,
+            OverwriteKind::Member => 1,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OverwriteKind {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        Ok(match v {
+            serde_json::Value::Number(n) if n.as_u64() == Some(1) => Self::Member,
+            serde_json::Value::String(s) if s == "member" || s == "1" => Self::Member,
+            _ => Self::Role,
+        })
+    }
+}
+
+/// Channel permission overwrite.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Overwrite {
+    pub id: Snowflake,
+    #[serde(default, rename = "type")]
+    pub kind: OverwriteKind,
+    #[serde(default, deserialize_with = "de_bits")]
+    pub allow: u64,
+    #[serde(default, deserialize_with = "de_bits")]
+    pub deny: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Channel {
     pub id: Snowflake,
     #[serde(rename = "type")]
@@ -142,6 +217,8 @@ pub struct Channel {
     pub recipients: Vec<User>,
     #[serde(default)]
     pub last_message_id: Option<Snowflake>,
+    #[serde(default, deserialize_with = "de_lenient_vec")]
+    pub permission_overwrites: Vec<Overwrite>,
 }
 
 impl Channel {
@@ -161,7 +238,7 @@ impl Channel {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Role {
     pub id: Snowflake,
     pub name: String,
@@ -169,9 +246,43 @@ pub struct Role {
     pub color: u32,
     #[serde(default)]
     pub position: i32,
+    /// Permission bitfield (sent as a decimal string).
+    #[serde(default, deserialize_with = "de_bits")]
+    pub permissions: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// A guild member as sent in GUILD_CREATE / READY / GUILD_MEMBER_UPDATE / member lists.
+/// `user` is present in normal payloads; `user_id` replaces it in deduplicated ones
+/// (`merged_members` with the `DEDUPE_USER_OBJECTS` capability).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GuildMember {
+    #[serde(default)]
+    pub user: Option<User>,
+    #[serde(default)]
+    pub user_id: Option<Snowflake>,
+    #[serde(default)]
+    pub roles: Vec<Snowflake>,
+    #[serde(default)]
+    pub nick: Option<String>,
+    #[serde(default)]
+    pub avatar: Option<String>,
+}
+
+impl GuildMember {
+    pub fn id(&self) -> Option<Snowflake> {
+        self.user.as_ref().map(|u| u.id).or(self.user_id)
+    }
+
+    pub fn partial(&self) -> PartialMember {
+        PartialMember {
+            roles: self.roles.clone(),
+            nick: self.nick.clone(),
+            avatar: self.avatar.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Guild {
     pub id: Snowflake,
     /// Missing on unavailable guilds in READY; filled by GUILD_CREATE.
@@ -185,6 +296,13 @@ pub struct Guild {
     pub roles: Vec<Role>,
     #[serde(default)]
     pub unavailable: bool,
+    #[serde(default)]
+    pub owner_id: Option<Snowflake>,
+    /// Initial members sent with the guild. For user accounts this is (at least) our own
+    /// member, which carries our roles for permission checks. The store moves these into
+    /// its member cache and does not keep them on the guild.
+    #[serde(default, deserialize_with = "de_lenient_vec")]
+    pub members: Vec<GuildMember>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -343,6 +461,12 @@ pub struct Message {
     /// Echoed back from the send request; lets the app match its optimistic message.
     #[serde(default, deserialize_with = "de_nonce")]
     pub nonce: Option<String>,
+    /// Message components (legacy action rows, or the whole layout with `IS_COMPONENTS_V2`).
+    #[serde(default, deserialize_with = "components::de_list")]
+    pub components: Vec<components::Component>,
+    /// Message flags (`components::IS_COMPONENTS_V2`, ...).
+    #[serde(default)]
+    pub flags: u64,
 }
 
 /// Nonce may come back as a string or a number.
@@ -370,9 +494,361 @@ pub struct MessageUpdate {
     pub embeds: Option<Vec<Embed>>,
     #[serde(default)]
     pub mentions: Option<Vec<User>>,
+    #[serde(default)]
+    pub components: Option<Vec<components::Component>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+// ---------------------------------------------------------------------------
+// Presences, relationships, member lists
+// ---------------------------------------------------------------------------
+//
+// Shapes follow Discord Userdoccers (docs.discord.food, resources/presence and
+// resources/relationships). The gateway crate decodes them leniently; these serde derives
+// are the plain, strict forms.
+
+/// User status. `Invisible` can only be sent, `Offline` only received.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Status {
+    Online,
+    Idle,
+    Dnd,
+    #[default]
+    Offline,
+    Invisible,
+}
+
+impl Status {
+    /// Unknown strings (including "unknown") map to `Offline`.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "online" => Self::Online,
+            "idle" => Self::Idle,
+            "dnd" => Self::Dnd,
+            "invisible" => Self::Invisible,
+            _ => Self::Offline,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Online => "online",
+            Self::Idle => "idle",
+            Self::Dnd => "dnd",
+            Self::Offline => "offline",
+            Self::Invisible => "invisible",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Online => "Online",
+            Self::Idle => "Idle",
+            Self::Dnd => "Do Not Disturb",
+            Self::Offline => "Offline",
+            Self::Invisible => "Invisible",
+        }
+    }
+
+    /// Shown as online-ish (not offline / invisible).
+    pub fn is_online(self) -> bool {
+        matches!(self, Self::Online | Self::Idle | Self::Dnd)
+    }
+}
+
+impl Serialize for Status {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Status {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = Option::<serde_json::Value>::deserialize(d)?;
+        Ok(match v {
+            Some(serde_json::Value::String(s)) => Self::parse(&s),
+            _ => Self::Offline,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(from = "u8", into = "u8")]
+pub enum ActivityKind {
+    #[default]
+    Playing,
+    Streaming,
+    Listening,
+    Watching,
+    Custom,
+    Competing,
+    Hang,
+    Other(u8),
+}
+
+impl From<u8> for ActivityKind {
+    fn from(n: u8) -> Self {
+        match n {
+            0 => Self::Playing,
+            1 => Self::Streaming,
+            2 => Self::Listening,
+            3 => Self::Watching,
+            4 => Self::Custom,
+            5 => Self::Competing,
+            6 => Self::Hang,
+            n => Self::Other(n),
+        }
+    }
+}
+impl From<ActivityKind> for u8 {
+    fn from(k: ActivityKind) -> u8 {
+        match k {
+            ActivityKind::Playing => 0,
+            ActivityKind::Streaming => 1,
+            ActivityKind::Listening => 2,
+            ActivityKind::Watching => 3,
+            ActivityKind::Custom => 4,
+            ActivityKind::Competing => 5,
+            ActivityKind::Hang => 6,
+            ActivityKind::Other(n) => n,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Activity {
+    #[serde(default, rename = "type")]
+    pub kind: ActivityKind,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub details: Option<String>,
+    /// Custom status emoji.
+    #[serde(default)]
+    pub emoji: Option<Emoji>,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+impl Activity {
+    /// One-line text like the official member list: "Playing X", "Listening to X",
+    /// or "<emoji> text" for a custom status. `None` if there is nothing to show.
+    pub fn label(&self) -> Option<String> {
+        fn nonempty(s: &Option<String>) -> Option<&str> {
+            s.as_deref().filter(|s| !s.trim().is_empty())
+        }
+        let text = match self.kind {
+            ActivityKind::Custom => {
+                let emoji = self
+                    .emoji
+                    .as_ref()
+                    .filter(|e| e.id.is_none())
+                    .and_then(|e| e.name.as_deref());
+                match (emoji, nonempty(&self.state)) {
+                    (Some(e), Some(s)) => format!("{e} {s}"),
+                    (None, Some(s)) => s.to_string(),
+                    (Some(e), None) => e.to_string(),
+                    (None, None) => return None,
+                }
+            }
+            ActivityKind::Hang => nonempty(&self.details)
+                .or(nonempty(&self.state))
+                .unwrap_or("Hanging out")
+                .to_string(),
+            _ if self.name.trim().is_empty() => return None,
+            ActivityKind::Playing => format!("Playing {}", self.name),
+            ActivityKind::Streaming => {
+                format!(
+                    "Streaming {}",
+                    nonempty(&self.details).unwrap_or(&self.name)
+                )
+            }
+            ActivityKind::Listening => format!("Listening to {}", self.name),
+            ActivityKind::Watching => format!("Watching {}", self.name),
+            ActivityKind::Competing => format!("Competing in {}", self.name),
+            ActivityKind::Other(_) => self.name.clone(),
+        };
+        Some(text)
+    }
+}
+
+/// Per-platform status. Missing platforms are offline.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ClientStatus {
+    #[serde(default)]
+    pub desktop: Option<Status>,
+    #[serde(default)]
+    pub mobile: Option<Status>,
+    #[serde(default)]
+    pub web: Option<Status>,
+}
+
+/// A user's presence (PRESENCE_UPDATE, READY `presences`, member list items).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Presence {
+    pub user_id: Snowflake,
+    #[serde(default)]
+    pub guild_id: Option<Snowflake>,
+    #[serde(default)]
+    pub status: Status,
+    #[serde(default)]
+    pub activities: Vec<Activity>,
+    #[serde(default)]
+    pub client_status: ClientStatus,
+}
+
+impl Presence {
+    /// Text under the name: the custom status if set, else the first other activity.
+    pub fn status_text(&self) -> Option<String> {
+        let custom = self
+            .activities
+            .iter()
+            .filter(|a| a.kind == ActivityKind::Custom)
+            .find_map(Activity::label);
+        custom.or_else(|| {
+            self.activities
+                .iter()
+                .filter(|a| a.kind != ActivityKind::Custom)
+                .find_map(Activity::label)
+        })
+    }
+
+    pub fn is_streaming(&self) -> bool {
+        self.activities
+            .iter()
+            .any(|a| a.kind == ActivityKind::Streaming)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(from = "u8", into = "u8")]
+pub enum RelationshipKind {
+    #[default]
+    None,
+    Friend,
+    Blocked,
+    IncomingRequest,
+    OutgoingRequest,
+    Implicit,
+    Other(u8),
+}
+
+impl From<u8> for RelationshipKind {
+    fn from(n: u8) -> Self {
+        match n {
+            0 => Self::None,
+            1 => Self::Friend,
+            2 => Self::Blocked,
+            3 => Self::IncomingRequest,
+            4 => Self::OutgoingRequest,
+            5 => Self::Implicit,
+            n => Self::Other(n),
+        }
+    }
+}
+impl From<RelationshipKind> for u8 {
+    fn from(k: RelationshipKind) -> u8 {
+        match k {
+            RelationshipKind::None => 0,
+            RelationshipKind::Friend => 1,
+            RelationshipKind::Blocked => 2,
+            RelationshipKind::IncomingRequest => 3,
+            RelationshipKind::OutgoingRequest => 4,
+            RelationshipKind::Implicit => 5,
+            RelationshipKind::Other(n) => n,
+        }
+    }
+}
+
+/// Relationship object (READY `relationships`, RELATIONSHIP_ADD). `id` is the target
+/// user. `user` may be missing in deduplicated payloads.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Relationship {
+    pub id: Snowflake,
+    #[serde(default, rename = "type")]
+    pub kind: RelationshipKind,
+    #[serde(default)]
+    pub user: Option<User>,
+    #[serde(default)]
+    pub nickname: Option<String>,
+}
+
+/// Member list group id: "online", "offline", or a hoisted role id (as a string).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemberListGroup {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub count: u32,
+}
+
+impl MemberListGroup {
+    /// The role id when this group is a hoisted role.
+    pub fn role_id(&self) -> Option<Snowflake> {
+        self.id.parse().ok().map(Snowflake)
+    }
+}
+
+/// A member row in a member list, with its presence.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ListMember {
+    pub member: GuildMember,
+    pub presence: Option<Presence>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MemberListItem {
+    Group(MemberListGroup),
+    Member(Box<ListMember>),
+    /// An item we could not decode. Keeps row indices aligned.
+    Unknown,
+}
+
+/// One op of GUILD_MEMBER_LIST_UPDATE. Indices are absolute row positions in the whole
+/// list (group header rows count as rows).
+#[derive(Debug, Clone, PartialEq)]
+pub enum MemberListOp {
+    Sync {
+        range: (u32, u32),
+        items: Vec<MemberListItem>,
+    },
+    Insert {
+        index: u32,
+        item: MemberListItem,
+    },
+    Update {
+        index: u32,
+        item: MemberListItem,
+    },
+    Delete {
+        index: u32,
+    },
+    Invalidate {
+        range: (u32, u32),
+    },
+}
+
+/// GUILD_MEMBER_LIST_UPDATE. `id` is "everyone" or a hash of the channel's
+/// permission overwrites (channels with the same visibility share a list).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MemberListUpdate {
+    pub id: String,
+    pub guild_id: Snowflake,
+    pub member_count: u32,
+    pub online_count: u32,
+    pub groups: Vec<MemberListGroup>,
+    pub ops: Vec<MemberListOp>,
+}
+
+/// READY_SUPPLEMENTAL, flattened: every presence from `merged_presences` (friends and
+/// per-guild).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReadySupplemental {
+    pub presences: Vec<Presence>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Ready {
     pub user: User,
     #[serde(default)]
@@ -382,6 +858,14 @@ pub struct Ready {
     pub session_id: String,
     #[serde(default)]
     pub resume_gateway_url: Option<String>,
+    /// Non-offline friends / implicit relationships, plus per-guild startup presences.
+    #[serde(default)]
+    pub presences: Vec<Presence>,
+    #[serde(default)]
+    pub relationships: Vec<Relationship>,
+    /// Our own status from the (JSON) user settings, or the sessions list.
+    #[serde(default)]
+    pub status: Option<Status>,
 }
 
 /// High-level events the gateway crate hands to the app.
@@ -430,6 +914,25 @@ pub enum GatewayEvent {
         message_id: Snowflake,
         user_id: Snowflake,
         emoji: Emoji,
+    },
+    /// PRESENCE_UPDATE. `user` is set when the payload carried a full enough user
+    /// object (username present) to refresh our user cache.
+    PresenceUpdate {
+        presence: Box<Presence>,
+        user: Option<Box<User>>,
+    },
+    MemberListUpdate(Box<MemberListUpdate>),
+    ReadySupplemental(Box<ReadySupplemental>),
+    RelationshipAdd(Box<Relationship>),
+    RelationshipRemove {
+        user_id: Snowflake,
+    },
+    /// Our own overall status changed (SESSIONS_REPLACE, session "all").
+    OwnStatus(Status),
+    /// GUILD_MEMBER_UPDATE (roles / nick changes, including our own).
+    GuildMemberUpdate {
+        guild_id: Snowflake,
+        member: Box<GuildMember>,
     },
 }
 
@@ -481,5 +984,58 @@ mod tests {
         assert_eq!(c.kind, ChannelKind::Category);
         let c: Channel = serde_json::from_str(r#"{"id":"1","type":99}"#).unwrap();
         assert_eq!(c.kind, ChannelKind::Other(99));
+    }
+
+    #[test]
+    fn permissions_and_overwrites_decode() {
+        let r: Role =
+            serde_json::from_str(r#"{"id":"1","name":"a","permissions":"1024"}"#).unwrap();
+        assert_eq!(r.permissions, permissions::VIEW_CHANNEL);
+        let r: Role =
+            serde_json::from_str(r#"{"id":"1","name":"a","permissions":"junk"}"#).unwrap();
+        assert_eq!(r.permissions, 0);
+        let c: Channel = serde_json::from_str(
+            r#"{"id":"1","type":0,"permission_overwrites":[
+                {"id":"5","type":1,"allow":"2048","deny":"0"},
+                {"id":"6","type":0,"allow":0,"deny":"1024"},
+                {"bogus":true}]}"#,
+        )
+        .unwrap();
+        assert_eq!(c.permission_overwrites.len(), 2, "bad entry skipped");
+        assert_eq!(c.permission_overwrites[0].kind, OverwriteKind::Member);
+        assert_eq!(c.permission_overwrites[0].allow, 2048);
+        assert_eq!(c.permission_overwrites[1].deny, 1024);
+    }
+
+    #[test]
+    fn status_and_activity_labels() {
+        assert_eq!(Status::parse("dnd"), Status::Dnd);
+        assert_eq!(Status::parse("unknown"), Status::Offline);
+        let s: Status = serde_json::from_str("42").unwrap();
+        assert_eq!(s, Status::Offline);
+        let a: Activity = serde_json::from_str(r#"{"type":0,"name":"Factorio"}"#).unwrap();
+        assert_eq!(a.label().as_deref(), Some("Playing Factorio"));
+        let a: Activity = serde_json::from_str(
+            r#"{"type":4,"name":"Custom Status","state":"brb","emoji":{"name":"☕"}}"#,
+        )
+        .unwrap();
+        assert_eq!(a.label().as_deref(), Some("☕ brb"));
+        let p = Presence {
+            activities: vec![
+                Activity {
+                    kind: ActivityKind::Listening,
+                    name: "Spotify".into(),
+                    ..Default::default()
+                },
+                a,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(p.status_text().as_deref(), Some("☕ brb"), "custom wins");
+        let empty = Activity {
+            kind: ActivityKind::Custom,
+            ..Default::default()
+        };
+        assert_eq!(empty.label(), None);
     }
 }

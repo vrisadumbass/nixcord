@@ -241,7 +241,8 @@ fn channel_glyph(kind: ChannelKind) -> &'static str {
 
 fn guild_channels(ui: &mut Ui, app: &NixApp, gid: Snowflake, actions: &mut Vec<Action>) {
     let t = app.theme;
-    let channels = app.store.guild_channels(gid);
+    // Hides channels I can't view, "__hidden__" placeholders and emptied categories.
+    let channels = app.store.visible_guild_channels(gid);
     let mut current_cat: Option<Snowflake> = None;
     for ch in channels {
         if ch.kind == ChannelKind::Category {
@@ -389,10 +390,20 @@ fn dm_list(ui: &mut Ui, app: &NixApp, actions: &mut Vec<Action>) {
             .find(|u| Some(u.id) != me)
             .or(ch.recipients.first());
         match (ch.kind, other) {
-            (ChannelKind::Dm, Some(u)) => app
-                .media
-                .borrow_mut()
-                .paint_avatar(ui, center, 32.0, u, None),
+            (ChannelKind::Dm, Some(u)) => {
+                app.media
+                    .borrow_mut()
+                    .paint_avatar(ui, center, 32.0, u, None);
+                let panel = super::presence::opaque_bg(t, t.sidebar);
+                let ring = if selected {
+                    super::presence::over(t.selected, panel)
+                } else if hovered {
+                    super::presence::over(t.hover, panel)
+                } else {
+                    panel
+                };
+                super::presence::paint_user_status(ui, app, u.id, center, 32.0, ring);
+            }
             _ => {
                 ui.painter()
                     .circle_filled(center, 16.0, super::id_color(ch.id));
@@ -419,12 +430,14 @@ fn dm_list(ui: &mut Ui, app: &NixApp, actions: &mut Vec<Action>) {
         .intersect(ui.clip_rect());
         let name_font = if unread { bold(15.5) } else { prop(15.5) };
         let name = ui.painter().layout_no_wrap(label, name_font, color);
-        if ch.kind == ChannelKind::GroupDm {
-            let sub = ui.painter().layout_no_wrap(
-                format!("{} Members", ch.recipients.len() + 1),
-                prop(12.0),
-                t.muted,
-            );
+        // Second line: member count for groups, custom status / activity for DMs.
+        let sub_text = match (ch.kind, other) {
+            (ChannelKind::GroupDm, _) => Some(format!("{} Members", ch.recipients.len() + 1)),
+            (ChannelKind::Dm, Some(u)) => app.store.status_text(u.id),
+            _ => None,
+        };
+        if let Some(sub_text) = sub_text {
+            let sub = ui.painter().layout_no_wrap(sub_text, prop(12.0), t.muted);
             let top = rect.center().y - (name.size().y + sub.size().y) / 2.0;
             let p = ui.painter().with_clip_rect(clip);
             let name_h = name.size().y;
@@ -457,11 +470,13 @@ fn user_panel(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
         ui.centered_and_justified(|ui| ui.add(egui::Spinner::new().color(t.muted)));
         return;
     };
+    // Connected: my own status (clickable to change it). Otherwise the connection state.
+    let my = app.store.my_status();
     let (status, dot) = match app.store.connection() {
-        ConnectionState::Connected => ("Online", t.online),
-        ConnectionState::Connecting => ("Connecting…", t.idle),
-        ConnectionState::Reconnecting => ("Reconnecting…", t.idle),
-        ConnectionState::Offline => ("Offline", t.muted),
+        ConnectionState::Connected => (my.label(), Some(my)),
+        ConnectionState::Connecting => ("Connecting…", None),
+        ConnectionState::Reconnecting => ("Reconnecting…", None),
+        ConnectionState::Offline => ("Offline", None),
     };
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
@@ -501,31 +516,50 @@ fn user_panel(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
         }
 
         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-            ui.add_space(4.0);
-            let r = app.media.borrow_mut().avatar(ui, &me, None, 32.0).rect;
-            paint_status_dot(
-                ui,
-                r.center(),
-                32.0,
-                Color32::from_gray(if t.dark { 24 } else { 225 }),
-                dot,
+            ui.add_space(2.0);
+            // One click target for avatar + name + status (plain painting, no selectable
+            // labels that would swallow the click). Opens the status picker.
+            let size = Vec2::new(ui.available_width() - 2.0, 44.0);
+            let sense = if dot.is_some() {
+                Sense::click()
+            } else {
+                Sense::hover()
+            };
+            let (area, resp) = ui.allocate_exact_size(size, sense);
+            if resp.hovered() && dot.is_some() {
+                ui.painter().rect_filled(
+                    area,
+                    CornerRadius::same(4),
+                    Color32::from_white_alpha(if t.dark { 10 } else { 40 }),
+                );
+            }
+            let c = Pos2::new(area.left() + 4.0 + 16.0, area.center().y);
+            app.media.borrow_mut().paint_avatar(ui, c, 32.0, &me, None);
+            let ring = super::presence::over(
+                Color32::from_black_alpha(if t.dark { 70 } else { 20 }),
+                super::presence::opaque_bg(t, t.sidebar),
             );
-            ui.add_space(4.0);
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(me.display_name())
-                            .font(bold(14.0))
-                            .color(t.strong),
-                    )
-                    .truncate(),
-                );
-                ui.add(
-                    egui::Label::new(RichText::new(status).font(prop(12.0)).color(t.muted))
-                        .truncate(),
-                );
-            });
+            match dot {
+                Some(s) => super::presence::paint_status(ui, t, c, 32.0, ring, s, false),
+                None => paint_status_dot(ui, c, 32.0, ring, t.idle),
+            }
+            let left = area.left() + 44.0;
+            let clip = Rect::from_min_max(Pos2::new(left, area.top()), area.right_bottom())
+                .intersect(ui.clip_rect());
+            let name =
+                ui.painter()
+                    .layout_no_wrap(me.display_name().to_string(), bold(14.0), t.strong);
+            let sub = ui
+                .painter()
+                .layout_no_wrap(status.to_string(), prop(12.0), t.muted);
+            let name_h = name.size().y;
+            let top = area.center().y - (name_h + sub.size().y) / 2.0;
+            let p = ui.painter().with_clip_rect(clip);
+            p.galley(Pos2::new(left, top), name, t.strong);
+            p.galley(Pos2::new(left, top + name_h), sub, t.muted);
+            if dot.is_some() {
+                super::presence::status_menu(&resp, app);
+            }
         });
     });
 }

@@ -5,11 +5,14 @@
 //! only read while drawing).
 
 pub mod chat;
+pub mod components;
 pub mod composer;
 pub mod login;
 pub mod markdown;
+pub mod presence;
 pub mod settings;
 pub mod sidebar;
+pub mod viewer;
 
 use crate::theme::Theme;
 use chrono::{Datelike, Local, TimeZone};
@@ -75,6 +78,8 @@ pub enum Action {
     Copy(String),
     Typing(Snowflake),
     OpenSettings,
+    /// Short notice at the bottom of the window.
+    Toast(String),
 }
 
 /// Bold-ish family (Segoe UI Semibold on Windows when available, else the default font).

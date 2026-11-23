@@ -35,9 +35,14 @@ pub enum RetryDelay {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     Send(Outgoing),
+    /// A token-free payload built from a `GatewayCommand` (op 3 / op 37).
+    SendRaw(String),
     Emit(GatewayEvent),
     StartHeartbeat(Duration),
-    Reconnect { reason: String, delay: RetryDelay },
+    Reconnect {
+        reason: String,
+        delay: RetryDelay,
+    },
 }
 
 /// What to do after the server closed the socket.

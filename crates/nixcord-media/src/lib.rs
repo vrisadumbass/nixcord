@@ -20,8 +20,8 @@ pub mod url;
 mod decode;
 mod fetch;
 
-pub use decode::decode;
-pub use fetch::{Config, Fetcher};
+pub use decode::{decode, encode_png};
+pub use fetch::{Config, Fetcher, SaveDone};
 
 use std::time::Duration;
 

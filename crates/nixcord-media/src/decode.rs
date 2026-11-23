@@ -36,6 +36,16 @@ pub fn decode(bytes: &[u8], max_w: u32, max_h: u32) -> Result<Image, Failure> {
     })
 }
 
+/// Encode RGBA pixels as PNG (saving generated demo images).
+pub fn encode_png(img: &Image) -> Option<Vec<u8>> {
+    let buf = image::RgbaImage::from_raw(img.width, img.height, img.rgba.clone())?;
+    let mut out = Vec::new();
+    image::DynamicImage::ImageRgba8(buf)
+        .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
+        .ok()?;
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,6 +70,13 @@ mod tests {
     fn never_upscales() {
         let img = decode(&png(20, 10), 64, 64).unwrap();
         assert_eq!((img.width, img.height), (20, 10));
+    }
+
+    #[test]
+    fn png_round_trip() {
+        let src = decode(&png(12, 7), 64, 64).unwrap();
+        let bytes = encode_png(&src).unwrap();
+        assert_eq!(decode(&bytes, 64, 64).unwrap(), src);
     }
 
     #[test]

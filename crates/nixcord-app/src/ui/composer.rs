@@ -78,7 +78,7 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
             });
     }
 
-    if app.view.forbidden.contains(&ch) {
+    if app.view.forbidden.contains(&ch) || !app.store.can_send(ch) {
         ui.add_space(2.0);
         Frame::new()
             .fill(t.elevated)

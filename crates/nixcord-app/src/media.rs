@@ -24,11 +24,32 @@
 //! - `media.image(ui, &url, Vec2::new(400.0, 300.0), Some((w, h)))` for attachments
 //!   (`a.url`, `a.width.zip(a.height)`) and embed images/thumbnails (prefer `proxy_url`,
 //!   `media.width.zip(media.height)`). Aspect-correct inside `max_size`, never upscaled,
-//!   rounded corners; a click opens the original URL in the browser. Pass `natural` whenever
+//!   rounded corners; a click opens the in-app image viewer (`ui::viewer`), stepping through
+//!   the other images of the same message (see "Viewer" below). Pass `natural` whenever
 //!   known so the row height is stable before the image arrives (the chat list caches row
 //!   heights). Discord attachment / embed-proxy URLs are fetched pre-scaled by the media
 //!   proxy, so we download about as many pixels as we show.
-//! - `media.clear()` on logout drops every texture; `media.stats()` -> `(textures, bytes)`.
+//! - `media.clear()` on logout drops every texture and closes the viewer;
+//!   `media.stats()` -> `(textures, bytes)` of the LRU (viewer textures are not counted).
+//!
+//! # Viewer
+//!
+//! A click on an image stores an open request (URL, natural size, file name from the URL)
+//! plus a "gallery" id: the chat list row (the item directly inside the `ScrollArea`) the
+//! image was drawn in, read from egui's `UiStack`, so the chat code needs no change. The
+//! viewer (`ui::viewer::show`, drawn last each frame) takes the request together with every
+//! image drawn in the same row this pass.
+//!
+//! The viewer asks for a large copy sized to the window's pixel size (rounded up to 512 px
+//! steps so resizing doesn't refetch every frame) or the natural size, whichever is smaller,
+//! under its own `Key`, so the small preview stays cached and is drawn scaled up until the
+//! large one arrives. Large textures live outside the LRU (one image can be 8-30 MB of
+//! RGBA): only the current image's is kept, and `close_viewer` drops it at once. A late
+//! download for a closed viewer is discarded instead of entering the LRU.
+//!
+//! `media.save(&img)` shows a native save dialog (rfd) on a helper thread, then streams the
+//! original file to disk on the fetcher; `take_notices()` returns "saved" / error messages
+//! for the toast.
 //!
 //! Demo mode (`Media::new(ctx, true)`) never touches the network: avatars, icons, emoji and
 //! attachment "screenshots" are generated locally by `nixcord_media::demo`, seeded by the
@@ -36,11 +57,13 @@
 
 use eframe::egui::{
     self, epaint::RectShape, Align2, Color32, CornerRadius, Pos2, Rect, Response, Sense,
-    TextureHandle, TextureId, TextureOptions, Ui, Vec2,
+    TextureHandle, TextureId, TextureOptions, Ui, UiKind, UiStack, Vec2,
 };
 use nixcord_media::{demo, lru::ByteLru, size, url as murl, Fetcher, Image, Key};
 use nixcord_model::{cdn, Guild, Snowflake, User};
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::mpsc;
 use std::time::Instant;
 
 /// Total RGBA bytes of textures kept around (visible ones are never evicted).
@@ -51,6 +74,10 @@ const UPLOADS_PER_FRAME: usize = 16;
 const DEMO_PIXELS_PER_FRAME: u64 = 600_000;
 /// Corner radius of attachment previews.
 const IMAGE_RADIUS: u8 = 6;
+/// The viewer's request box is the window's pixel size rounded up to this step.
+const VIEW_STEP: u32 = 512;
+/// Size of a demo image whose natural size is unknown (viewer and save).
+const DEMO_NATURAL: (u32, u32) = (1280, 720);
 
 enum Entry {
     Loading,
@@ -59,10 +86,76 @@ enum Entry {
 }
 
 /// A texture ready to paint.
-#[derive(Clone, Copy)]
-struct Tex {
-    id: TextureId,
-    size: [u32; 2],
+#[derive(Clone, Copy, Debug)]
+pub struct Tex {
+    pub id: TextureId,
+    /// Pixel size.
+    pub size: [u32; 2],
+}
+
+/// An image the viewer can show.
+#[derive(Clone, Debug)]
+pub struct ViewImage {
+    /// URL as passed to `Media::image` (the original, unsized one).
+    pub url: String,
+    /// Natural size as reported by Discord, if known.
+    pub natural: Option<(u32, u32)>,
+    /// File name from the URL (may be empty).
+    pub filename: String,
+    /// Cache id of the chat preview (drawn scaled up while the large copy loads).
+    preview_id: u64,
+}
+
+impl ViewImage {
+    /// GIF / video: the viewer shows the first frame only and offers the browser.
+    pub fn is_animated(&self) -> bool {
+        murl::is_animated(&self.url)
+    }
+    #[cfg(test)]
+    pub fn for_test(url: &str, natural: Option<(u32, u32)>) -> Self {
+        Self {
+            url: url.to_owned(),
+            natural,
+            filename: murl::file_name(url),
+            preview_id: 0,
+        }
+    }
+}
+
+/// What the viewer can paint this frame.
+#[derive(Clone, Copy, Debug)]
+pub struct ViewTex {
+    /// Large copy (or the preview itself, if that is already as large).
+    pub big: Option<Tex>,
+    /// Chat preview, if cached.
+    pub preview: Option<Tex>,
+    /// The large copy failed; only the preview (if any) can be shown.
+    pub failed: bool,
+}
+
+/// A large viewer texture, kept outside the LRU.
+struct Big {
+    id: u64,
+    /// `fnv1a64` of the image URL (a size change keeps the old texture until the new one
+    /// is ready).
+    url: u64,
+    state: BigState,
+}
+
+enum BigState {
+    Loading,
+    Ready(TextureHandle, [u32; 2]),
+    Failed,
+}
+
+/// Messages from the save helper thread.
+enum SaveMsg {
+    /// The user picked `path` for `url`; download it on the fetcher.
+    Picked {
+        url: String,
+        path: PathBuf,
+    },
+    Notice(String),
 }
 
 /// State of one image request this frame.
@@ -82,10 +175,25 @@ pub struct Media {
     lru: ByteLru<u64>,
     pass: u64,
     demo_budget: u64,
+    /// Images drawn this pass with their gallery (chat row) id.
+    drawn: Vec<(Option<egui::Id>, ViewImage)>,
+    /// Image clicked this pass, waiting for the viewer.
+    open: Option<(Option<egui::Id>, ViewImage)>,
+    /// Large viewer textures (current image only, plus its previous size while resizing).
+    big: Vec<Big>,
+    demo_tx: mpsc::Sender<(u64, Image)>,
+    demo_rx: mpsc::Receiver<(u64, Image)>,
+    save_tx: mpsc::Sender<SaveMsg>,
+    save_rx: mpsc::Receiver<SaveMsg>,
+    notices: Vec<String>,
+    /// Open viewer state (owned here so the app needs no extra field).
+    pub viewer: Option<crate::ui::viewer::State>,
 }
 
 impl Media {
     pub fn new(ctx: &egui::Context, demo: bool) -> Self {
+        let (demo_tx, demo_rx) = mpsc::channel();
+        let (save_tx, save_rx) = mpsc::channel();
         Self {
             ctx: ctx.clone(),
             demo,
@@ -95,6 +203,15 @@ impl Media {
             lru: ByteLru::new(),
             pass: u64::MAX,
             demo_budget: 0,
+            drawn: Vec::new(),
+            open: None,
+            big: Vec::new(),
+            demo_tx,
+            demo_rx,
+            save_tx,
+            save_rx,
+            notices: Vec::new(),
+            viewer: None,
         }
     }
 
@@ -107,6 +224,9 @@ impl Media {
     pub fn clear(&mut self) {
         self.entries.retain(|_, e| matches!(e, Entry::Loading));
         self.lru = ByteLru::new();
+        self.close_viewer();
+        self.open = None;
+        self.drawn.clear();
     }
 
     // ---- helpers ----------------------------------------------------------------------
@@ -266,6 +386,7 @@ impl Media {
         max_size: Vec2,
         natural: Option<(u32, u32)>,
     ) -> Response {
+        self.begin_pass();
         let ppp = self.ctx.pixels_per_point();
         let max = (max_size.x.max(1.0), max_size.y.max(1.0));
         // Size we lay out at; with no natural size, a 16:9 box until the image arrives.
@@ -277,28 +398,31 @@ impl Media {
             max,
         );
         let (pw, ph) = (size::to_px(w, ppp), size::to_px(h, ppp));
-        let id_and_got = |this: &mut Self| -> Got {
-            if this.demo {
-                let seed = murl::fnv1a64(url.as_bytes());
-                this.local(local_id(4, seed, pw, ph), pw as u64 * ph as u64, || {
-                    demo::screenshot(seed, pw, ph)
-                })
-            } else if natural.is_some() {
-                this.net(Key::new(murl::sized_url(url, pw, ph), pw, ph))
-            } else {
-                // Unknown size: decode into the whole max box, then lay out by its aspect.
-                let (mw, mh) = (size::to_px(max.0, ppp), size::to_px(max.1, ppp));
-                this.net(Key::new(url, mw, mh))
-            }
+        let seed = murl::fnv1a64(url.as_bytes());
+        let key = if self.demo {
+            None
+        } else if natural.is_some() {
+            Some(Key::new(murl::sized_url(url, pw, ph), pw, ph))
+        } else {
+            // Unknown size: decode into the whole max box, then lay out by its aspect.
+            let (mw, mh) = (size::to_px(max.0, ppp), size::to_px(max.1, ppp));
+            Some(Key::new(url, mw, mh))
         };
+        let preview_id = key
+            .as_ref()
+            .map_or_else(|| local_id(4, seed, pw, ph), Key::id);
 
         // Visible check needs a rect, but the rect for unknown sizes depends on the texture:
         // peek at the would-be rect first.
         let probe = Rect::from_min_size(ui.cursor().min, Vec2::new(w, h));
-        let got = if ui.is_rect_visible(probe) {
-            id_and_got(self)
-        } else {
+        let got = if !ui.is_rect_visible(probe) {
             Got::Loading
+        } else if let Some(key) = key {
+            self.net(key)
+        } else {
+            self.local(preview_id, pw as u64 * ph as u64, || {
+                demo::screenshot(seed, pw, ph)
+            })
         };
         let shown = match (&got, natural) {
             (Got::Ready(t), None) => {
@@ -327,10 +451,237 @@ impl Media {
                 );
             }
         }
+
+        let group = gallery_group(ui.stack());
+        let img = ViewImage {
+            url: url.to_owned(),
+            natural,
+            filename: murl::file_name(url),
+            preview_id,
+        };
         if resp.clicked() {
-            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+            self.open = Some((group, img.clone()));
         }
+        self.drawn.push((group, img));
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
+
+    // ---- viewer -----------------------------------------------------------------------
+
+    /// The image clicked this frame, with the images of the same message (in draw order)
+    /// and its index among them.
+    pub fn take_open_request(&mut self) -> Option<(Vec<ViewImage>, usize)> {
+        let (group, img) = self.open.take()?;
+        let mut items: Vec<ViewImage> = Vec::new();
+        if group.is_some() {
+            for (g, i) in &self.drawn {
+                if *g == group && !items.iter().any(|x| x.url == i.url) {
+                    items.push(i.clone());
+                }
+            }
+        }
+        let index = match items.iter().position(|x| x.url == img.url) {
+            Some(i) => i,
+            None => {
+                items = vec![img];
+                0
+            }
+        };
+        Some((items, index))
+    }
+
+    /// Textures for showing `img` in the viewer, requesting the large copy (sized for a
+    /// `win_px` window) if needed. Large copies of other images are dropped.
+    pub fn viewer_tex(&mut self, img: &ViewImage, win_px: (u32, u32)) -> ViewTex {
+        self.begin_pass();
+        let preview = match self.cached(img.preview_id) {
+            Some(Got::Ready(t)) => Some(t),
+            _ => None,
+        };
+        let step = |v: u32| v.max(1).div_ceil(VIEW_STEP).saturating_mul(VIEW_STEP);
+        let bx = (
+            step(win_px.0).min(size::MAX_SIDE),
+            step(win_px.1).min(size::MAX_SIDE),
+        );
+        let seed = murl::fnv1a64(img.url.as_bytes());
+        let natural = img.natural.or(self.demo.then_some(DEMO_NATURAL));
+        let (bw, bh) = natural.map_or(bx, |n| size::fit_within(n, bx));
+        let key = (!self.demo).then(|| match img.natural {
+            Some(_) => Key::new(murl::sized_url(&img.url, bw, bh), bw, bh),
+            None => Key::new(img.url.as_str(), bw, bh),
+        });
+        let id = key
+            .as_ref()
+            .map_or_else(|| local_id(5, seed, bw, bh), Key::id);
+
+        // Already cached as a regular image (small natural size: the preview is the whole
+        // image).
+        if id == img.preview_id || self.entries.contains_key(&id) {
+            if let Some(Got::Ready(t)) = self.cached(id) {
+                self.big.clear();
+                return ViewTex {
+                    big: Some(t),
+                    preview,
+                    failed: false,
+                };
+            }
+        }
+
+        if !self.big.iter().any(|b| b.id == id) {
+            self.big.push(Big {
+                id,
+                url: seed,
+                state: BigState::Loading,
+            });
+            let started = match key {
+                Some(key) => {
+                    let ok = self.ensure_fetcher();
+                    if let (true, Some(f)) = (ok, &self.fetcher) {
+                        f.request(key);
+                    }
+                    ok
+                }
+                None => {
+                    let (tx, ctx) = (self.demo_tx.clone(), self.ctx.clone());
+                    std::thread::Builder::new()
+                        .name("nixcord-demo-image".into())
+                        .spawn(move || {
+                            let _ = tx.send((id, demo::screenshot(seed, bw, bh)));
+                            ctx.request_repaint();
+                        })
+                        .is_ok()
+                }
+            };
+            if !started {
+                self.upload_big(id, Err(()));
+            }
+        }
+
+        let ready = |b: &Big| match &b.state {
+            BigState::Ready(tex, size) => Some(Tex {
+                id: tex.id(),
+                size: *size,
+            }),
+            _ => None,
+        };
+        let current = self.big.iter().find(|b| b.id == id);
+        let failed = current.is_some_and(|b| matches!(b.state, BigState::Failed));
+        let big = match current.and_then(ready) {
+            Some(t) => {
+                self.big.retain(|b| b.id == id);
+                Some(t)
+            }
+            None => {
+                // Keep only an older size of this same image to show meanwhile.
+                self.big
+                    .retain(|b| b.id == id || (b.url == seed && ready(b).is_some()));
+                self.big.iter().find_map(ready)
+            }
+        };
+        ViewTex {
+            big,
+            preview,
+            failed,
+        }
+    }
+
+    /// Drop the viewer state and its large textures now (not via the LRU).
+    pub fn close_viewer(&mut self) {
+        self.viewer = None;
+        self.big.clear();
+    }
+
+    /// RGBA bytes held by the viewer's large textures.
+    #[cfg(test)]
+    pub fn viewer_bytes(&self) -> usize {
+        self.big
+            .iter()
+            .map(|b| match b.state {
+                BigState::Ready(_, s) => size::rgba_bytes(s[0], s[1]),
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// Ask where to save `img` (native dialog, helper thread), then write the original file
+    /// there. The result arrives through `take_notices`.
+    pub fn save(&mut self, img: &ViewImage) {
+        let mut name = if img.filename.is_empty() {
+            "image".to_owned()
+        } else {
+            img.filename.clone()
+        };
+        let demo = self.demo;
+        if demo {
+            // Generated images are saved as PNG.
+            let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s);
+            name = format!("{stem}.png");
+        }
+        let url = img.url.clone();
+        let natural = img.natural.unwrap_or(DEMO_NATURAL);
+        let (tx, ctx) = (self.save_tx.clone(), self.ctx.clone());
+        let spawned = std::thread::Builder::new()
+            .name("nixcord-save".into())
+            .spawn(move || {
+                let mut dialog = rfd::AsyncFileDialog::new().set_file_name(&name);
+                if let Some(dir) = downloads_dir() {
+                    dialog = dialog.set_directory(dir);
+                }
+                let Some(path) = block_on(dialog.save_file()).map(|h| h.path().to_path_buf())
+                else {
+                    return; // cancelled
+                };
+                let msg = if demo {
+                    let (w, h) = size::fit_within(natural, (size::MAX_SIDE, size::MAX_SIDE));
+                    let seed = murl::fnv1a64(url.as_bytes());
+                    let png = nixcord_media::encode_png(&demo::screenshot(seed, w, h));
+                    SaveMsg::Notice(match png.map(|b| std::fs::write(&path, b)) {
+                        Some(Ok(())) => saved_notice(&path),
+                        Some(Err(e)) => format!("Couldn't save the image: {e}"),
+                        None => "Couldn't save the image.".into(),
+                    })
+                } else {
+                    SaveMsg::Picked { url, path }
+                };
+                let _ = tx.send(msg);
+                ctx.request_repaint();
+            });
+        if spawned.is_err() {
+            self.notices.push("Couldn't open the save dialog.".into());
+        }
+    }
+
+    /// Messages for the toast (finished or failed saves).
+    pub fn take_notices(&mut self) -> Vec<String> {
+        self.pump_saves();
+        std::mem::take(&mut self.notices)
+    }
+
+    fn pump_saves(&mut self) {
+        while let Ok(msg) = self.save_rx.try_recv() {
+            match msg {
+                SaveMsg::Notice(n) => self.notices.push(n),
+                SaveMsg::Picked { url, path } => {
+                    if !self.ensure_fetcher() {
+                        self.notices
+                            .push("Couldn't save the image: no network.".into());
+                        continue;
+                    }
+                    let Some(f) = &self.fetcher else { continue };
+                    let (tx, shown) = (self.save_tx.clone(), path.clone());
+                    f.save(
+                        url,
+                        path,
+                        Box::new(move |r| {
+                            let _ = tx.send(SaveMsg::Notice(match r {
+                                Ok(_) => saved_notice(&shown),
+                                Err(e) => format!("Couldn't save the image: {e}"),
+                            }));
+                        }),
+                    );
+                }
+            }
+        }
     }
 
     // ---- cache ------------------------------------------------------------------------
@@ -347,6 +698,11 @@ impl Media {
         }
         self.pass = pass;
         self.demo_budget = DEMO_PIXELS_PER_FRAME;
+        self.drawn.clear();
+        self.pump_saves();
+        while let Ok((id, img)) = self.demo_rx.try_recv() {
+            self.upload_big(id, Ok(img));
+        }
 
         if let Some(f) = &self.fetcher {
             let mut loaded = Vec::new();
@@ -361,6 +717,13 @@ impl Media {
             }
             for l in loaded {
                 let id = l.key.id();
+                if self.big.iter().any(|b| b.id == id) {
+                    self.upload_big(id, l.result.map_err(|_| ()));
+                    continue;
+                }
+                if !matches!(self.entries.get(&id), Some(Entry::Loading)) {
+                    continue; // e.g. a viewer download that finished after it closed
+                }
                 match l.result {
                     Ok(img) => {
                         self.upload(id, img);
@@ -405,6 +768,49 @@ impl Media {
         t
     }
 
+    /// Put a finished large viewer image in place (dropped if the viewer moved on).
+    fn upload_big(&mut self, id: u64, result: Result<Image, ()>) {
+        let Some(b) = self.big.iter_mut().find(|b| b.id == id) else {
+            return;
+        };
+        b.state = match result {
+            Ok(img) => {
+                let size = [img.width, img.height];
+                let color = egui::ColorImage::from_rgba_unmultiplied(
+                    [img.width as usize, img.height as usize],
+                    &img.rgba,
+                );
+                drop(img);
+                let tex =
+                    self.ctx
+                        .load_texture(format!("viewer-{id:x}"), color, TextureOptions::LINEAR);
+                BigState::Ready(tex, size)
+            }
+            Err(()) => BigState::Failed,
+        };
+    }
+
+    /// Start the fetcher on first use. `false` if it can't run (or in demo mode).
+    fn ensure_fetcher(&mut self) -> bool {
+        if self.demo || self.net_broken {
+            return false;
+        }
+        if self.fetcher.is_none() {
+            let ctx = self.ctx.clone();
+            match Fetcher::spawn(nixcord_media::Config::default(), move || {
+                ctx.request_repaint()
+            }) {
+                Ok(f) => self.fetcher = Some(f),
+                Err(e) => {
+                    tracing::error!("media fetcher failed to start: {e}");
+                    self.net_broken = true;
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Look up `id`; `Some(got)` if the entry decides the outcome.
     fn cached(&mut self, id: u64) -> Option<Got> {
         match self.entries.get(&id)? {
@@ -429,21 +835,8 @@ impl Media {
         if let Some(g) = self.cached(id) {
             return g;
         }
-        if self.demo || self.net_broken {
+        if !self.ensure_fetcher() {
             return Got::Failed;
-        }
-        if self.fetcher.is_none() {
-            let ctx = self.ctx.clone();
-            match Fetcher::spawn(nixcord_media::Config::default(), move || {
-                ctx.request_repaint()
-            }) {
-                Ok(f) => self.fetcher = Some(f),
-                Err(e) => {
-                    tracing::error!("media fetcher failed to start: {e}");
-                    self.net_broken = true;
-                    return Got::Failed;
-                }
-            }
         }
         if let Some(f) = &self.fetcher {
             f.request(key);
@@ -472,13 +865,70 @@ fn local_id(kind: u8, seed: u64, w: u32, h: u32) -> u64 {
     murl::sized_id(&format!("demo:{kind}:{seed}"), w, h)
 }
 
+/// Gallery id of an image: the chat-list row it was drawn in, i.e. the `Ui` directly inside
+/// the innermost `ScrollArea` (skipping the scroll area's own margin `Frame`). `None` outside
+/// a scroll area (the image then opens alone).
+fn gallery_group(stack: &UiStack) -> Option<egui::Id> {
+    let mut node = stack;
+    while let Some(parent) = node.parent.as_deref() {
+        let grand = parent.parent.as_deref();
+        let in_list = parent.kind() == Some(UiKind::ScrollArea)
+            || (parent.kind() == Some(UiKind::Frame)
+                && grand.is_some_and(|g| g.kind() == Some(UiKind::ScrollArea)));
+        if in_list {
+            return Some(node.unique_id);
+        }
+        node = parent;
+    }
+    None
+}
+
+/// The user's Downloads folder, if it exists.
+fn downloads_dir() -> Option<PathBuf> {
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
+    let dir = PathBuf::from(home).join("Downloads");
+    dir.is_dir().then_some(dir)
+}
+
+fn saved_notice(path: &std::path::Path) -> String {
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    match path.parent() {
+        Some(dir) => format!("Saved {name} to {}", dir.display()),
+        None => format!("Saved {name}"),
+    }
+}
+
+/// Minimal executor for the dialog future on the save thread (rfd's async dialog wakes us
+/// from its own thread; on macOS it runs the panel on the main thread).
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    use std::task::{Context, Poll, Wake, Waker};
+    struct Unpark(std::thread::Thread);
+    impl Wake for Unpark {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = Waker::from(std::sync::Arc::new(Unpark(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+            return v;
+        }
+        std::thread::park();
+    }
+}
+
 fn radius(r: f32) -> CornerRadius {
     CornerRadius::same(r.round().clamp(0.0, 255.0) as u8)
 }
 
 /// Paint a texture into `rect` with rounded corners. `cover` crops the texture to fill the
 /// rect's aspect (avatars, icons); otherwise it is stretched to the rect (already fitted).
-fn paint_texture(ui: &Ui, rect: Rect, rounding: CornerRadius, t: Tex, cover: bool) {
+pub(crate) fn paint_texture(ui: &Ui, rect: Rect, rounding: CornerRadius, t: Tex, cover: bool) {
     let uv = if cover {
         cover_uv(t.size, rect.size())
     } else {
@@ -510,5 +960,101 @@ impl crate::ui::markdown::EmojiImages for MediaEmoji<'_> {
             .try_borrow_mut()
             .ok()?
             .emoji_texture(id, animated, size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One headless frame (texture uploads are acknowledged so epaint doesn't complain).
+    fn run(ctx: &egui::Context, f: impl FnMut(&mut Ui)) {
+        ctx.run_ui(egui::RawInput::default(), f)
+            .textures_delta
+            .clear();
+    }
+
+    /// One headless frame: a scroll list of two rows, each with a bare image and one inside
+    /// an embed-like `Frame`. Returns the gallery ids recorded, in draw order.
+    fn frame(media: &mut Media, ctx: &egui::Context) -> Vec<Option<egui::Id>> {
+        run(ctx, |ui| {
+            egui::ScrollArea::vertical().show_viewport(ui, |ui, _| {
+                for row in 0..2 {
+                    let rect = Rect::from_min_size(
+                        ui.max_rect().min + Vec2::new(0.0, row as f32 * 400.0),
+                        Vec2::new(400.0, 400.0),
+                    );
+                    let mut child =
+                        ui.new_child(egui::UiBuilder::new().id_salt(row).max_rect(rect));
+                    let url = format!("https://example.com/{row}/a.png");
+                    media.image(&mut child, &url, Vec2::splat(80.0), Some((80, 60)));
+                    egui::Frame::new().show(&mut child, |ui| {
+                        ui.horizontal(|ui| {
+                            let url = format!("https://example.com/{row}/b.png");
+                            media.image(ui, &url, Vec2::splat(80.0), Some((80, 60)));
+                        });
+                    });
+                }
+            });
+        });
+        media.drawn.iter().map(|(g, _)| *g).collect()
+    }
+
+    #[test]
+    fn gallery_groups_by_chat_row() {
+        let ctx = egui::Context::default();
+        let mut media = Media::new(&ctx, true);
+        let g = frame(&mut media, &ctx);
+        assert_eq!(g.len(), 4);
+        assert!(g.iter().all(Option::is_some));
+        assert_eq!(g[0], g[1]);
+        assert_eq!(g[2], g[3]);
+        assert_ne!(g[0], g[2]);
+
+        // A click on the second row's image opens with that row's two images.
+        media.open = Some((g[2], media.drawn[3].1.clone()));
+        let (items, index) = media.take_open_request().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(index, 1);
+        assert!(items[0].url.ends_with("/1/a.png"));
+    }
+
+    #[test]
+    fn outside_a_list_opens_alone() {
+        let ctx = egui::Context::default();
+        let mut media = Media::new(&ctx, true);
+        run(&ctx, |ui| {
+            media.image(ui, "https://example.com/x.png", Vec2::splat(50.0), None);
+        });
+        assert_eq!(media.drawn.len(), 1);
+        assert!(media.drawn[0].0.is_none());
+        media.open = Some((None, media.drawn[0].1.clone()));
+        let (items, index) = media.take_open_request().unwrap();
+        assert_eq!((items.len(), index), (1, 0));
+    }
+
+    #[test]
+    fn viewer_texture_is_freed_on_close() {
+        let ctx = egui::Context::default();
+        let mut media = Media::new(&ctx, true);
+        let img = ViewImage::for_test("https://example.com/big.png", Some((1200, 600)));
+        let mut got = None;
+        for _ in 0..500 {
+            run(&ctx, |_| {
+                got = media.viewer_tex(&img, (1920, 1080)).big;
+            });
+            if got.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let t = got.expect("demo viewer image generated");
+        // Natural size wins over the (rounded-up) window box; never upscaled.
+        assert_eq!(t.size, [1200, 600]);
+        assert_eq!(media.viewer_bytes(), 1200 * 600 * 4);
+        // Not in the preview LRU.
+        assert_eq!(media.stats(), (0, 0));
+        media.close_viewer();
+        assert_eq!(media.viewer_bytes(), 0);
     }
 }

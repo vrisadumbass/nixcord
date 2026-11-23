@@ -15,13 +15,21 @@
 //! [`Store::guild_channels`] instead.
 
 use nixcord_model::{
-    Channel, Emoji, GatewayEvent, Guild, Message, MessageUpdate, PartialMember, Reaction, Role,
-    Snowflake, User,
+    permissions as perm, Channel, ChannelKind, Emoji, GatewayEvent, Guild, GuildMember, Message,
+    MessageUpdate, OverwriteKind, PartialMember, Presence, Reaction, Relationship,
+    RelationshipKind, Role, Snowflake, Status, User,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+mod member_list;
+pub use member_list::{ListRow, ListSection, MemberList, MEMBER_LIST_MAX_ROWS};
+
 pub const MAX_MESSAGES_PER_CHANNEL: usize = 250;
+
+/// Channels with this exact name are always hidden (Discord placeholder for channels we
+/// may not see; a fallback for when permission data is incomplete).
+pub const HIDDEN_CHANNEL_NAME: &str = "__hidden__";
 
 /// How long a TYPING_START keeps a user shown as typing.
 pub const TYPING_TIMEOUT: Duration = Duration::from_secs(10);
@@ -59,6 +67,16 @@ pub struct Store {
     /// channel -> (user, when TYPING_START was received).
     typing: HashMap<Snowflake, Vec<(Snowflake, Instant)>>,
     users: HashMap<Snowflake, User>,
+    /// user -> latest presence. Offline users without activities are not stored.
+    presences: HashMap<Snowflake, Presence>,
+    /// target user -> relationship (friends, blocked, requests).
+    relationships: HashMap<Snowflake, Relationship>,
+    my_status: Status,
+    /// Member list of the focused guild only (see `set_member_list_focus`).
+    member_list: Option<(Snowflake, MemberList)>,
+    list_focus: Option<Snowflake>,
+    /// Incremented on every READY (new session). Lets the app re-subscribe.
+    epoch: u64,
 }
 
 impl Store {
@@ -70,7 +88,9 @@ impl Store {
         match event {
             GatewayEvent::Connecting => self.connection = ConnectionState::Connecting,
             GatewayEvent::Ready(ready) => {
+                let epoch = self.epoch + 1;
                 *self = Self::new();
+                self.epoch = epoch;
                 self.cache_user(&ready.user);
                 self.me = Some(ready.user.clone());
                 for guild in &ready.guilds {
@@ -79,7 +99,34 @@ impl Store {
                 for ch in &ready.private_channels {
                     self.upsert_channel(ch);
                 }
+                for r in &ready.relationships {
+                    self.relationship_add(r);
+                }
+                for p in &ready.presences {
+                    self.set_presence(p);
+                }
+                self.my_status = ready.status.unwrap_or(Status::Online);
                 self.connection = ConnectionState::Connected;
+            }
+            GatewayEvent::ReadySupplemental(sup) => {
+                for p in &sup.presences {
+                    self.set_presence(p);
+                }
+            }
+            GatewayEvent::PresenceUpdate { presence, user } => {
+                if let Some(u) = user {
+                    self.cache_user(u);
+                }
+                self.set_presence(presence);
+            }
+            GatewayEvent::MemberListUpdate(u) => self.member_list_update(u),
+            GatewayEvent::RelationshipAdd(r) => self.relationship_add(r),
+            GatewayEvent::RelationshipRemove { user_id } => {
+                self.relationships.remove(user_id);
+            }
+            GatewayEvent::OwnStatus(s) => self.my_status = *s,
+            GatewayEvent::GuildMemberUpdate { guild_id, member } => {
+                self.cache_guild_member(*guild_id, member);
             }
             GatewayEvent::Resumed => self.connection = ConnectionState::Connected,
             GatewayEvent::Disconnected { will_retry, .. } => {
@@ -367,7 +414,321 @@ impl Store {
         self.users.get(&id)
     }
 
+    // ---- presence, relationships ----
+
+    /// Number of READYs seen (a new session each). Subscriptions must be re-sent when it
+    /// changes.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Latest presence of a user, if they are online or have an activity.
+    pub fn presence(&self, user: Snowflake) -> Option<&Presence> {
+        self.presences.get(&user)
+    }
+
+    /// Status of a user (`Offline` when unknown). For myself, my own status.
+    pub fn status(&self, user: Snowflake) -> Status {
+        if self.me.as_ref().is_some_and(|m| m.id == user) {
+            return match self.my_status {
+                Status::Invisible => Status::Offline,
+                s => s,
+            };
+        }
+        self.presences
+            .get(&user)
+            .map_or(Status::Offline, |p| p.status)
+    }
+
+    /// Custom status or activity line for a user.
+    pub fn status_text(&self, user: Snowflake) -> Option<String> {
+        self.presences.get(&user)?.status_text()
+    }
+
+    /// My own status as last set / reported (may be `Invisible`).
+    pub fn my_status(&self) -> Status {
+        self.my_status
+    }
+
+    /// Optimistically set my status after sending op 3 (Discord never echoes our own
+    /// PRESENCE_UPDATE; SESSIONS_REPLACE may follow).
+    pub fn set_my_status(&mut self, status: Status) {
+        self.my_status = status;
+    }
+
+    pub fn relationship(&self, user: Snowflake) -> Option<&Relationship> {
+        self.relationships.get(&user)
+    }
+
+    /// Friends, sorted by display name (case-insensitive).
+    pub fn friends(&self) -> Vec<&User> {
+        let mut out: Vec<&User> = self
+            .relationships
+            .values()
+            .filter(|r| r.kind == RelationshipKind::Friend)
+            .filter_map(|r| self.users.get(&r.id))
+            .collect();
+        out.sort_by_cached_key(|u| (u.display_name().to_lowercase(), u.id));
+        out
+    }
+
+    // ---- member list ----
+
+    /// Keep the member list of `guild` only. Switching away drops the previous guild's
+    /// list, its cached member rows and the presences only it referenced. Updates for
+    /// other guilds are ignored.
+    pub fn set_member_list_focus(&mut self, guild: Option<Snowflake>) {
+        if self.list_focus == guild {
+            return;
+        }
+        self.list_focus = guild;
+        if self
+            .member_list
+            .as_ref()
+            .is_some_and(|(g, _)| Some(*g) != guild)
+        {
+            if let Some((g, list)) = self.member_list.take() {
+                self.forget_list(g, &list);
+            }
+        }
+    }
+
+    pub fn member_list_focus(&self) -> Option<Snowflake> {
+        self.list_focus
+    }
+
+    /// The member list of a guild, if it is the focused one and a SYNC arrived.
+    pub fn member_list(&self, guild: Snowflake) -> Option<&MemberList> {
+        self.member_list
+            .as_ref()
+            .filter(|(g, _)| *g == guild)
+            .map(|(_, l)| l)
+    }
+
+    /// Member avatar hash of a user in a guild (guild-specific avatar), if known.
+    pub fn member_avatar(&self, guild: Snowflake, user: Snowflake) -> Option<&str> {
+        self.members.get(&(guild, user))?.avatar.as_deref()
+    }
+
+    // ---- permissions ----
+
+    /// My effective permissions in a guild channel, following Discord's documented
+    /// algorithm. `None` when unknown (not a guild channel, or my member / the
+    /// @everyone role is unknown): callers should fail open.
+    pub fn channel_permissions(&self, channel_id: Snowflake) -> Option<u64> {
+        let ch = self.channels.get(&channel_id)?;
+        let guild_id = ch.guild_id?;
+        let guild = self.guilds.get(&guild_id)?;
+        let me = self.me.as_ref()?.id;
+        if guild.owner_id == Some(me) {
+            return Some(perm::ALL);
+        }
+        let member = self.members.get(&(guild_id, me))?;
+        let everyone = guild.roles.iter().find(|r| r.id == guild_id)?;
+        let mut base = everyone.permissions;
+        for r in guild.roles.iter().filter(|r| member.roles.contains(&r.id)) {
+            base |= r.permissions;
+        }
+        if base & perm::ADMINISTRATOR != 0 {
+            return Some(perm::ALL);
+        }
+        let mut p = base;
+        let ows = &ch.permission_overwrites;
+        if let Some(o) = ows.iter().find(|o| o.id == guild_id) {
+            p &= !o.deny;
+            p |= o.allow;
+        }
+        let (mut allow, mut deny) = (0u64, 0u64);
+        for o in ows.iter().filter(|o| {
+            o.kind == OverwriteKind::Role && o.id != guild_id && member.roles.contains(&o.id)
+        }) {
+            allow |= o.allow;
+            deny |= o.deny;
+        }
+        p &= !deny;
+        p |= allow;
+        if let Some(o) = ows
+            .iter()
+            .find(|o| o.kind == OverwriteKind::Member && o.id == me)
+        {
+            p &= !o.deny;
+            p |= o.allow;
+        }
+        Some(p)
+    }
+
+    /// Can I see this channel? DMs always; guild channels per permissions, failing open
+    /// when my roles are unknown. Unknown channels are not visible.
+    pub fn can_view(&self, channel_id: Snowflake) -> bool {
+        let Some(ch) = self.channels.get(&channel_id) else {
+            return false;
+        };
+        if ch.guild_id.is_none() {
+            return true;
+        }
+        self.channel_permissions(channel_id)
+            .is_none_or(|p| p & perm::VIEW_CHANNEL != 0)
+    }
+
+    /// Can I send messages here (needs VIEW_CHANNEL too)? Fails open like `can_view`.
+    pub fn can_send(&self, channel_id: Snowflake) -> bool {
+        let Some(ch) = self.channels.get(&channel_id) else {
+            return false;
+        };
+        if ch.guild_id.is_none() {
+            return true;
+        }
+        self.channel_permissions(channel_id)
+            .is_none_or(|p| p & perm::VIEW_CHANNEL != 0 && p & perm::SEND_MESSAGES != 0)
+    }
+
+    /// `guild_channels` without what the official client hides: channels I can't view,
+    /// channels named `__hidden__`, and categories left with no visible children.
+    pub fn visible_guild_channels(&self, guild_id: Snowflake) -> Vec<&Channel> {
+        let all = self.guild_channels(guild_id);
+        let shown =
+            |c: &Channel| c.name.as_deref() != Some(HIDDEN_CHANNEL_NAME) && self.can_view(c.id);
+        let has_children: HashSet<Snowflake> = all
+            .iter()
+            .filter(|c| c.kind != ChannelKind::Category && shown(c))
+            .filter_map(|c| c.parent_id)
+            .collect();
+        all.into_iter()
+            .filter(|c| {
+                if c.kind == ChannelKind::Category {
+                    shown(c) && has_children.contains(&c.id)
+                } else {
+                    shown(c)
+                }
+            })
+            .collect()
+    }
+
     // ---- internals ----
+
+    /// Users whose presence we keep regardless of member lists: me, friends and other
+    /// relationships, DM recipients.
+    fn presence_pinned(&self, user: Snowflake) -> bool {
+        self.me.as_ref().is_some_and(|m| m.id == user)
+            || self.relationships.contains_key(&user)
+            || self.private_ids.iter().any(|id| {
+                self.channels
+                    .get(id)
+                    .is_some_and(|c| c.recipients.iter().any(|r| r.id == user))
+            })
+    }
+
+    fn set_presence(&mut self, p: &Presence) {
+        if p.status == Status::Offline && p.activities.is_empty() {
+            self.presences.remove(&p.user_id);
+            return;
+        }
+        let mut p = p.clone();
+        // Presences are kept per user; the guild a given copy came from doesn't matter.
+        p.guild_id = None;
+        match self.presences.get_mut(&p.user_id) {
+            Some(existing) if *existing == p => {}
+            Some(existing) => *existing = p,
+            None => {
+                self.presences.insert(p.user_id, p);
+            }
+        }
+    }
+
+    fn relationship_add(&mut self, r: &Relationship) {
+        let mut r = r.clone();
+        if let Some(u) = r.user.take() {
+            self.cache_user(&u);
+        }
+        self.relationships.insert(r.id, r);
+    }
+
+    fn cache_guild_member(&mut self, guild: Snowflake, m: &GuildMember) {
+        let Some(id) = m.id() else { return };
+        if let Some(u) = &m.user {
+            self.cache_user(u);
+        }
+        let partial = m.partial();
+        match self.members.get_mut(&(guild, id)) {
+            Some(existing) if *existing == partial => {}
+            Some(existing) => *existing = partial,
+            None => {
+                self.members.insert((guild, id), partial);
+            }
+        }
+    }
+
+    fn member_list_update(&mut self, u: &nixcord_model::MemberListUpdate) {
+        if self.list_focus != Some(u.guild_id) {
+            return;
+        }
+        // Cache member data and presences carried by the items.
+        for item in member_list::op_items(&u.ops) {
+            if let nixcord_model::MemberListItem::Member(m) = item {
+                self.cache_guild_member(u.guild_id, &m.member);
+                match &m.presence {
+                    Some(p) => self.set_presence(p),
+                    // A list member without a presence is offline.
+                    None => {
+                        if let Some(id) = m.member.id() {
+                            if !self.presence_pinned(id) {
+                                self.presences.remove(&id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let replace = match &self.member_list {
+            Some((g, l)) => *g != u.guild_id || l.id != u.id,
+            None => true,
+        };
+        if replace {
+            // A different list (e.g. a channel with other overwrites) needs a SYNC first.
+            if !u
+                .ops
+                .iter()
+                .any(|o| matches!(o, nixcord_model::MemberListOp::Sync { .. }))
+            {
+                return;
+            }
+            self.member_list = Some((u.guild_id, MemberList::new(u.id.clone())));
+        }
+        if let Some((_, list)) = &mut self.member_list {
+            list.apply(u);
+        }
+    }
+
+    /// Drop presences and member rows that only the dropped list referenced. Member data
+    /// learned from stored messages is re-derived so chat role colors stay correct.
+    fn forget_list(&mut self, guild: Snowflake, list: &MemberList) {
+        let me = self.me.as_ref().map(|u| u.id);
+        let ids: Vec<Snowflake> = list.member_ids().collect();
+        for id in &ids {
+            if !self.presence_pinned(*id) {
+                self.presences.remove(id);
+            }
+            if Some(*id) != me {
+                self.members.remove(&(guild, *id));
+            }
+        }
+        let gone: HashSet<Snowflake> = ids.into_iter().collect();
+        let channels = self
+            .guild_channel_ids
+            .get(&guild)
+            .cloned()
+            .unwrap_or_default();
+        let msgs: Vec<Message> = channels
+            .iter()
+            .filter_map(|c| self.messages.get(c))
+            .flatten()
+            .filter(|m| gone.contains(&m.author.id) && m.member.is_some())
+            .cloned()
+            .collect();
+        for m in &msgs {
+            self.cache_member(m);
+        }
+    }
 
     fn cache_user(&mut self, u: &User) {
         match self.users.get_mut(&u.id) {
@@ -433,6 +794,9 @@ impl Store {
         }
         if let Some(e) = &u.embeds {
             m.embeds.clone_from(e);
+        }
+        if let Some(c) = &u.components {
+            m.components.clone_from(c);
         }
         if let Some(mentions) = &u.mentions {
             m.mentions.clone_from(mentions);
@@ -505,6 +869,9 @@ impl Store {
     fn upsert_guild(&mut self, g: &Guild, replace_channels: bool) {
         let mut stored = g.clone();
         let channels = std::mem::take(&mut stored.channels);
+        for m in std::mem::take(&mut stored.members) {
+            self.cache_guild_member(g.id, &m);
+        }
         if !self.guilds.contains_key(&g.id) {
             self.guild_order.push(g.id);
         }

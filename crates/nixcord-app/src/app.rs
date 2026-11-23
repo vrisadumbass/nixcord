@@ -118,6 +118,7 @@ pub struct ViewState {
     pub mic_muted: bool,
     pub deafened: bool,
     pub confirm_delete: Option<(Snowflake, Snowflake)>,
+    pub member_sub: ui::presence::SubState,
 }
 
 pub struct NixApp {
@@ -138,7 +139,8 @@ pub struct NixApp {
     /// Newest message id the user has seen per channel (unread indicators; not persisted).
     pub seen: HashMap<Snowflake, Snowflake>,
     seen_dirty: bool,
-    toast: Option<(String, Instant)>,
+    /// (message, shown at, is_error)
+    toast: Option<(String, Instant, bool)>,
     /// Token + remember flag of the login in flight. Dropped once it resolves.
     pending_login: Option<(String, bool)>,
     token_source: Option<token::Source>,
@@ -191,14 +193,20 @@ impl NixApp {
         app
     }
 
-    fn send(&self, cmd: Command) {
+    pub(crate) fn send(&self, cmd: Command) {
         if self.backend.commands.send(cmd).is_err() {
             tracing::error!("backend is gone");
         }
     }
 
+    /// Neutral notice (e.g. "Saved to Downloads").
     pub fn toast(&mut self, msg: impl Into<String>) {
-        self.toast = Some((msg.into(), Instant::now()));
+        self.toast = Some((msg.into(), Instant::now(), false));
+    }
+
+    /// Error notice, drawn with a red border.
+    pub fn toast_err(&mut self, msg: impl Into<String>) {
+        self.toast = Some((msg.into(), Instant::now(), true));
     }
 
     // ---- backend events -------------------------------------------------------------
@@ -254,7 +262,7 @@ impl NixApp {
             AppEvent::Sent(m) => self.store.apply(&GatewayEvent::MessageCreate(m)),
             AppEvent::Forbidden { channel } => {
                 self.view.forbidden.insert(channel);
-                self.toast("You don't have permission to send messages in this channel.");
+                self.toast_err("You don't have permission to send messages in this channel.");
             }
             AppEvent::HistoryFailed { channel, error } => {
                 // Unblock this channel only, so the user can retry it.
@@ -265,9 +273,9 @@ impl NixApp {
                 if !self.store.history_loaded(channel) {
                     self.view.history_failed.insert(channel);
                 }
-                self.toast(error);
+                self.toast_err(error);
             }
-            AppEvent::Error(e) => self.toast(e),
+            AppEvent::Error(e) => self.toast_err(e),
             AppEvent::LoginOk(_user) => {
                 if let Some((tok, remember)) = self.pending_login.take() {
                     if remember && !tok.is_empty() {
@@ -337,7 +345,7 @@ impl NixApp {
                 self.view.guild = Some(g);
                 let ch = self.view.last_channel.get(&Some(g)).copied().or_else(|| {
                     self.store
-                        .guild_channels(g)
+                        .visible_guild_channels(g)
                         .into_iter()
                         .find(|c| c.kind.is_textual())
                         .map(|c| c.id)
@@ -430,6 +438,7 @@ impl NixApp {
             Action::Copy(text) => ctx.copy_text(text),
             Action::Typing(channel) => self.send(Command::Typing { channel }),
             Action::OpenSettings => self.settings_open = true,
+            Action::Toast(msg) => self.toast(msg),
         }
     }
 
@@ -501,7 +510,7 @@ impl NixApp {
     /// Does this server have an unread text channel?
     pub fn guild_unread(&self, guild: Snowflake) -> bool {
         self.store
-            .guild_channels(guild)
+            .visible_guild_channels(guild)
             .into_iter()
             .any(|c| c.kind.is_textual() && self.is_unread(c))
     }
@@ -637,7 +646,9 @@ impl NixApp {
     }
 
     fn toast_ui(&mut self, ctx: &egui::Context) {
-        let Some((msg, at)) = &self.toast else { return };
+        let Some((msg, at, is_err)) = &self.toast else {
+            return;
+        };
         let left = TOAST_FOR.saturating_sub(at.elapsed());
         if left.is_zero() {
             self.toast = None;
@@ -652,7 +663,14 @@ impl NixApp {
             .show(ctx, |ui| {
                 Frame::new()
                     .fill(t.elevated.to_opaque())
-                    .stroke(egui::Stroke::new(1.0, t.danger.gamma_multiply(0.6)))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        if *is_err {
+                            t.danger.gamma_multiply(0.6)
+                        } else {
+                            t.divider
+                        },
+                    ))
                     .corner_radius(CornerRadius::same(8))
                     .inner_margin(Margin::symmetric(14, 10))
                     .show(ui, |ui| {
@@ -688,10 +706,12 @@ impl eframe::App for NixApp {
             }
             Screen::Main => {
                 self.ensure_history();
+                self.sync_member_subscription();
                 self.update_seen();
                 self.main_ui(ui, &mut actions);
                 ui::settings::window(&ctx, self, &mut actions);
                 ui::chat::delete_modal(&ctx, self, &mut actions);
+                ui::viewer::show(&ctx, self);
             }
         }
         self.toast_ui(&ctx);
