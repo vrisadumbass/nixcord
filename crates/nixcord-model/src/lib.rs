@@ -282,7 +282,15 @@ pub struct Channel {
     /// Tag ids applied to a Forum post thread.
     #[serde(default, deserialize_with = "de_lenient_vec")]
     pub applied_tags: Vec<Snowflake>,
+    /// Threads: present when the current user has joined the thread.
+    #[serde(default)]
+    pub member: Option<ThreadSelfMember>,
 }
+
+/// The current user's thread member object (`member` on a thread). Only its presence
+/// matters: it means "joined", which is what puts a thread in the sidebar.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ThreadSelfMember {}
 
 impl Channel {
     /// Name to show in the sidebar. DMs fall back to recipient names.
@@ -1204,6 +1212,16 @@ pub enum GatewayEvent {
         guild_id: Snowflake,
         channel_ids: Vec<Snowflake>,
         threads: Vec<Channel>,
+    },
+    /// THREAD_MEMBER_UPDATE: the current user's membership of this thread (joined).
+    ThreadMemberUpdate {
+        thread_id: Snowflake,
+    },
+    /// THREAD_MEMBERS_UPDATE: users added to / removed from a thread.
+    ThreadMembersUpdate {
+        thread_id: Snowflake,
+        added_user_ids: Vec<Snowflake>,
+        removed_user_ids: Vec<Snowflake>,
     },
 }
 

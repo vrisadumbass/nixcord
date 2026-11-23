@@ -554,6 +554,24 @@ pub fn fmt_stamp(ms: u64, h24: bool) -> String {
     }
 }
 
+/// Message header stamp, as Discord shows it: "9:53 PM" today, otherwise like
+/// [`fmt_stamp`].
+pub fn fmt_message_stamp(ms: u64, h24: bool) -> String {
+    let today = local(ms).is_some_and(|t| t.date_naive() == Local::now().date_naive());
+    if today {
+        fmt_clock(ms, h24)
+    } else {
+        fmt_stamp(ms, h24)
+    }
+}
+
+/// Full date and time for tooltips: "Monday, November 23, 2026 at 9:53 PM".
+pub fn fmt_full_stamp(ms: u64, h24: bool) -> String {
+    local(ms).map_or_else(String::new, |t| {
+        format!("{} at {}", t.format("%A, %B %-d, %Y"), fmt_clock(ms, h24))
+    })
+}
+
 /// Local calendar day number, for date dividers.
 pub fn day_number(ms: u64) -> i32 {
     local(ms).map_or(0, |t| t.date_naive().num_days_from_ce())

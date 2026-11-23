@@ -152,6 +152,8 @@ pub struct Store {
     relationships: HashMap<Snowflake, Relationship>,
     my_status: Status,
     my_custom_status: Option<CustomStatus>,
+    /// Threads the current user has joined (only these are listed in the sidebar).
+    joined_threads: HashSet<Snowflake>,
     /// Member list of the focused guild only (see `set_member_list_focus`).
     member_list: Option<(Snowflake, MemberList)>,
     list_focus: Option<Snowflake>,
@@ -302,7 +304,18 @@ impl Store {
                 self.upsert_channel(ch)
             }
             GatewayEvent::ChannelDelete(ch) => self.remove_channel(ch.id),
-            GatewayEvent::MessageCreate(m) => self.message_create(m),
+            GatewayEvent::MessageCreate(m) => {
+                // Posting in a thread joins it (Discord auto-joins the author).
+                if self.me.as_ref().is_some_and(|u| u.id == m.author.id)
+                    && self
+                        .channels
+                        .get(&m.channel_id)
+                        .is_some_and(|c| c.kind.is_thread())
+                {
+                    self.joined_threads.insert(m.channel_id);
+                }
+                self.message_create(m)
+            }
             GatewayEvent::MessageUpdate(u) => self.message_update(u),
             GatewayEvent::MessageDelete { id, channel_id } => {
                 if let Some(msgs) = self.messages.get_mut(channel_id) {
@@ -334,7 +347,25 @@ impl Store {
                 self.upsert_thread(ch);
             }
             GatewayEvent::ThreadDelete { id, guild_id, .. } => {
+                self.joined_threads.remove(id);
                 self.remove_thread(*id, *guild_id);
+            }
+            GatewayEvent::ThreadMemberUpdate { thread_id } => {
+                self.joined_threads.insert(*thread_id);
+            }
+            GatewayEvent::ThreadMembersUpdate {
+                thread_id,
+                added_user_ids,
+                removed_user_ids,
+            } => {
+                if let Some(me) = self.me.as_ref().map(|u| u.id) {
+                    if added_user_ids.contains(&me) {
+                        self.joined_threads.insert(*thread_id);
+                    }
+                    if removed_user_ids.contains(&me) {
+                        self.joined_threads.remove(thread_id);
+                    }
+                }
             }
             GatewayEvent::ThreadListSync {
                 guild_id,
@@ -635,6 +666,12 @@ impl Store {
     }
 
     /// Active, visible threads belonging to `parent_id`, most recently active first.
+    /// Has the current user joined this thread? Only joined threads are listed in the
+    /// sidebar, like Discord.
+    pub fn thread_joined(&self, thread_id: Snowflake) -> bool {
+        self.joined_threads.contains(&thread_id)
+    }
+
     pub fn channel_threads(&self, parent_id: Snowflake) -> Vec<&Channel> {
         if let Some(gid) = self.channels.get(&parent_id).and_then(|c| c.guild_id) {
             return self
@@ -1707,6 +1744,10 @@ impl Store {
     }
 
     fn upsert_thread(&mut self, th: &Channel) {
+        let me = self.me.as_ref().map(|u| u.id);
+        if th.member.is_some() || (me.is_some() && th.owner_id == me) {
+            self.joined_threads.insert(th.id);
+        }
         let mut th = th.clone();
         if th.guild_id.is_none() {
             th.guild_id = th

@@ -511,6 +511,22 @@ fn ready() -> Ready {
         ..Default::default()
     };
 
+    // "You" have joined the text-channel threads (so they're in the sidebar), not the
+    // forum posts, which are browsed on the forum board.
+    for g in [&mut nix, &mut rust] {
+        let forums: Vec<Snowflake> = g
+            .channels
+            .iter()
+            .filter(|c| c.kind == ChannelKind::Forum)
+            .map(|c| c.id)
+            .collect();
+        for th in &mut g.threads {
+            if !th.parent_id.is_some_and(|p| forums.contains(&p)) {
+                th.member = Some(Default::default());
+            }
+        }
+    }
+
     Ready {
         user: p[0].clone(),
         guilds: vec![nix, rust, pixel, synth, coffee],
@@ -768,8 +784,8 @@ fn showcase_messages(
              > replies, reactions, embeds and role colors all landed this week\n\
              The secret: ||it idles well under 80 MB||. Notes are in \
              [the architecture doc](https://github.com/vrisadumbass/nixcord) \u{2014} \
-             thanks <@{}> and <@{}>!",
-            juan.id, rebrax.id
+             thanks <@{}> and <@{}>! Roadmap: https://discord.com/channels/{}/111",
+            juan.id, rebrax.id, guild
         ),
         t,
     );
@@ -1823,6 +1839,7 @@ pub async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx
                         locked: false,
                     }),
                     applied_tags,
+                    member: Some(Default::default()),
                     ..Default::default()
                 };
                 if let Some(m) = first_msg {

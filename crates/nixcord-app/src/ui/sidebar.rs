@@ -1871,9 +1871,13 @@ fn guild_channels(ui: &mut Ui, app: &NixApp, gid: Snowflake, actions: &mut Vec<A
             continue;
         }
         channel_row(ui, app, ch, actions);
+        // Like Discord: only threads you've joined (or have open) are listed.
         let visible_threads: Vec<&Channel> = threads
             .into_iter()
-            .filter(|th| !collapsed_cat || app.view.channel == Some(th.id))
+            .filter(|th| {
+                let open = app.view.channel == Some(th.id);
+                open || (!collapsed_cat && app.store.thread_joined(th.id))
+            })
             .collect();
         let n = visible_threads.len();
         for (i, th) in visible_threads.into_iter().enumerate() {

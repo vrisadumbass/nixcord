@@ -8,9 +8,9 @@
 
 use super::markdown::{self, MdClick, RenderCtx, StoreResolver};
 use super::{
-    bold, emoji_picker, emoji_text, fmt_clock, fmt_day, fmt_size, fmt_stamp, hline, icon_button,
-    id_color, member_name, paint_app_badge, paint_icon, paint_plus, paint_search, prop, role_color,
-    Action, Icon,
+    bold, emoji_picker, emoji_text, fmt_clock, fmt_day, fmt_size, hline, icon_button, id_color,
+    member_name, paint_app_badge, paint_icon, paint_plus, paint_search, prop, role_color, Action,
+    Icon,
 };
 use crate::app::{NixApp, RowKey, ScrollAnchor};
 use crate::media::MediaEmoji;
@@ -90,6 +90,10 @@ pub fn header(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Ac
         .flatten();
     let name = channel.label();
     let topic = channel.topic.clone().filter(|s| !s.trim().is_empty());
+    let search_hint = match channel.guild_id.and_then(|g| app.store.guild(g)) {
+        Some(g) => format!("Search {}", g.name),
+        None => "Search".to_string(),
+    };
     let me = app.store.me().map(|u| u.id);
     let dm_user = (channel.kind == ChannelKind::Dm)
         .then(|| channel.recipients.iter().find(|u| Some(u.id) != me))
@@ -145,7 +149,7 @@ pub fn header(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Ac
         let resp = child.add(
             egui::TextEdit::singleline(&mut app.view.search.input)
                 .id(Id::unique("header_search"))
-                .hint_text("Search (Enter)")
+                .hint_text(search_hint)
                 .frame(Frame::NONE)
                 .margin(Margin::ZERO)
                 .font(prop(14.0))
@@ -314,15 +318,82 @@ pub fn header(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Ac
                 let (r, _) = ui.allocate_exact_size(Vec2::new(1.0, 24.0), Sense::hover());
                 ui.painter().rect_filled(r, 0.0, t.divider);
                 ui.add_space(4.0);
-                let one_line = topic.lines().next().unwrap_or_default().to_string();
-                ui.add(
-                    egui::Label::new(RichText::new(one_line).font(prop(14.0)).color(t.muted))
-                        .truncate(),
-                )
-                .on_hover_text(topic);
+                topic_line(ui, t, &topic);
             }
         });
     });
+}
+
+/// URL byte ranges in `text` (bare `http(s)://` words, trailing punctuation trimmed).
+fn url_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut search = 0;
+    while let Some(rel) = text[search..].find("http") {
+        let start = search + rel;
+        let rest = &text[start..];
+        let is_url = rest.starts_with("https://") || rest.starts_with("http://");
+        let at_word_start = text[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| c.is_whitespace() || "(<[".contains(c));
+        let word_len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        if is_url && at_word_start {
+            let url =
+                rest[..word_len].trim_end_matches(['.', ',', ')', '>', ']', '!', '?', ';', ':']);
+            if url.len() > "https://".len() {
+                out.push(start..start + url.len());
+            }
+        }
+        search = start + word_len.max(4);
+    }
+    out
+}
+
+/// One-line channel topic with clickable links (like Discord's header); full text on hover.
+fn topic_line(ui: &mut Ui, t: &crate::theme::Theme, topic: &str) {
+    let line = topic.lines().next().unwrap_or_default();
+    let urls = url_ranges(line);
+    let font = prop(14.0);
+    let mut job = egui::text::LayoutJob::default();
+    let mut at = 0;
+    for r in &urls {
+        job.append(
+            &line[at..r.start],
+            0.0,
+            egui::TextFormat::simple(font.clone(), t.muted),
+        );
+        job.append(
+            &line[r.clone()],
+            0.0,
+            egui::TextFormat::simple(font.clone(), t.link),
+        );
+        at = r.end;
+    }
+    job.append(&line[at..], 0.0, egui::TextFormat::simple(font, t.muted));
+    job.wrap = egui::text::TextWrapping::truncate_at_width(ui.available_width());
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    let (rect, resp) = ui.allocate_exact_size(galley.size(), Sense::click());
+    // Which link (if any) is under the pointer: map the pointer to a char index.
+    let hovered_url = resp.hover_pos().and_then(|p| {
+        let idx = galley.cursor_from_pos(p - rect.min).index.0;
+        let byte = line.char_indices().nth(idx).map_or(line.len(), |(b, _)| b);
+        urls.iter()
+            .find(|r| r.contains(&byte))
+            .map(|r| &line[r.clone()])
+    });
+    ui.painter().galley(rect.min, galley, t.muted);
+    match hovered_url {
+        Some(url) => {
+            if resp.clicked() {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+            }
+            resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(url);
+        }
+        None => {
+            resp.on_hover_text(topic);
+        }
+    }
 }
 
 fn thread_status_pill(ui: &mut Ui, label: &str, fg: Color32, bg: Color32) {
@@ -1107,10 +1178,11 @@ fn message_row(
             }
             ui.add_space(2.0);
             ui.label(
-                RichText::new(fmt_stamp(m.id.timestamp_ms(), h24))
+                RichText::new(super::fmt_message_stamp(m.id.timestamp_ms(), h24))
                     .font(prop(12.0))
                     .color(t.muted),
-            );
+            )
+            .on_hover_text(super::fmt_full_stamp(m.id.timestamp_ms(), h24));
         });
         child.add_space(-4.0);
     }
@@ -1322,8 +1394,8 @@ fn content(ui: &mut Ui, app: &NixApp, m: &Message, actions: &mut Vec<Action>) ->
     ctx.h24 = app.prefs.clock_24h;
     ctx.emoji = Some(&emoji);
     let out = markdown::render(ui, &*doc, &ctx);
-    if let Some(MdClick::Channel(id)) = out.clicked {
-        actions.push(Action::SelectChannel(Snowflake(id)));
+    if let Some(a) = out.clicked.as_ref().and_then(MdClick::action) {
+        actions.push(a);
     }
     out.mentions_me
 }
@@ -1480,10 +1552,16 @@ fn embed_card(
                 .video
                 .as_ref()
                 .filter(|_| e.kind.as_deref() == Some("video"));
+            // Discord shows an "article" embed's thumbnail (og:image with a large Twitter
+            // card, e.g. GitHub) as the big image under the text, not a small one beside it.
+            let article_image = e
+                .thumbnail
+                .as_ref()
+                .filter(|_| e.kind.as_deref() == Some("article") && e.image.is_none());
             let thumb = e
                 .thumbnail
                 .as_ref()
-                .filter(|_| e.image.is_none() && video.is_none());
+                .filter(|_| e.image.is_none() && video.is_none() && article_image.is_none());
             let text_w = if thumb.is_some() {
                 card_w - 32.0 - 96.0
             } else {
@@ -1521,7 +1599,7 @@ fn embed_card(
                     );
                 }
             }
-            if let Some(img) = &e.image {
+            if let Some(img) = e.image.as_ref().or(article_image) {
                 ui.add_space(4.0);
                 let max = Vec2::new(PREVIEW_MAX.x.min(card_w - 32.0), PREVIEW_MAX.y);
                 app.media.borrow_mut().image(
@@ -1644,8 +1722,8 @@ fn embed_markdown(
     ctx.font_size = 14.0;
     ctx.line_height = 18.0;
     let out = markdown::render(ui, &*doc, &ctx);
-    if let Some(MdClick::Channel(id)) = out.clicked {
-        actions.push(Action::SelectChannel(Snowflake(id)));
+    if let Some(a) = out.clicked.as_ref().and_then(MdClick::action) {
+        actions.push(a);
     }
 }
 
@@ -1656,9 +1734,8 @@ fn reactions_row(ui: &mut Ui, app: &NixApp, m: &Message, actions: &mut Vec<Actio
         return;
     }
     let t = app.theme;
-    // The "+" pill shows while the message is hovered (or its picker is open).
-    let show_add = app.chat.hover.is_some_and(|(id, _)| id == m.id)
-        || react_picker_open(ui.ctx()).is_some_and(|p| p.message == m.id);
+    // Like Discord, the add-reaction pill always sits after the reactions.
+    let picker_open = react_picker_open(ui.ctx()).is_some_and(|p| p.message == m.id);
     ui.add_space(2.0);
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
@@ -1682,8 +1759,8 @@ fn reactions_row(ui: &mut Ui, app: &NixApp, m: &Message, actions: &mut Vec<Actio
         }
         // Add-reaction pill (space always reserved so the row doesn't reflow on hover).
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(34.0, 26.0), Sense::click());
-        if show_add {
-            let hot = resp.hovered();
+        {
+            let hot = resp.hovered() || picker_open;
             ui.painter().rect(
                 rect,
                 CornerRadius::same(8),
@@ -2074,5 +2151,16 @@ mod reaction_tests {
             let _ = thread_header_button(ui, t, "Unlock", true, "Unlock Thread");
         });
         out.textures_delta.clear();
+    }
+
+    #[test]
+    fn finds_urls_in_topics() {
+        let text = "Chat here. Code: https://example.com/a/b. More (http://x.org)";
+        let got: Vec<&str> = super::url_ranges(text)
+            .into_iter()
+            .map(|r| &text[r])
+            .collect();
+        assert_eq!(got, vec!["https://example.com/a/b", "http://x.org"]);
+        assert!(super::url_ranges("no links, just httpd and https://").is_empty());
     }
 }

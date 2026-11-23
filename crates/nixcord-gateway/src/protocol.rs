@@ -441,8 +441,16 @@ pub fn decode_dispatch(t: &str, d: &str) -> Result<Option<GatewayEvent>, JsonErr
                 channel_ids: Vec<Snowflake>,
                 #[serde(default)]
                 threads: Vec<Value>,
+                /// The current user's thread members, for the threads they joined.
+                #[serde(default)]
+                members: Vec<Value>,
             }
             let s: ThreadSync = serde_json::from_str(d)?;
+            let joined: std::collections::HashSet<Snowflake> = s
+                .members
+                .iter()
+                .filter_map(|m| m.get("id").and_then(snowflake_of))
+                .collect();
             GatewayEvent::ThreadListSync {
                 guild_id: s.guild_id,
                 channel_ids: s.channel_ids,
@@ -450,7 +458,45 @@ pub fn decode_dispatch(t: &str, d: &str) -> Result<Option<GatewayEvent>, JsonErr
                     .threads
                     .into_iter()
                     .filter_map(|v| serde_json::from_value::<Channel>(v).ok())
+                    .map(|mut t| {
+                        if joined.contains(&t.id) {
+                            t.member.get_or_insert_with(Default::default);
+                        }
+                        t
+                    })
                     .collect(),
+            }
+        }
+        "THREAD_MEMBER_UPDATE" => {
+            let v: Value = serde_json::from_str(d)?;
+            let Some(thread_id) = v.get("id").and_then(snowflake_of) else {
+                return Ok(None);
+            };
+            GatewayEvent::ThreadMemberUpdate { thread_id }
+        }
+        "THREAD_MEMBERS_UPDATE" => {
+            let v: Value = serde_json::from_str(d)?;
+            let Some(thread_id) = v.get("id").and_then(snowflake_of) else {
+                return Ok(None);
+            };
+            let added_user_ids = v
+                .get("added_members")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|m| m.get("user_id").and_then(snowflake_of))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let removed_user_ids = v
+                .get("removed_member_ids")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(snowflake_of).collect())
+                .unwrap_or_default();
+            GatewayEvent::ThreadMembersUpdate {
+                thread_id,
+                added_user_ids,
+                removed_user_ids,
             }
         }
         _ => return Ok(None),
@@ -1003,6 +1049,15 @@ fn own_status_from_sessions(v: &Value) -> Option<Status> {
     pick.get("status")
         .and_then(Value::as_str)
         .map(Status::parse)
+}
+
+/// A snowflake sent as a string (or, rarely, a number).
+fn snowflake_of(v: &Value) -> Option<Snowflake> {
+    match v {
+        Value::String(s) => s.parse().ok().map(Snowflake),
+        Value::Number(n) => n.as_u64().map(Snowflake),
+        _ => None,
+    }
 }
 
 fn range_of(v: &Value) -> Option<(u32, u32)> {
@@ -2110,5 +2165,43 @@ mod emoji_tests {
         assert!(r.guild_folders[0].is_folder());
         assert!(!r.guild_folders[1].is_folder());
         assert_eq!(r.guild_folders[1].guild_ids, vec![Snowflake(30)]);
+    }
+
+    #[test]
+    fn thread_membership_events() {
+        let sync = r#"{"guild_id":"100","threads":[
+            {"id":"50","type":11,"parent_id":"10","name":"a"},
+            {"id":"51","type":11,"parent_id":"10","name":"b"}],
+            "members":[{"id":"51","user_id":"7","join_timestamp":"x","flags":1}]}"#;
+        match decode_dispatch("THREAD_LIST_SYNC", sync).unwrap().unwrap() {
+            GatewayEvent::ThreadListSync { threads, .. } => {
+                assert!(threads[0].member.is_none());
+                assert!(threads[1].member.is_some());
+            }
+            other => panic!("{other:?}"),
+        }
+        let th = r#"{"id":"52","type":11,"parent_id":"10","name":"c",
+            "member":{"id":"52","user_id":"7","join_timestamp":"x","flags":0}}"#;
+        match decode_dispatch("THREAD_CREATE", th).unwrap().unwrap() {
+            GatewayEvent::ThreadCreate(c) => assert!(c.member.is_some()),
+            other => panic!("{other:?}"),
+        }
+        let up = r#"{"id":"50","user_id":"7","guild_id":"100","flags":1}"#;
+        assert_eq!(
+            decode_dispatch("THREAD_MEMBER_UPDATE", up).unwrap(),
+            Some(GatewayEvent::ThreadMemberUpdate {
+                thread_id: Snowflake(50)
+            })
+        );
+        let many = r#"{"id":"50","guild_id":"100","member_count":2,
+            "added_members":[{"user_id":"7","id":"50"}],"removed_member_ids":["8"]}"#;
+        assert_eq!(
+            decode_dispatch("THREAD_MEMBERS_UPDATE", many).unwrap(),
+            Some(GatewayEvent::ThreadMembersUpdate {
+                thread_id: Snowflake(50),
+                added_user_ids: vec![Snowflake(7)],
+                removed_user_ids: vec![Snowflake(8)],
+            })
+        );
     }
 }

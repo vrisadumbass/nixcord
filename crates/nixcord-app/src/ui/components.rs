@@ -324,8 +324,8 @@ fn text(ui: &mut Ui, cx: &mut Cx, content: &str) {
     ctx.h24 = cx.clock_24h;
     ctx.emoji = Some(&emoji);
     let out = markdown::render(ui, &*doc, &ctx);
-    if let Some(MdClick::Channel(ch)) = out.clicked {
-        cx.actions.push(Action::SelectChannel(Snowflake(ch)));
+    if let Some(a) = out.clicked.as_ref().and_then(MdClick::action) {
+        cx.actions.push(a);
     }
     cx.mentions_me |= out.mentions_me;
 }

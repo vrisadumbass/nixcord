@@ -230,8 +230,62 @@ pub enum MdClick {
     User(u64),
     Role(u64),
     Channel(u64),
+    /// A `discord.com/channels/…/{channel}/{message}` link to a known channel.
+    Message {
+        channel: u64,
+        message: u64,
+    },
     Link(String),
 }
+
+impl MdClick {
+    /// The app action for a click on a channel mention or Discord link, if any.
+    pub fn action(&self) -> Option<super::Action> {
+        match *self {
+            MdClick::Channel(id) => Some(super::Action::SelectChannel(Snowflake(id))),
+            MdClick::Message { channel, message } => Some(super::Action::JumpToMessage {
+                channel_id: Snowflake(channel),
+                message_id: Snowflake(message),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Parse a Discord channel / message link (`https://discord.com/channels/{guild|@me}/
+/// {channel}[/{message}]`, also `ptb.` / `canary.` and `discordapp.com`). Returns
+/// `(channel, message)`; a message id equal to the channel id (a thread's starter
+/// message) counts as a channel link.
+pub fn parse_discord_link(url: &str) -> Option<(u64, Option<u64>)> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let rest = ["ptb.", "canary.", "www."]
+        .iter()
+        .find_map(|p| rest.strip_prefix(p))
+        .unwrap_or(rest);
+    let rest = rest
+        .strip_prefix("discord.com/channels/")
+        .or_else(|| rest.strip_prefix("discordapp.com/channels/"))?;
+    let rest = rest.split(['?', '#']).next()?.trim_end_matches('/');
+    let mut parts = rest.split('/');
+    let guild = parts.next()?;
+    if guild != "@me" && guild.parse::<u64>().is_err() {
+        return None;
+    }
+    let channel: u64 = parts.next()?.parse().ok()?;
+    let message = match parts.next() {
+        Some(m) => Some(m.parse::<u64>().ok()?),
+        None => None,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((channel, message.filter(|&m| m != channel)))
+}
+
+/// Discord truncates long channel names in link pills.
+const LINK_PILL_MAX_CHARS: usize = 32;
 
 pub struct MarkdownResponse {
     /// Covers the whole rendered content.
@@ -898,6 +952,7 @@ impl<'a> Renderer<'_, 'a> {
                         });
                     }
                 }
+                Inline::Link(l) if l.label.is_none() && self.discord_link(ui, b, &l.url, st) => {}
                 Inline::Link(l) => {
                     let start = b.chars;
                     let ls = Style {
@@ -1052,6 +1107,45 @@ impl<'a> Renderer<'_, 'a> {
         } else {
             t.accent
         });
+        self.pill(ui, b, &text, click, base, st);
+    }
+
+    /// A `discord.com/channels/…` link to a channel we know: drawn as a channel pill
+    /// (`#name`, or `#name › 💬` for a message), like Discord. False = render as a link.
+    fn discord_link<'d>(&mut self, ui: &Ui, b: &mut Builder<'d>, url: &str, st: Style) -> bool {
+        let Some((channel, message)) = parse_discord_link(url) else {
+            return false;
+        };
+        let Some(info) = self.ctx.resolver.channel(channel) else {
+            return false;
+        };
+        let mut name: String = info.name.chars().take(LINK_PILL_MAX_CHARS).collect();
+        if info.name.chars().count() > LINK_PILL_MAX_CHARS {
+            name.push('…');
+        }
+        let (text, click) = match message {
+            Some(message) => (
+                format!("#{name} › 💬"),
+                MdClick::Message { channel, message },
+            ),
+            None => (format!("#{name}"), MdClick::Channel(channel)),
+        };
+        let base = self.t().accent;
+        self.pill(ui, b, &text, Some(click), base, st);
+        true
+    }
+
+    /// Mention-style pill: tinted background in `base`, light text, clickable.
+    fn pill<'d>(
+        &mut self,
+        ui: &Ui,
+        b: &mut Builder<'d>,
+        text: &str,
+        click: Option<MdClick>,
+        base: Color32,
+        st: Style,
+    ) {
+        let t = self.t();
         let fg = if t.dark {
             base.lerp_to_gamma(Color32::WHITE, 0.45)
         } else {
@@ -1064,7 +1158,7 @@ impl<'a> Renderer<'_, 'a> {
             Some(images) if !pill_st.mono => {
                 let size = (pill_st.size * emoji_text::LABEL_SCALE).round();
                 let lh = Some(pill_st.line_height.max(size));
-                for run in nixcord_emoji::emoji_runs(&text) {
+                for run in nixcord_emoji::emoji_runs(text) {
                     match run {
                         nixcord_emoji::TextOrEmoji::Text(seg) => {
                             b.push(seg, self.fmt(&pill_st));
@@ -1092,7 +1186,7 @@ impl<'a> Renderer<'_, 'a> {
                 }
             }
             _ => {
-                b.push(&text, self.fmt(&pill_st));
+                b.push(text, self.fmt(&pill_st));
             }
         }
         let chars = start..b.chars;
@@ -1459,5 +1553,26 @@ mod tests {
             *rec.0.borrow(),
             vec!["\u{1F4A1}".to_string(), "\u{1F980}".to_string()]
         );
+    }
+
+    #[test]
+    fn parses_discord_channel_and_message_links() {
+        use super::parse_discord_link as p;
+        assert_eq!(p("https://discord.com/channels/1/2"), Some((2, None)));
+        assert_eq!(p("https://discord.com/channels/1/2/3"), Some((2, Some(3))));
+        assert_eq!(
+            p("https://ptb.discord.com/channels/@me/2/3/"),
+            Some((2, Some(3)))
+        );
+        assert_eq!(
+            p("https://discordapp.com/channels/1/2?x=y"),
+            Some((2, None))
+        );
+        // A thread's starter message has the thread's id: that's a channel link.
+        assert_eq!(p("https://discord.com/channels/1/2/2"), Some((2, None)));
+        assert_eq!(p("https://discord.com/channels/1"), None);
+        assert_eq!(p("https://discord.com/channels/1/x"), None);
+        assert_eq!(p("https://discord.com/channels/1/2/3/4"), None);
+        assert_eq!(p("https://example.com/channels/1/2"), None);
     }
 }
