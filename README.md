@@ -9,6 +9,20 @@ A lightweight, native Discord client written in Rust. No Electron, no webview, n
 - **Hackable.** A small crate-per-concern workspace with a pure, unit-tested state store.
   PRs welcome, forks welcome. It's open source, after all.
 
+![nixcord chat view](docs/screenshots/chat.png)
+
+<details>
+<summary>More screenshots</summary>
+
+| | |
+|---|---|
+| ![Bot message components](docs/screenshots/components.png) | ![Emoji picker](docs/screenshots/emoji-picker.png) |
+| ![Gradient theme](docs/screenshots/gradient-theme.png) | ![Image viewer](docs/screenshots/image-viewer.png) |
+| ![DMs with presence](docs/screenshots/dm-home.png) | |
+
+All screenshots are from `--demo` mode, using made-up servers, users and messages.
+</details>
+
 > [!WARNING]
 > **Unofficial client. Use at your own risk.** Logging into Discord with a user token from a
 > third-party client violates Discord's Terms of Service and can get your account
