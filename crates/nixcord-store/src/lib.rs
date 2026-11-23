@@ -251,6 +251,11 @@ impl Store {
                     g.emojis.clone_from(emojis);
                 }
             }
+            GatewayEvent::GuildStickersUpdate { guild_id, stickers } => {
+                if let Some(g) = self.guilds.get_mut(guild_id) {
+                    g.stickers.clone_from(stickers);
+                }
+            }
             GatewayEvent::Resumed => self.connection = ConnectionState::Connected,
             GatewayEvent::Disconnected { will_retry, .. } => {
                 self.connection = if *will_retry {

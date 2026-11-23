@@ -8,6 +8,9 @@
 //! sent with or without text.
 //!
 //! Emoji: the smiley button on the right opens the emoji picker (inserts at the caret).
+//! Gift, GIF and sticker buttons sit left of it, in Discord's order: gift opens Discord's
+//! Nitro page in the browser, GIF and sticker open their pickers (`gif_picker`,
+//! `sticker_picker`), which send right away.
 //! Typing `:hea` (two or more name characters after a colon) shows matching emoji above the
 //! composer: Up/Down select, Tab/Enter insert, Escape closes. On send, complete
 //! `:shortcodes:` become unicode emoji, and custom `:name:` becomes `<:name:id>` when the
@@ -251,6 +254,9 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
     };
     let mut changed = false;
     let mut picker_btn: Option<(Rect, bool)> = None;
+    let mut gif_btn: Option<(Rect, bool)> = None;
+    let mut sticker_btn: Option<(Rect, bool)> = None;
+    let extras = app.composer.editing.is_none();
     let mut send_clicked = false;
     let mut attach_clicked = false;
     let can_attach = app.composer.editing.is_none()
@@ -300,7 +306,9 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
                 }
 
                 ui.add_space(4.0);
-                let right_controls_w = if show_send_btn { 84.0 } else { 44.0 };
+                let right_controls_w = 44.0
+                    + if show_send_btn { 40.0 } else { 0.0 }
+                    + if extras { 3.0 * 36.0 } else { 0.0 };
                 let text_w = (ui.available_width() - right_controls_w).max(40.0);
                 egui::ScrollArea::vertical()
                     .id_salt(("composer_scroll", ch))
@@ -339,9 +347,35 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
                     let open = app.composer.picker.is_some();
                     let b = icon_button(ui, t, Icon::Smile, 32.0, "Select emoji");
                     if open {
-                        paint_icon_on(ui, b.rect, t.strong);
+                        paint_icon_on(ui, b.rect, Icon::Smile, t.strong);
                     }
                     picker_btn = Some((b.rect, b.clicked()));
+                    if extras {
+                        ui.add_space(4.0);
+                        let b = icon_button(ui, t, Icon::Sticker, 32.0, "Open sticker picker");
+                        if app.composer.sticker_picker.is_some() {
+                            paint_icon_on(ui, b.rect, Icon::Sticker, t.strong);
+                        }
+                        sticker_btn = Some((b.rect, b.clicked()));
+                        ui.add_space(4.0);
+                        let b = icon_button(ui, t, Icon::Gif, 32.0, "Open GIF picker");
+                        if app.composer.gif_picker.is_some() {
+                            paint_icon_on(ui, b.rect, Icon::Gif, t.strong);
+                        }
+                        gif_btn = Some((b.rect, b.clicked()));
+                        ui.add_space(4.0);
+                        let b = icon_button(
+                            ui,
+                            t,
+                            Icon::Gift,
+                            32.0,
+                            "Upgrade your friends! Gift them Nitro (opens discord.com)",
+                        );
+                        if b.clicked() {
+                            ui.ctx()
+                                .open_url(egui::OpenUrl::new_tab("https://discord.com/nitro"));
+                        }
+                    }
                 });
             });
         });
@@ -362,16 +396,58 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
         }
     }
 
-    // Emoji picker.
+    // Emoji / GIF / sticker pickers: one open at a time.
     if let Some((rect, clicked)) = picker_btn {
         if clicked {
-            app.composer.picker = match app.composer.picker {
-                Some(_) => {
-                    emoji_picker::reset(ui.ctx());
-                    None
-                }
-                None => Some(rect),
-            };
+            let open = app.composer.picker.is_none();
+            close_pickers(ui.ctx(), app);
+            if open {
+                app.composer.picker = Some(rect);
+            }
+        }
+    }
+    if let Some((rect, true)) = gif_btn {
+        let open = app.composer.gif_picker.is_none();
+        close_pickers(ui.ctx(), app);
+        if open {
+            app.composer.gif_picker = Some(rect);
+        }
+    }
+    if let Some((rect, true)) = sticker_btn {
+        let open = app.composer.sticker_picker.is_none();
+        close_pickers(ui.ctx(), app);
+        if open {
+            app.composer.sticker_picker = Some(rect);
+        }
+    }
+    if let Some(anchor) = app.composer.gif_picker {
+        let out = super::gif_picker::show(ui.ctx(), app, anchor, actions);
+        if let Some(url) = out.picked {
+            actions.push(Action::Send {
+                channel: ch,
+                content: url,
+                reply_to: app.composer.reply_to.take(),
+                attachments: Vec::new(),
+            });
+        }
+        if out.close {
+            app.composer.gif_picker = None;
+            app.composer.want_focus = true;
+        }
+    }
+    if let Some(anchor) = app.composer.sticker_picker {
+        let guild = app.store.channel(ch).and_then(|c| c.guild_id);
+        let out = super::sticker_picker::show(ui.ctx(), app, anchor, guild);
+        if let Some(sticker_id) = out.picked {
+            actions.push(Action::SendSticker {
+                channel: ch,
+                sticker_id,
+                reply_to: app.composer.reply_to.take(),
+            });
+        }
+        if out.close {
+            app.composer.sticker_picker = None;
+            app.composer.want_focus = true;
         }
     }
     if let Some(anchor) = app.composer.picker {
@@ -1166,9 +1242,22 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     }
 }
 
-/// Highlight the smiley while the picker is open.
-fn paint_icon_on(ui: &Ui, rect: Rect, color: Color32) {
-    super::paint_icon(ui, Icon::Smile, rect, color);
+/// Highlight a picker button's icon while its picker is open.
+fn paint_icon_on(ui: &Ui, rect: Rect, icon: Icon, color: Color32) {
+    super::paint_icon(ui, icon, rect, color);
+}
+
+/// Close the emoji, GIF and sticker pickers (and forget their search text).
+fn close_pickers(ctx: &egui::Context, app: &mut NixApp) {
+    if app.composer.picker.take().is_some() {
+        emoji_picker::reset(ctx);
+    }
+    if app.composer.gif_picker.take().is_some() {
+        app.view.gifs.reset();
+    }
+    if app.composer.sticker_picker.take().is_some() {
+        super::sticker_picker::reset(ctx);
+    }
 }
 
 /// An open autocomplete: the `:query` spans bytes `start..end` (end = caret).

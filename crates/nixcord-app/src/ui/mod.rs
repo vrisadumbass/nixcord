@@ -11,6 +11,7 @@ pub mod emoji_picker;
 pub mod emoji_text;
 pub mod forum;
 pub mod friends;
+pub mod gif_picker;
 pub mod login;
 pub mod markdown;
 pub mod presence;
@@ -18,6 +19,7 @@ pub mod profile;
 pub mod search;
 pub mod settings;
 pub mod sidebar;
+pub mod sticker_picker;
 pub mod viewer;
 
 use crate::theme::Theme;
@@ -104,6 +106,13 @@ pub enum Action {
     BlockUser(Snowflake),
     SendFriendRequest(String),
     /// Execute a guild/DM message search from the header or pagination controls.
+    /// GIF picker search (`None` = trending).
+    SearchGifs(Option<String>),
+    SendSticker {
+        channel: Snowflake,
+        sticker_id: Snowflake,
+        reply_to: Option<Snowflake>,
+    },
     SearchMessages {
         raw: String,
         offset: u32,
@@ -363,6 +372,9 @@ pub enum Icon {
     Copy,
     Smile,
     File,
+    Gift,
+    Gif,
+    Sticker,
     Glyph(&'static str),
 }
 
@@ -426,6 +438,79 @@ pub fn paint_icon(ui: &Ui, icon: Icon, rect: Rect, color: Color32) {
                 })
                 .collect();
             p.add(egui::Shape::line(arc, Stroke::new(1.6, color)));
+        }
+        Icon::Gift => {
+            // Box with a lid, a ribbon down the middle and a two-loop bow.
+            let body = Rect::from_min_max(
+                c + Vec2::new(-s * 0.4, -s * 0.05),
+                c + Vec2::new(s * 0.4, s * 0.5),
+            );
+            let lid = Rect::from_min_max(
+                c + Vec2::new(-s * 0.5, -s * 0.28),
+                c + Vec2::new(s * 0.5, -s * 0.05),
+            );
+            let st = Stroke::new(1.6, color);
+            p.rect_stroke(body, CornerRadius::same(1), st, egui::StrokeKind::Middle);
+            p.rect_stroke(lid, CornerRadius::same(1), st, egui::StrokeKind::Middle);
+            p.line_segment(
+                [Pos2::new(c.x, lid.top()), Pos2::new(c.x, body.bottom())],
+                st,
+            );
+            for dir in [-1.0f32, 1.0] {
+                let loop_c = Pos2::new(c.x + dir * s * 0.17, lid.top() - s * 0.13);
+                p.circle_stroke(loop_c, s * 0.13, Stroke::new(1.4, color));
+            }
+        }
+        Icon::Gif => {
+            let r = Rect::from_center_size(c, Vec2::new(s * 1.25, s * 0.95));
+            p.rect_stroke(
+                r,
+                CornerRadius::same(3),
+                Stroke::new(1.6, color),
+                egui::StrokeKind::Middle,
+            );
+            p.text(
+                c + Vec2::new(0.0, 0.5),
+                Align2::CENTER_CENTER,
+                "GIF",
+                bold((s * 0.55).max(8.0)),
+                color,
+            );
+        }
+        Icon::Sticker => {
+            // A rounded square with its bottom-right corner peeled over, plus a smile.
+            let r = Rect::from_center_size(c, Vec2::splat(s * 1.0));
+            let fold = s * 0.38;
+            let st = Stroke::new(1.6, color);
+            let pts = vec![
+                Pos2::new(r.left() + 3.0, r.top()),
+                Pos2::new(r.right() - 3.0, r.top()),
+                Pos2::new(r.right(), r.top() + 3.0),
+                Pos2::new(r.right(), r.bottom() - fold),
+                Pos2::new(r.right() - fold, r.bottom()),
+                Pos2::new(r.left() + 3.0, r.bottom()),
+                Pos2::new(r.left(), r.bottom() - 3.0),
+                Pos2::new(r.left(), r.top() + 3.0),
+            ];
+            p.add(egui::Shape::closed_line(pts, st));
+            p.add(egui::Shape::line(
+                vec![
+                    Pos2::new(r.right(), r.bottom() - fold),
+                    Pos2::new(r.right() - fold, r.bottom() - fold),
+                    Pos2::new(r.right() - fold, r.bottom()),
+                ],
+                st,
+            ));
+            let mouth: Vec<Pos2> = (0..=8)
+                .map(|i| {
+                    let a = std::f32::consts::PI * i as f32 / 8.0;
+                    c + Vec2::new(-a.cos() * s * 0.2 - s * 0.06, a.sin() * s * 0.14 + s * 0.02)
+                })
+                .collect();
+            p.add(egui::Shape::line(mouth, Stroke::new(1.4, color)));
+            for dx in [-s * 0.2, s * 0.08] {
+                p.circle_filled(c + Vec2::new(dx, -s * 0.15), s * 0.06, color);
+            }
         }
         Icon::File => {
             let r = Rect::from_center_size(c, Vec2::new(s * 0.75, s * 0.95));

@@ -1200,6 +1200,9 @@ fn message_row(
     for (i, e) in m.embeds.iter().enumerate() {
         embed_card(&mut child, app, m, i, e, actions);
     }
+    for s in &m.sticker_items {
+        sticker(&mut child, app, s);
+    }
     mentions_me |= super::components::show(&mut child, app, m, actions);
     reactions_row(&mut child, app, m, actions);
 
@@ -1358,7 +1361,9 @@ fn reply_preview(
     );
     x += nw + 6.0;
     let preview = if r.content.is_empty() {
-        if r.attachments.is_empty() && r.embeds.is_empty() {
+        if let Some(s) = r.sticker_items.first() {
+            format!("Sticker: {}", s.name)
+        } else if r.attachments.is_empty() && r.embeds.is_empty() {
             "Click to see original message".to_string()
         } else {
             "Click to see attachment".to_string()
@@ -1475,6 +1480,39 @@ fn attachment(ui: &mut Ui, app: &NixApp, a: &Attachment) {
 
 fn embed_media_url(m: &nixcord_model::EmbedMedia) -> &str {
     m.proxy_url.as_deref().unwrap_or(&m.url)
+}
+
+/// Sticker size in messages (points), like Discord.
+const STICKER_SIZE: f32 = 160.0;
+
+/// A sticker on a message: the image, or a "Sticker: name" card for Lottie stickers.
+fn sticker(ui: &mut Ui, app: &NixApp, s: &nixcord_model::StickerItem) {
+    let t = app.theme;
+    ui.add_space(2.0);
+    match s.url(STICKER_SIZE as u32) {
+        Some(url) => {
+            let resp = app.media.borrow_mut().image(
+                ui,
+                &url,
+                Vec2::splat(STICKER_SIZE),
+                Some((STICKER_SIZE as u32, STICKER_SIZE as u32)),
+            );
+            resp.on_hover_text(&s.name);
+        }
+        None => {
+            Frame::new()
+                .fill(t.elevated)
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!("Sticker: {}", s.name))
+                            .font(prop(14.0))
+                            .color(t.muted),
+                    );
+                });
+        }
+    }
 }
 
 /// Discord-style embed card: colored left bar, provider, author, title, description,

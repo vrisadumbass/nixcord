@@ -238,6 +238,43 @@ impl Route {
         r
     }
 
+    /// POST /channels/{id}/messages with one sticker and no text.
+    pub fn send_sticker(
+        channel_id: Snowflake,
+        sticker_id: Snowflake,
+        nonce: &str,
+        reply_to: Option<Snowflake>,
+    ) -> Self {
+        let mut r = Self::send_message(channel_id, "", nonce, reply_to);
+        if let Some(body) = r.body.as_mut() {
+            body["sticker_ids"] = serde_json::json!([sticker_id]);
+        }
+        r
+    }
+
+    /// GET /gifs/search (Discord's Tenor proxy), MP4 renditions.
+    pub fn gifs_search(query: &str, locale: &str) -> Self {
+        let mut r = Self::new(Method::Get, "/gifs/search".to_string());
+        r.query = vec![
+            ("q", query.to_string()),
+            ("media_format", "mp4".into()),
+            ("provider", "tenor".into()),
+            ("locale", locale.to_string()),
+        ];
+        r
+    }
+
+    /// GET /gifs/trending-gifs, MP4 renditions.
+    pub fn gifs_trending(locale: &str) -> Self {
+        let mut r = Self::new(Method::Get, "/gifs/trending-gifs".to_string());
+        r.query = vec![
+            ("media_format", "mp4".into()),
+            ("provider", "tenor".into()),
+            ("locale", locale.to_string()),
+        ];
+        r
+    }
+
     /// PUT /channels/{c}/messages/{m}/reactions/{emoji}/@me.
     pub fn add_reaction(channel_id: Snowflake, message_id: Snowflake, emoji: &Emoji) -> Self {
         Self::new(
@@ -621,6 +658,31 @@ impl Http {
             reply_to,
         ))
         .await
+    }
+
+    /// POST /channels/{id}/messages with `sticker_ids: [sticker_id]`.
+    pub async fn send_sticker(
+        &self,
+        channel_id: Snowflake,
+        sticker_id: Snowflake,
+        reply_to: Option<Snowflake>,
+    ) -> Result<Message> {
+        self.json(Route::send_sticker(
+            channel_id,
+            sticker_id,
+            &generate_nonce(),
+            reply_to,
+        ))
+        .await
+    }
+
+    /// GIF search via Discord (`None` = trending).
+    pub async fn gifs(&self, query: Option<&str>) -> Result<Vec<nixcord_model::GifResult>> {
+        let route = match query {
+            Some(q) => Route::gifs_search(q, "en-US"),
+            None => Route::gifs_trending("en-US"),
+        };
+        self.json(route).await
     }
 
     /// PUT /channels/{cid}/messages/{mid}/reactions/{emoji}/@me (204).
@@ -1497,5 +1559,34 @@ mod tests {
         assert!(reqs[3].starts_with("POST /users/@me/relationships "));
         assert!(reqs[4].starts_with("DELETE /users/@me/relationships/55 "));
         assert!(reqs[5].starts_with("GET /guilds/7/messages/search?content=found "));
+    }
+
+    #[test]
+    fn sticker_and_gif_routes() {
+        let r = Route::send_sticker(C, Snowflake(77), "n1", Some(M));
+        assert_eq!(r.path, "/channels/111/messages");
+        let b = r.body.unwrap();
+        assert_eq!(b["sticker_ids"], serde_json::json!([Snowflake(77)]));
+        assert_eq!(b["content"], "");
+        assert_eq!(b["message_reference"]["message_id"], serde_json::json!(M));
+
+        let u = |r: Route| r.url(API_BASE).unwrap().to_string();
+        assert_eq!(
+            u(Route::gifs_search("happy cat", "en-US")),
+            "https://discord.com/api/v10/gifs/search?q=happy+cat&media_format=mp4&provider=tenor&locale=en-US"
+        );
+        assert_eq!(
+            u(Route::gifs_trending("en-US")),
+            "https://discord.com/api/v10/gifs/trending-gifs?media_format=mp4&provider=tenor&locale=en-US"
+        );
+        let gifs: Vec<nixcord_model::GifResult> = serde_json::from_str(
+            r#"[{"id":"1","title":"cat","url":"https://tenor.com/view/cat-gif-1",
+                "src":"https://media.tenor.com/abcdefghPo/cat.mp4",
+                "gif_src":"https://media.tenor.com/abcdefghAC/cat.gif",
+                "width":498,"height":280,"preview":"https://media.tenor.com/abcdefghAe/cat.png"}]"#,
+        )
+        .unwrap();
+        assert_eq!(gifs[0].width, 498);
+        assert_eq!(gifs[0].url, "https://tenor.com/view/cat-gif-1");
     }
 }

@@ -76,8 +76,22 @@ const EMOJI: &[(u64, &str)] = &[
     (1_150_000_000_000_000_024, "borrowck.png"),
 ];
 
-/// `(Tenor media id prefix, file under gifs/)` for gifv embeds.
-const TENOR: &[(&str, &str)] = &[("nixDemoHorseGallop", "horse.gif")];
+/// `(Tenor media id prefix, file under gifs/)` for gifv embeds and the GIF picker.
+const TENOR: &[(&str, &str)] = &[
+    ("nixDemoHorseGallop", "horse.gif"),
+    ("nixDemoCatGallop", "cat-gallop.gif"),
+    ("nixDemoLoadingSpin", "loading.gif"),
+];
+
+/// `(sticker id, file under emoji/)`: demo stickers reuse the demo emoji images.
+pub const STICKERS: &[(u64, &str)] = &[
+    (1_160_000_000_000_000_001, "ferris.png"),
+    (1_160_000_000_000_000_002, "party.gif"),
+    (1_160_000_000_000_000_003, "shipit.png"),
+    (1_160_000_000_000_000_004, "think.png"),
+    (1_160_000_000_000_000_005, "borrowck.png"),
+    (1_160_000_000_000_000_006, "catjam.gif"),
+];
 
 /// Folders searched for attachment / embed files, by URL file name.
 const URL_DIRS: &[&str] = &["photos", "gifs", "icons"];
@@ -154,6 +168,11 @@ pub fn emoji_file(id: u64) -> Option<PathBuf> {
 
 /// File for an attachment / embed image URL (see the module docs).
 pub fn url_file(url: &str) -> Option<PathBuf> {
+    if let Some(rest) = url.split("/stickers/").nth(1) {
+        let id: u64 = rest.split(['.', '?', '/']).next()?.parse().ok()?;
+        let (_, name) = STICKERS.iter().find(|(i, _)| *i == id)?;
+        return file("emoji", name);
+    }
     if let Some(base) = nixcord_media::anim_url::tenor_base(url) {
         if let Some((_, name)) = TENOR.iter().find(|(id, _)| base.starts_with(id)) {
             return file("gifs", name);
@@ -231,5 +250,12 @@ mod tests {
         assert!(url_file("https://media.tenor.com/nixDemoHorseGallopAx/tenor.webp").is_some());
         assert!(url_file("https://cdn.discordapp.com/attachments/1/2/desk-setup.jpg").is_some());
         assert!(url_file("https://example.com/nothing-here.png").is_none());
+        let sticker = nixcord_model::cdn::sticker(
+            nixcord_model::Snowflake(STICKERS[0].0),
+            nixcord_model::sticker_format::PNG,
+            160,
+        )
+        .unwrap();
+        assert!(url_file(&sticker).is_some());
     }
 }

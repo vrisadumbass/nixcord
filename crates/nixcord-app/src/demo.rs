@@ -202,8 +202,97 @@ fn guild(id: u64, name: &str, channels: Vec<Channel>) -> Guild {
             ..Default::default()
         }],
         emojis: demo_guild_emojis(id),
+        stickers: demo_guild_stickers(id),
         threads: Vec::new(),
     }
+}
+
+/// Stickers of the demo servers (images reuse `assets/demo/emoji`, see `demo_assets`).
+fn demo_guild_stickers(guild: u64) -> Vec<nixcord_model::Sticker> {
+    use crate::demo_assets::STICKERS;
+    use nixcord_model::sticker_format::{GIF, PNG};
+    let s = |i: usize, name: &str, tags: &str, format_type: u8| nixcord_model::Sticker {
+        id: Snowflake(STICKERS[i].0),
+        name: name.into(),
+        description: None,
+        tags: tags.into(),
+        format_type,
+        available: true,
+    };
+    match guild {
+        10 => vec![
+            s(0, "Ferris Wave", "crab, hello, wave", PNG),
+            s(1, "Party Time", "party, celebrate", GIF),
+            s(2, "Ship It", "ship, deploy", PNG),
+            s(3, "Hmm", "think, thinking", PNG),
+        ],
+        20 => vec![
+            s(4, "Borrow Checker", "rust, borrowck", PNG),
+            s(5, "Cat Jam", "cat, vibe, music", GIF),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+/// GIF "search" results for demo mode: the bundled GIFs, under made-up Tenor ids that
+/// `demo_assets` maps back to the files.
+pub fn demo_gifs(query: Option<&str>) -> Vec<nixcord_model::GifResult> {
+    let all = [
+        (
+            "nixDemoHorseGallop",
+            "horse gallop running",
+            GIF_HORSE,
+            1234567,
+        ),
+        ("nixDemoCatGallop", "cat gallop running", GIF_CAT, 2345678),
+        (
+            "nixDemoLoadingSpin",
+            "loading spinner wait",
+            GIF_LOADING,
+            3456789,
+        ),
+    ];
+    let q = query.map(str::to_lowercase);
+    all.iter()
+        .filter(|(_, title, _, _)| q.as_deref().is_none_or(|q| title.contains(q)))
+        .map(|&(base, title, (w, h), n)| {
+            let slug = title.replace(' ', "-");
+            nixcord_model::GifResult {
+                url: format!("https://tenor.com/view/{slug}-gif-{n}"),
+                title: title.into(),
+                src: format!("https://media.tenor.com/{base}Po/{slug}.mp4"),
+                gif_src: Some(format!("https://media.tenor.com/{base}AC/{slug}.gif")),
+                preview: Some(format!("https://media.tenor.com/{base}Ae/{slug}.png")),
+                width: w,
+                height: h,
+            }
+        })
+        .collect()
+}
+
+/// The gifv embed Discord would add to a message that is just a GIF link (demo only).
+fn demo_gif_embed(content: &str) -> Option<Embed> {
+    let g = demo_gifs(None)
+        .into_iter()
+        .find(|g| g.url == content.trim())?;
+    let media = |url: String| EmbedMedia {
+        url,
+        proxy_url: None,
+        width: Some(g.width),
+        height: Some(g.height),
+    };
+    Some(Embed {
+        kind: Some("gifv".into()),
+        url: Some(g.url.clone()),
+        provider: Some(EmbedAuthor {
+            name: "Tenor".into(),
+            url: Some("https://tenor.co".into()),
+            icon_url: None,
+        }),
+        thumbnail: g.preview.clone().map(media),
+        video: Some(media(g.src.clone())),
+        ..Default::default()
+    })
 }
 
 /// Custom emoji of the demo servers (images from `assets/demo/emoji`, see `Media`).
@@ -1565,6 +1654,7 @@ pub async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx
                 seq += 1;
                 let t = now_ms();
                 let mut mine = base_msg(snowflake_at(t, seq), channel, &people[0], content, t);
+                mine.embeds.extend(demo_gif_embed(&mine.content));
                 mine.attachments = attachments
                     .into_iter()
                     .enumerate()
@@ -1739,6 +1829,36 @@ pub async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx
                         error: None,
                     });
                 }
+            }
+            Command::SearchGifs { request_id, query } => {
+                let result = Ok(demo_gifs(query.as_deref()));
+                events.send(AppEvent::Gifs { request_id, result });
+            }
+            Command::SendSticker {
+                channel,
+                sticker_id,
+                reply_to: reply_target,
+            } => {
+                seq += 1;
+                let t = now_ms();
+                let mut mine =
+                    base_msg(snowflake_at(t, seq), channel, &people[0], String::new(), t);
+                let sticker = ready()
+                    .guilds
+                    .iter()
+                    .flat_map(|g| g.stickers.iter())
+                    .find(|s| s.id == sticker_id)
+                    .map(nixcord_model::Sticker::item);
+                mine.sticker_items.extend(sticker);
+                if let Some(target) = reply_target.and_then(|id| {
+                    histories
+                        .get(&channel)
+                        .and_then(|h| h.iter().find(|m| m.id == id))
+                }) {
+                    reply_to(&mut mine, target);
+                }
+                histories.entry(channel).or_default().push(mine.clone());
+                events.send(AppEvent::Sent(Box::new(mine)));
             }
             Command::SearchMessages {
                 request_id,

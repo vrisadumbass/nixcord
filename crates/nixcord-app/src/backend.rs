@@ -74,6 +74,11 @@ pub enum AppEvent {
         request_id: u64,
         error: String,
     },
+    /// GIF picker results (trending or a search) for request `request_id`.
+    Gifs {
+        request_id: u64,
+        result: Result<Vec<nixcord_model::GifResult>, String>,
+    },
     /// Messages fetched `around` a jumped-to message id.
     HistoryAround {
         channel: Snowflake,
@@ -163,6 +168,16 @@ pub enum Command {
         request_id: u64,
         scope: SearchScope,
         query: MessageSearchQuery,
+    },
+    /// GIF picker: `None` = trending.
+    SearchGifs {
+        request_id: u64,
+        query: Option<String>,
+    },
+    SendSticker {
+        channel: Snowflake,
+        sticker_id: Snowflake,
+        reply_to: Option<Snowflake>,
     },
     LoadHistoryAround {
         channel: Snowflake,
@@ -491,6 +506,22 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
                 }),
             }
         }
+        Command::SearchGifs { request_id, query } => {
+            let result = http
+                .gifs(query.as_deref())
+                .await
+                .map_err(|e| format!("Couldn't load GIFs: {e}"));
+            events.send(AppEvent::Gifs { request_id, result });
+        }
+        Command::SendSticker {
+            channel,
+            sticker_id,
+            reply_to,
+        } => match http.send_sticker(channel, sticker_id, reply_to).await {
+            Ok(m) => events.send(AppEvent::Sent(Box::new(m))),
+            Err(HttpError::Forbidden) => events.send(AppEvent::Forbidden { channel }),
+            Err(e) => events.send(AppEvent::Error(format!("Couldn't send sticker: {e}"))),
+        },
         Command::LoadHistoryAround { channel, around } => {
             match http.messages_around(channel, around, HISTORY_PAGE).await {
                 Ok(messages) => events.send(AppEvent::HistoryAround {

@@ -395,6 +395,23 @@ pub fn decode_dispatch(t: &str, d: &str) -> Result<Option<GatewayEvent>, JsonErr
                     .collect(),
             }
         }
+        "GUILD_STICKERS_UPDATE" => {
+            #[derive(Deserialize)]
+            struct StickersUpdate {
+                guild_id: Snowflake,
+                #[serde(default)]
+                stickers: Vec<Value>,
+            }
+            let u: StickersUpdate = serde_json::from_str(d)?;
+            GatewayEvent::GuildStickersUpdate {
+                guild_id: u.guild_id,
+                stickers: u
+                    .stickers
+                    .into_iter()
+                    .filter_map(|v| serde_json::from_value::<nixcord_model::Sticker>(v).ok())
+                    .collect(),
+            }
+        }
         "MESSAGE_ACK" => {
             #[derive(Deserialize)]
             struct Ack {
@@ -2203,5 +2220,39 @@ mod emoji_tests {
                 removed_user_ids: vec![Snowflake(8)],
             })
         );
+    }
+
+    #[test]
+    fn stickers_on_messages_and_guilds() {
+        let d = r#"{"guild_id":"7","stickers":[
+            {"id":"1","name":"wave","tags":"hello","format_type":1,"available":true},
+            {"id":"2","name":"spin","tags":"","format_type":3}]}"#;
+        match decode_dispatch("GUILD_STICKERS_UPDATE", d)
+            .unwrap()
+            .unwrap()
+        {
+            GatewayEvent::GuildStickersUpdate { guild_id, stickers } => {
+                assert_eq!(guild_id, Snowflake(7));
+                assert_eq!(stickers.len(), 2);
+                assert!(stickers[0]
+                    .item()
+                    .url(160)
+                    .unwrap()
+                    .ends_with("/stickers/1.png?size=160"));
+                assert!(stickers[1].item().url(160).is_none(), "lottie has no image");
+            }
+            other => panic!("{other:?}"),
+        }
+        let m: nixcord_model::Message = serde_json::from_str(
+            r#"{"id":"5","channel_id":"6","author":{"id":"8","username":"a"},"content":"",
+                "timestamp":"2024-01-01T00:00:00Z",
+                "sticker_items":[{"id":"9","name":"party","format_type":4}]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.sticker_items[0].name, "party");
+        assert!(m.sticker_items[0]
+            .url(160)
+            .unwrap()
+            .contains("/stickers/9.gif"));
     }
 }

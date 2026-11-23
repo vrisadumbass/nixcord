@@ -382,10 +382,87 @@ pub struct Guild {
     /// GUILD_EMOJIS_UPDATE). Entries without a name are dropped.
     #[serde(default, deserialize_with = "de_lenient_vec")]
     pub emojis: Vec<CustomEmoji>,
+    /// The server's stickers (READY / GUILD_CREATE `stickers`, replaced by
+    /// GUILD_STICKERS_UPDATE).
+    #[serde(default, deserialize_with = "de_lenient_vec")]
+    pub stickers: Vec<Sticker>,
     /// Active threads in the guild (READY / GUILD_CREATE `threads`). The store moves these
     /// into its channel/thread maps and does not keep them on the guild.
     #[serde(default, deserialize_with = "de_lenient_vec")]
     pub threads: Vec<Channel>,
+}
+
+/// Sticker image formats (`format_type`).
+pub mod sticker_format {
+    pub const PNG: u8 = 1;
+    pub const APNG: u8 = 2;
+    pub const LOTTIE: u8 = 3;
+    pub const GIF: u8 = 4;
+}
+
+/// A guild sticker (shown in the sticker picker; sent with `sticker_ids`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Sticker {
+    pub id: Snowflake,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Autocomplete / search keywords (comma separated).
+    #[serde(default)]
+    pub tags: String,
+    #[serde(default)]
+    pub format_type: u8,
+    /// `false` when the sticker is locked (the server lost the boost level for it).
+    #[serde(default = "yes")]
+    pub available: bool,
+}
+
+impl Sticker {
+    pub fn item(&self) -> StickerItem {
+        StickerItem {
+            id: self.id,
+            name: self.name.clone(),
+            format_type: self.format_type,
+        }
+    }
+}
+
+/// A sticker on a message (`sticker_items`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StickerItem {
+    pub id: Snowflake,
+    pub name: String,
+    #[serde(default)]
+    pub format_type: u8,
+}
+
+impl StickerItem {
+    /// Image URL at `size` px, or `None` for Lottie stickers (vector animations, which
+    /// nixcord doesn't render).
+    pub fn url(&self, size: u32) -> Option<String> {
+        cdn::sticker(self.id, self.format_type, size)
+    }
+}
+
+/// One result of Discord's GIF search (`GET /gifs/search`, `/gifs/trending-gifs`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GifResult {
+    /// The provider page (e.g. `https://tenor.com/view/...`): what gets sent.
+    pub url: String,
+    #[serde(default)]
+    pub title: String,
+    /// The MP4 rendition (`media_format=mp4`).
+    #[serde(default)]
+    pub src: String,
+    #[serde(default)]
+    pub gif_src: Option<String>,
+    /// A still preview image.
+    #[serde(default)]
+    pub preview: Option<String>,
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
 }
 
 /// A guild's custom emoji. Shown in the picker and used by autocomplete; sent as
@@ -590,6 +667,9 @@ pub struct Message {
     /// Message flags (`components::IS_COMPONENTS_V2`, ...).
     #[serde(default)]
     pub flags: u64,
+    /// Stickers sent with the message.
+    #[serde(default, deserialize_with = "de_lenient_vec")]
+    pub sticker_items: Vec<StickerItem>,
     /// Application that owns an interaction/bot message (used for component interactions).
     #[serde(default)]
     pub application_id: Option<Snowflake>,
@@ -1196,6 +1276,10 @@ pub enum GatewayEvent {
         guild_id: Snowflake,
         emojis: Vec<CustomEmoji>,
     },
+    GuildStickersUpdate {
+        guild_id: Snowflake,
+        stickers: Vec<Sticker>,
+    },
     /// MESSAGE_ACK: a channel was marked read up to `message_id`.
     MessageAck {
         channel_id: Snowflake,
@@ -1250,6 +1334,18 @@ pub mod cdn {
     pub fn emoji(id: Snowflake, animated: bool, size: u32) -> String {
         let ext = if animated { "gif" } else { "webp" };
         format!("{BASE}/emojis/{id}.{ext}?size={size}")
+    }
+
+    /// Sticker image by `format_type`; `None` for Lottie (format 3).
+    pub fn sticker(id: Snowflake, format_type: u8, size: u32) -> Option<String> {
+        let ext = match format_type {
+            super::sticker_format::LOTTIE => return None,
+            super::sticker_format::GIF => "gif",
+            _ => "png",
+        };
+        Some(format!(
+            "https://media.discordapp.net/stickers/{id}.{ext}?size={size}"
+        ))
     }
 }
 

@@ -124,6 +124,9 @@ pub struct ComposerState {
     /// Emoji autocomplete: selected row, and the query the user dismissed with Escape.
     pub ac_selected: usize,
     pub ac_dismissed: Option<String>,
+    /// The GIF / sticker picker is open, anchored at this button rect.
+    pub gif_picker: Option<Rect>,
+    pub sticker_picker: Option<Rect>,
     /// Staged files to upload with the next sent message.
     pub attachments: Vec<nixcord_http::UploadFile>,
     /// Background file-picker / drag-drop loader receivers returning `(files, error_messages)`.
@@ -204,6 +207,8 @@ pub struct ViewState {
     pub drafts: HashMap<Snowflake, String>,
     /// Staged attachments of channels other than the open one (see `stash_attachments`).
     pub attachment_drafts: HashMap<Snowflake, AttachmentDraft>,
+    /// GIF picker search and results.
+    pub gifs: ui::gif_picker::GifState,
     pub mic_muted: bool,
     pub deafened: bool,
     pub confirm_delete: Option<(Snowflake, Snowflake)>,
@@ -454,6 +459,7 @@ impl NixApp {
                 }
             }
             AppEvent::Sent(m) => self.store.apply(&GatewayEvent::MessageCreate(m)),
+            AppEvent::Gifs { request_id, result } => self.view.gifs.apply(request_id, result),
             AppEvent::SendFailed {
                 channel,
                 content,
@@ -805,6 +811,27 @@ impl NixApp {
                 self.view.friends.add_busy = true;
                 self.view.friends.add_feedback = None;
                 self.send(Command::SendFriendRequest { username: trimmed });
+            }
+            Action::SearchGifs(query) => {
+                self.view.gifs.request_id = self.view.gifs.request_id.wrapping_add(1);
+                self.send(Command::SearchGifs {
+                    request_id: self.view.gifs.request_id,
+                    query,
+                });
+            }
+            Action::SendSticker {
+                channel,
+                sticker_id,
+                reply_to,
+            } => {
+                if self.store.is_detached(channel) {
+                    self.jump_to_present(channel);
+                }
+                self.send(Command::SendSticker {
+                    channel,
+                    sticker_id,
+                    reply_to,
+                });
             }
             Action::SearchMessages { raw, offset } => {
                 // Paging keeps the scope of the first page, even if the view moved since.

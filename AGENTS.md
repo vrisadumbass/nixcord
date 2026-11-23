@@ -116,6 +116,9 @@ then calls `request_repaint()`. The UI sends `Command`s to the backend. UI code 
     (with missing-glyph fallbacks instead of box glyphs).
   - A picker with ranked search, categories, skin tones and server custom emoji.
   - `:shortcode:` autocomplete.
+  - Composer gift (opens Discord's Nitro page), GIF picker (Discord's Tenor proxy: trending + search,
+    sends the GIF link) and sticker picker (server stickers, sent with `sticker_ids`); stickers render
+    in messages (Lottie ones as a "Sticker: name" card).
 - **Presence & Profiles:**
   - Status dots, activities and custom status.
   - Own status picker & custom status editor (op 3, persisted across restarts).
@@ -150,13 +153,15 @@ demo mode only:
   multipart uploads, message search / `around` jumps, Friends/DM creation routes, Forum/thread creation
   (`POST /channels/{id}/threads`), thread archive/lock (`PATCH /channels/{id}`), and `READY.read_state` /
   `MESSAGE_ACK` / `THREAD_*` events on real servers.
+- GIF search (`/gifs/search`, `/gifs/trending-gifs`), sending stickers, `GUILD_STICKERS_UPDATE`, and
+  thread membership (`member`, `THREAD_LIST_SYNC.members`, `THREAD_MEMBER(S)_UPDATE`) that decides
+  which threads the sidebar lists.
 
 Not built yet:
 - Voice and video calls, screen share.
 - Native OS desktop notifications (in-app mention toasts, mention badges, unread counts and
   window title badges are built).
 - Modals for bot interactions (buttons, string selects, and entity select menus are interactive).
-- Stickers, the GIF picker.
 - Full profile modals (bio/banners/mutuals), server settings.
 - Plugin API (planned: a stable Rust trait plus WASM).
 
