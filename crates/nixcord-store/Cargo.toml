@@ -1,0 +1,9 @@
+[package]
+name = "nixcord-store"
+description = "In-memory client state for nixcord"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nixcord-model.workspace = true

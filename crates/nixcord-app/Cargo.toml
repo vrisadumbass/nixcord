@@ -1,0 +1,19 @@
+[package]
+name = "nixcord"
+description = "A lightweight native Discord client written in Rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "nixcord"
+path = "src/main.rs"
+
+[dependencies]
+nixcord-model.workspace = true
+nixcord-gateway.workspace = true
+nixcord-http.workspace = true
+nixcord-store.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
