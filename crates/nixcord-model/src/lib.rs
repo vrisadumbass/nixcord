@@ -1178,4 +1178,35 @@ mod tests {
         };
         assert_eq!(empty.label(), None);
     }
+
+    #[test]
+    fn thread_kinds_and_read_state_decode() {
+        for (raw, expected) in [
+            (10u8, ChannelKind::AnnouncementThread),
+            (11, ChannelKind::PublicThread),
+            (12, ChannelKind::PrivateThread),
+        ] {
+            let k = ChannelKind::from(raw);
+            assert_eq!(k, expected);
+            assert_eq!(u8::from(k), raw);
+            assert!(k.is_thread());
+            assert!(k.is_textual());
+        }
+        assert!(!ChannelKind::Text.is_thread());
+        assert!(!ChannelKind::Forum.is_thread());
+
+        let c: Channel = serde_json::from_str(
+            r#"{"id":"50","type":11,"parent_id":"10","thread_metadata":{"archived":true,"locked":true}}"#,
+        )
+        .unwrap();
+        assert!(c.is_archived());
+        assert!(c.thread_metadata.as_ref().unwrap().locked);
+
+        let rs: ReadState =
+            serde_json::from_str(r#"{"id":"10","last_message_id":"99","mention_count":4}"#)
+                .unwrap();
+        assert_eq!(rs.id, Snowflake(10));
+        assert_eq!(rs.last_message_id, Some(Snowflake(99)));
+        assert_eq!(rs.mention_count, 4);
+    }
 }

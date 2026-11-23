@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use nixcord_model::{
     Activity, Channel, ClientStatus, Emoji, GatewayEvent, Guild, GuildMember, ListMember,
     MemberListGroup, MemberListItem, MemberListOp, MemberListUpdate, Message, MessageUpdate,
-    Presence, Ready, ReadySupplemental, Relationship, Snowflake, Status, User,
+    Presence, ReadState, Ready, ReadySupplemental, Relationship, Snowflake, Status, User,
 };
 use serde::de::{DeserializeOwned, Error as _};
 use serde::Deserialize;
@@ -365,6 +365,64 @@ pub fn decode_dispatch(t: &str, d: &str) -> Result<Option<GatewayEvent>, JsonErr
                     .collect(),
             }
         }
+        "MESSAGE_ACK" => {
+            #[derive(Deserialize)]
+            struct Ack {
+                channel_id: Snowflake,
+                #[serde(default)]
+                message_id: Option<Snowflake>,
+            }
+            let a: Ack = serde_json::from_str(d)?;
+            let Some(message_id) = a.message_id else {
+                return Ok(None);
+            };
+            GatewayEvent::MessageAck {
+                channel_id: a.channel_id,
+                message_id,
+            }
+        }
+        "THREAD_CREATE" => {
+            GatewayEvent::ThreadCreate(Box::new(serde_json::from_str::<Channel>(d)?))
+        }
+        "THREAD_UPDATE" => {
+            GatewayEvent::ThreadUpdate(Box::new(serde_json::from_str::<Channel>(d)?))
+        }
+        "THREAD_DELETE" => {
+            #[derive(Deserialize)]
+            struct ThreadDel {
+                id: Snowflake,
+                #[serde(default)]
+                guild_id: Option<Snowflake>,
+                #[serde(default)]
+                parent_id: Option<Snowflake>,
+            }
+            let t: ThreadDel = serde_json::from_str(d)?;
+            GatewayEvent::ThreadDelete {
+                id: t.id,
+                guild_id: t.guild_id,
+                parent_id: t.parent_id,
+            }
+        }
+        "THREAD_LIST_SYNC" => {
+            #[derive(Deserialize)]
+            struct ThreadSync {
+                guild_id: Snowflake,
+                #[serde(default)]
+                channel_ids: Vec<Snowflake>,
+                #[serde(default)]
+                threads: Vec<Value>,
+            }
+            let s: ThreadSync = serde_json::from_str(d)?;
+            GatewayEvent::ThreadListSync {
+                guild_id: s.guild_id,
+                channel_ids: s.channel_ids,
+                threads: s
+                    .threads
+                    .into_iter()
+                    .filter_map(|v| serde_json::from_value::<Channel>(v).ok())
+                    .collect(),
+            }
+        }
         _ => return Ok(None),
     };
     Ok(Some(ev))
@@ -444,6 +502,8 @@ pub fn decode_ready(d: &str) -> Result<Ready, JsonError> {
         user_settings: Option<Value>,
         #[serde(default)]
         sessions: Option<Value>,
+        #[serde(default)]
+        read_state: Value,
     }
     fn array(v: &Value) -> &[Value] {
         v.as_array().map_or(&[], Vec::as_slice)
@@ -540,6 +600,8 @@ pub fn decode_ready(d: &str) -> Result<Ready, JsonError> {
         private_channels.push(ch);
     }
 
+    let read_state = decode_read_state(&extras.read_state);
+
     Ok(Ready {
         user: raw.user,
         guilds,
@@ -549,8 +611,43 @@ pub fn decode_ready(d: &str) -> Result<Ready, JsonError> {
         presences,
         relationships,
         status,
-        read_state: Vec::new(),
+        read_state,
     })
+}
+
+/// Leniently decode READY `read_state`. Discord sends either a top-level array of channel
+/// read-state entries or a wrapped object `{"entries": [...], ...}`. Entries with a
+/// non-zero `read_state_type` (non-channel entries such as guild events) or invalid ids
+/// are skipped; `"0"` / `0` / `null` `last_message_id` becomes `None`.
+fn decode_read_state(v: &Value) -> Vec<ReadState> {
+    let entries = v
+        .as_array()
+        .or_else(|| v.get("entries").and_then(Value::as_array))
+        .map_or(&[][..], Vec::as_slice);
+    entries
+        .iter()
+        .filter_map(|e| {
+            if let Some(t) = e.get("read_state_type").and_then(Value::as_u64) {
+                if t != 0 {
+                    return None;
+                }
+            }
+            let id = e.get("id").and_then(snowflake)?;
+            let last_message_id = e
+                .get("last_message_id")
+                .and_then(snowflake)
+                .filter(|s| s.0 != 0);
+            let mention_count = e
+                .get("mention_count")
+                .and_then(Value::as_u64)
+                .map_or(0, |n| n.min(u32::MAX as u64) as u32);
+            Some(ReadState {
+                id,
+                last_message_id,
+                mention_count,
+            })
+        })
+        .collect()
 }
 
 fn snowflake(v: &Value) -> Option<Snowflake> {
@@ -1616,6 +1713,7 @@ mod tests {
 #[cfg(test)]
 mod emoji_tests {
     use super::*;
+    use nixcord_model::ChannelKind;
 
     #[test]
     fn decodes_guild_emojis() {
@@ -1639,6 +1737,149 @@ mod emoji_tests {
         let g = r#"{"id":"7","name":"G","emojis":[{"id":"1","name":"ferris"}]}"#;
         match decode_dispatch("GUILD_CREATE", g).unwrap().unwrap() {
             GatewayEvent::GuildCreate(g) => assert_eq!(g.emojis[0].name, "ferris"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_ready_read_state_and_threads() {
+        // Array shape of read_state + guild inline threads.
+        let d = r#"{
+            "user":{"id":"1","username":"me"},
+            "session_id":"s1",
+            "guilds":[{
+                "id":"100","name":"G",
+                "channels":[{"id":"10","type":0,"name":"general"}],
+                "threads":[
+                    {"id":"50","type":11,"guild_id":"100","parent_id":"10","name":"bug-fix",
+                     "last_message_id":"900","thread_metadata":{"archived":false,"locked":false}},
+                    {"bogus":true}
+                ]
+            }],
+            "read_state":[
+                {"id":"10","last_message_id":"800","mention_count":3},
+                {"id":"50","last_message_id":"0","mention_count":null},
+                {"id":"100","read_state_type":2,"mention_count":5},
+                {"mention_count":1}
+            ]
+        }"#;
+        let r = decode_ready(d).unwrap();
+        assert_eq!(r.guilds[0].threads.len(), 1);
+        assert_eq!(r.guilds[0].threads[0].id, Snowflake(50));
+        assert_eq!(r.guilds[0].threads[0].kind, ChannelKind::PublicThread);
+        assert_eq!(r.guilds[0].threads[0].parent_id, Some(Snowflake(10)));
+        assert_eq!(r.read_state.len(), 2);
+        assert_eq!(
+            r.read_state[0],
+            ReadState {
+                id: Snowflake(10),
+                last_message_id: Some(Snowflake(800)),
+                mention_count: 3,
+            }
+        );
+        assert_eq!(
+            r.read_state[1],
+            ReadState {
+                id: Snowflake(50),
+                last_message_id: None,
+                mention_count: 0,
+            }
+        );
+
+        // Object `{ "entries": [...] }` shape of read_state.
+        let d_obj = r#"{
+            "user":{"id":"1","username":"me"},
+            "session_id":"s2",
+            "read_state":{"version":42,"partial":false,"entries":[
+                {"id":"20","last_message_id":"999","mention_count":1}
+            ]}
+        }"#;
+        let r2 = decode_ready(d_obj).unwrap();
+        assert_eq!(r2.read_state.len(), 1);
+        assert_eq!(r2.read_state[0].id, Snowflake(20));
+        assert_eq!(r2.read_state[0].last_message_id, Some(Snowflake(999)));
+        assert_eq!(r2.read_state[0].mention_count, 1);
+    }
+
+    #[test]
+    fn decodes_message_ack_and_thread_events() {
+        match decode_dispatch("MESSAGE_ACK", r#"{"channel_id":"10","message_id":"99"}"#)
+            .unwrap()
+            .unwrap()
+        {
+            GatewayEvent::MessageAck {
+                channel_id,
+                message_id,
+            } => {
+                assert_eq!(channel_id, Snowflake(10));
+                assert_eq!(message_id, Snowflake(99));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            decode_dispatch("MESSAGE_ACK", r#"{"channel_id":"10","message_id":null}"#)
+                .unwrap()
+                .is_none()
+        );
+
+        let th = r#"{"id":"50","type":12,"guild_id":"100","parent_id":"10","name":"secret",
+            "thread_metadata":{"archived":false,"locked":true}}"#;
+        match decode_dispatch("THREAD_CREATE", th).unwrap().unwrap() {
+            GatewayEvent::ThreadCreate(c) => {
+                assert_eq!(c.id, Snowflake(50));
+                assert_eq!(c.kind, ChannelKind::PrivateThread);
+                assert!(c.kind.is_thread());
+                assert!(c.kind.is_textual());
+                assert!(!c.is_archived());
+                assert!(c.thread_metadata.as_ref().unwrap().locked);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let th_upd = r#"{"id":"50","type":11,"guild_id":"100","parent_id":"10","name":"done",
+            "thread_metadata":{"archived":true,"locked":false}}"#;
+        match decode_dispatch("THREAD_UPDATE", th_upd).unwrap().unwrap() {
+            GatewayEvent::ThreadUpdate(c) => {
+                assert_eq!(c.name.as_deref(), Some("done"));
+                assert!(c.is_archived());
+            }
+            other => panic!("{other:?}"),
+        }
+
+        match decode_dispatch(
+            "THREAD_DELETE",
+            r#"{"id":"50","guild_id":"100","parent_id":"10","type":11}"#,
+        )
+        .unwrap()
+        .unwrap()
+        {
+            GatewayEvent::ThreadDelete {
+                id,
+                guild_id,
+                parent_id,
+            } => {
+                assert_eq!(id, Snowflake(50));
+                assert_eq!(guild_id, Some(Snowflake(100)));
+                assert_eq!(parent_id, Some(Snowflake(10)));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let sync = r#"{"guild_id":"100","channel_ids":["10"],"threads":[
+            {"id":"51","type":10,"guild_id":"100","parent_id":"10","name":"news-thread"},
+            {"bad":true}
+        ]}"#;
+        match decode_dispatch("THREAD_LIST_SYNC", sync).unwrap().unwrap() {
+            GatewayEvent::ThreadListSync {
+                guild_id,
+                channel_ids,
+                threads,
+            } => {
+                assert_eq!(guild_id, Snowflake(100));
+                assert_eq!(channel_ids, vec![Snowflake(10)]);
+                assert_eq!(threads.len(), 1);
+                assert_eq!(threads[0].kind, ChannelKind::AnnouncementThread);
+            }
             other => panic!("{other:?}"),
         }
     }

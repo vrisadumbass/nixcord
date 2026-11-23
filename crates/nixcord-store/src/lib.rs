@@ -106,20 +106,31 @@ struct PresenceDiag {
     shadowed: u64,
 }
 
+/// Per-channel read state: newest read message id and unread mention count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ChannelReadState {
+    last_read_message_id: Option<Snowflake>,
+    mention_count: u32,
+}
+
 #[derive(Default)]
 pub struct Store {
     connection: ConnectionState,
     me: Option<User>,
     /// Guild ids in the order Discord sent them.
     guild_order: Vec<Snowflake>,
-    /// Guilds with `channels` emptied (channels live in `channels`).
+    /// Guilds with `channels` and `threads` emptied (both live in `channels`).
     guilds: HashMap<Snowflake, Guild>,
-    /// Channel ids per guild (unsorted).
+    /// Regular channel ids per guild (unsorted; excludes threads).
     guild_channel_ids: HashMap<Snowflake, Vec<Snowflake>>,
+    /// Thread ids per guild (unsorted; threads also live in `channels`).
+    guild_thread_ids: HashMap<Snowflake, Vec<Snowflake>>,
     /// DM / group DM ids (unsorted).
     private_ids: Vec<Snowflake>,
-    /// Every known channel, guild or private.
+    /// Every known channel or thread, guild or private.
     channels: HashMap<Snowflake, Channel>,
+    /// Per-channel read state (last read message id + unread mention count).
+    read_states: HashMap<Snowflake, ChannelReadState>,
     /// Per channel, sorted by id ascending (oldest first), no duplicates, capped.
     messages: HashMap<Snowflake, Vec<Message>>,
     history_loaded: HashSet<Snowflake>,
@@ -159,11 +170,23 @@ impl Store {
                 self.epoch = epoch;
                 self.cache_user(&ready.user);
                 self.me = Some(ready.user.clone());
+                // Load explicit server read states before upserting guilds/channels so
+                // baselines only fill channels absent from `ready.read_state`.
+                for rs in &ready.read_state {
+                    self.read_states.insert(
+                        rs.id,
+                        ChannelReadState {
+                            last_read_message_id: rs.last_message_id,
+                            mention_count: rs.mention_count,
+                        },
+                    );
+                }
                 for guild in &ready.guilds {
-                    self.upsert_guild(guild, true);
+                    self.upsert_guild(guild, true, true);
                 }
                 for ch in &ready.private_channels {
                     self.upsert_channel(ch);
+                    self.baseline_read_state(ch.id, ch.last_message_id);
                 }
                 for r in &ready.relationships {
                     self.relationship_add(r);
@@ -212,9 +235,10 @@ impl Store {
                 };
             }
             GatewayEvent::AuthFailed => self.connection = ConnectionState::Offline,
-            GatewayEvent::GuildCreate(g) => self.upsert_guild(g, true),
+            GatewayEvent::GuildCreate(g) => self.upsert_guild(g, true, true),
             GatewayEvent::GuildUpdate(g) => {
-                let replace = !g.channels.is_empty() || !self.guilds.contains_key(&g.id);
+                let replace_channels = !g.channels.is_empty() || !self.guilds.contains_key(&g.id);
+                let replace_threads = !g.threads.is_empty();
                 // A GUILD_UPDATE without `emojis` keeps the list we have.
                 let keep = g.emojis.is_empty();
                 let old = keep
@@ -224,7 +248,7 @@ impl Store {
                             .map(|o| std::mem::take(&mut o.emojis))
                     })
                     .flatten();
-                self.upsert_guild(g, replace);
+                self.upsert_guild(g, replace_channels, replace_threads);
                 if let (Some(old), Some(new)) = (old, self.guilds.get_mut(&g.id)) {
                     new.emojis = old;
                 }
@@ -275,11 +299,27 @@ impl Store {
                 });
                 list.push((*user_id, now));
             }
-            GatewayEvent::MessageAck { .. }
-            | GatewayEvent::ThreadCreate(_)
-            | GatewayEvent::ThreadUpdate(_)
-            | GatewayEvent::ThreadDelete { .. }
-            | GatewayEvent::ThreadListSync { .. } => {}
+            GatewayEvent::MessageAck {
+                channel_id,
+                message_id,
+            } => {
+                let entry = self.read_states.entry(*channel_id).or_default();
+                entry.last_read_message_id = Some(*message_id);
+                entry.mention_count = 0;
+            }
+            GatewayEvent::ThreadCreate(ch) | GatewayEvent::ThreadUpdate(ch) => {
+                self.upsert_thread(ch);
+            }
+            GatewayEvent::ThreadDelete { id, guild_id, .. } => {
+                self.remove_thread(*id, *guild_id);
+            }
+            GatewayEvent::ThreadListSync {
+                guild_id,
+                channel_ids,
+                threads,
+            } => {
+                self.thread_list_sync(*guild_id, channel_ids, threads);
+            }
         }
     }
 
@@ -363,70 +403,269 @@ impl Store {
         self.channels.get(&id)
     }
 
-    // ---- notifications, threads & profile contract stubs (implemented by store-eng) ----
+    // ---- notifications, unread state, threads & profiles ----
 
-    pub fn last_read_message_id(&self, _channel_id: Snowflake) -> Option<Snowflake> {
-        None
+    /// Last message id marked read in `channel_id`, if known.
+    pub fn last_read_message_id(&self, channel_id: Snowflake) -> Option<Snowflake> {
+        self.read_states.get(&channel_id)?.last_read_message_id
     }
 
-    pub fn channel_unread(&self, _channel_id: Snowflake) -> bool {
-        false
+    /// True if `channel_id` is a visible textual channel (or active thread) with unread
+    /// messages or unread mentions.
+    pub fn channel_unread(&self, channel_id: Snowflake) -> bool {
+        let Some(ch) = self.channels.get(&channel_id) else {
+            return false;
+        };
+        if !ch.kind.is_textual() || ch.is_archived() {
+            return false;
+        }
+        if ch.guild_id.is_some()
+            && (ch.name.as_deref() == Some(HIDDEN_CHANNEL_NAME) || !self.can_view(channel_id))
+        {
+            return false;
+        }
+        let rs = self.read_states.get(&channel_id);
+        if rs.is_some_and(|r| r.mention_count > 0) {
+            return true;
+        }
+        let Some(last) = ch.last_message_id else {
+            return false;
+        };
+        rs.and_then(|r| r.last_read_message_id)
+            .is_none_or(|read| last > read)
     }
 
-    pub fn channel_mention_count(&self, _channel_id: Snowflake) -> u32 {
-        0
+    /// Unread mention count for `channel_id` (0 if none or unknown).
+    pub fn channel_mention_count(&self, channel_id: Snowflake) -> u32 {
+        self.read_states
+            .get(&channel_id)
+            .map_or(0, |r| r.mention_count)
     }
 
-    pub fn guild_unread_count(&self, _guild_id: Snowflake) -> usize {
-        0
+    /// Number of visible textual channels and active visible threads in `guild_id` that
+    /// have unread messages.
+    pub fn guild_unread_count(&self, guild_id: Snowflake) -> usize {
+        let ch_unread = self
+            .visible_guild_channels(guild_id)
+            .into_iter()
+            .filter(|c| c.kind.is_textual() && self.channel_unread(c.id))
+            .count();
+        let th_unread = self
+            .guild_threads(guild_id)
+            .into_iter()
+            .filter(|t| self.channel_unread(t.id))
+            .count();
+        ch_unread + th_unread
     }
 
-    pub fn guild_unread(&self, _guild_id: Snowflake) -> bool {
-        false
+    /// True if `guild_id` has any unread visible textual channel or active thread.
+    pub fn guild_unread(&self, guild_id: Snowflake) -> bool {
+        self.visible_guild_channels(guild_id)
+            .into_iter()
+            .any(|c| c.kind.is_textual() && self.channel_unread(c.id))
+            || self
+                .guild_threads(guild_id)
+                .into_iter()
+                .any(|t| self.channel_unread(t.id))
     }
 
-    pub fn guild_mention_count(&self, _guild_id: Snowflake) -> u32 {
-        0
+    /// Total unread mentions across all visible textual channels and active threads in
+    /// `guild_id`.
+    pub fn guild_mention_count(&self, guild_id: Snowflake) -> u32 {
+        let ch_mentions = self
+            .visible_guild_channels(guild_id)
+            .into_iter()
+            .filter(|c| c.kind.is_textual())
+            .fold(0u32, |acc, c| {
+                acc.saturating_add(self.channel_mention_count(c.id))
+            });
+        let th_mentions = self
+            .guild_threads(guild_id)
+            .into_iter()
+            .fold(0u32, |acc, t| {
+                acc.saturating_add(self.channel_mention_count(t.id))
+            });
+        ch_mentions.saturating_add(th_mentions)
     }
 
+    /// Total unread mentions across all DMs and group DMs.
     pub fn dm_mention_count(&self) -> u32 {
-        0
+        self.private_ids.iter().fold(0u32, |acc, id| {
+            acc.saturating_add(self.channel_mention_count(*id))
+        })
     }
 
+    /// Total unread mentions across all available guilds and private channels.
     pub fn total_mention_count(&self) -> u32 {
-        0
+        let guild_total = self
+            .guilds()
+            .into_iter()
+            .filter(|g| !g.unavailable)
+            .fold(0u32, |acc, g| {
+                acc.saturating_add(self.guild_mention_count(g.id))
+            });
+        guild_total.saturating_add(self.dm_mention_count())
     }
 
-    pub fn mark_read(&mut self, _channel_id: Snowflake) {}
-
-    pub fn mark_read_to(&mut self, _channel_id: Snowflake, _message_id: Snowflake) {}
-
-    pub fn should_notify(&self, _msg: &Message, _open_channel: Option<Snowflake>) -> bool {
-        false
+    /// Locally mark `channel_id` read up to its newest known message and clear its
+    /// mention count.
+    pub fn mark_read(&mut self, channel_id: Snowflake) {
+        let target = self
+            .channels
+            .get(&channel_id)
+            .and_then(|c| c.last_message_id)
+            .or_else(|| {
+                self.messages
+                    .get(&channel_id)
+                    .and_then(|msgs| msgs.last())
+                    .map(|m| m.id)
+            });
+        let entry = self.read_states.entry(channel_id).or_default();
+        if let Some(id) = target {
+            if entry.last_read_message_id.is_none_or(|old| old < id) {
+                entry.last_read_message_id = Some(id);
+            }
+        }
+        entry.mention_count = 0;
     }
 
-    pub fn channel_threads(&self, _parent_id: Snowflake) -> Vec<&Channel> {
-        Vec::new()
+    /// Locally mark `channel_id` read up to `message_id` (monotonic) and clear its
+    /// mention count.
+    pub fn mark_read_to(&mut self, channel_id: Snowflake, message_id: Snowflake) {
+        let entry = self.read_states.entry(channel_id).or_default();
+        if entry
+            .last_read_message_id
+            .is_none_or(|old| old < message_id)
+        {
+            entry.last_read_message_id = Some(message_id);
+        }
+        entry.mention_count = 0;
     }
 
-    pub fn guild_threads(&self, _guild_id: Snowflake) -> Vec<&Channel> {
-        Vec::new()
+    /// Should an incoming `MESSAGE_CREATE` trigger an in-app/desktop notification?
+    /// False for own messages, the currently open channel, while in Do Not Disturb,
+    /// or hidden channels; true for DMs/group DMs and messages mentioning us.
+    pub fn should_notify(&self, msg: &Message, open_channel: Option<Snowflake>) -> bool {
+        if self.me.as_ref().is_some_and(|u| u.id == msg.author.id) {
+            return false;
+        }
+        if open_channel == Some(msg.channel_id) {
+            return false;
+        }
+        if self.my_status == Status::Dnd {
+            return false;
+        }
+        if let Some(ch) = self.channels.get(&msg.channel_id) {
+            if ch.guild_id.is_some()
+                && (ch.name.as_deref() == Some(HIDDEN_CHANNEL_NAME)
+                    || !self.can_view(msg.channel_id))
+            {
+                return false;
+            }
+            if matches!(ch.kind, ChannelKind::Dm | ChannelKind::GroupDm) {
+                return true;
+            }
+        }
+        self.is_mentioned(msg)
     }
 
-    pub fn member_roles(&self, _guild_id: Snowflake, _user_id: Snowflake) -> Vec<&Role> {
-        Vec::new()
+    /// Active, visible threads belonging to `parent_id`, most recently active first.
+    pub fn channel_threads(&self, parent_id: Snowflake) -> Vec<&Channel> {
+        if let Some(gid) = self.channels.get(&parent_id).and_then(|c| c.guild_id) {
+            return self
+                .guild_threads(gid)
+                .into_iter()
+                .filter(|t| t.parent_id == Some(parent_id))
+                .collect();
+        }
+        let mut out: Vec<&Channel> = self
+            .guild_thread_ids
+            .values()
+            .flatten()
+            .filter_map(|id| self.channels.get(id))
+            .filter(|t| {
+                t.parent_id == Some(parent_id)
+                    && !t.is_archived()
+                    && t.name.as_deref() != Some(HIDDEN_CHANNEL_NAME)
+                    && self.can_view(t.id)
+            })
+            .collect();
+        sort_threads(&mut out);
+        out
     }
 
-    pub fn relationship_kind(&self, _user_id: Snowflake) -> RelationshipKind {
-        RelationshipKind::None
+    /// Active, visible threads in `guild_id`, most recently active first.
+    pub fn guild_threads(&self, guild_id: Snowflake) -> Vec<&Channel> {
+        let Some(ids) = self.guild_thread_ids.get(&guild_id) else {
+            return Vec::new();
+        };
+        let mut out: Vec<&Channel> = ids
+            .iter()
+            .filter_map(|id| self.channels.get(id))
+            .filter(|t| {
+                !t.is_archived()
+                    && t.name.as_deref() != Some(HIDDEN_CHANNEL_NAME)
+                    && self.can_view(t.id)
+            })
+            .collect();
+        sort_threads(&mut out);
+        out
     }
 
+    /// Guild roles of a member (excluding `@everyone`), sorted highest-position first.
+    pub fn member_roles(&self, guild_id: Snowflake, user_id: Snowflake) -> Vec<&Role> {
+        let Some(member) = self.members.get(&(guild_id, user_id)) else {
+            return Vec::new();
+        };
+        let Some(guild) = self.guilds.get(&guild_id) else {
+            return Vec::new();
+        };
+        let mut roles: Vec<&Role> = guild
+            .roles
+            .iter()
+            .filter(|r| r.id != guild_id && member.roles.contains(&r.id))
+            .collect();
+        // Higher position wins; on a tie, lower (older) id ranks higher (Discord's order).
+        roles.sort_by(|a, b| b.position.cmp(&a.position).then(a.id.cmp(&b.id)));
+        roles
+    }
+
+    /// Relationship kind with `user_id` (`RelationshipKind::None` if unrelated).
+    pub fn relationship_kind(&self, user_id: Snowflake) -> RelationshipKind {
+        self.relationships
+            .get(&user_id)
+            .map_or(RelationshipKind::None, |r| r.kind)
+    }
+
+    /// Borrowed profile snapshot for a user (optionally scoped to a guild for nick,
+    /// guild avatar, roles and role color).
     pub fn user_profile(
         &self,
-        _user_id: Snowflake,
-        _guild_id: Option<Snowflake>,
+        user_id: Snowflake,
+        guild_id: Option<Snowflake>,
     ) -> Option<UserProfile<'_>> {
-        None
+        let user = self.users.get(&user_id)?;
+        let is_me = self.me.as_ref().is_some_and(|m| m.id == user_id);
+        let (nick, member_avatar, roles, color) = match guild_id {
+            Some(gid) => (
+                self.member_nick(gid, user_id),
+                self.member_avatar(gid, user_id),
+                self.member_roles(gid, user_id),
+                self.member_color(gid, user_id),
+            ),
+            None => (None, None, Vec::new(), None),
+        };
+        Some(UserProfile {
+            user,
+            nick,
+            member_avatar,
+            roles,
+            color,
+            status: self.status(user_id),
+            presence: self.presence(user_id),
+            relationship: self.relationship_kind(user_id),
+            is_me,
+        })
     }
 
     /// Oldest-first.
@@ -674,6 +913,11 @@ impl Store {
     /// @everyone role is unknown): callers should fail open.
     pub fn channel_permissions(&self, channel_id: Snowflake) -> Option<u64> {
         let ch = self.channels.get(&channel_id)?;
+        // Threads inherit permission overwrites from their parent channel.
+        if ch.kind.is_thread() {
+            let parent = ch.parent_id.filter(|&p| p != channel_id)?;
+            return self.channel_permissions(parent);
+        }
         let guild_id = ch.guild_id?;
         let guild = self.guilds.get(&guild_id)?;
         let me = self.me.as_ref()?.id;
@@ -1012,11 +1256,14 @@ impl Store {
             }
         }
         let gone: HashSet<Snowflake> = ids.into_iter().collect();
-        let channels = self
+        let mut channels = self
             .guild_channel_ids
             .get(&guild)
             .cloned()
             .unwrap_or_default();
+        if let Some(threads) = self.guild_thread_ids.get(&guild) {
+            channels.extend(threads.iter().copied());
+        }
         let msgs: Vec<Message> = channels
             .iter()
             .filter_map(|c| self.messages.get(c))
@@ -1163,11 +1410,22 @@ impl Store {
         }
     }
 
+    fn baseline_read_state(&mut self, channel_id: Snowflake, last_message_id: Option<Snowflake>) {
+        self.read_states
+            .entry(channel_id)
+            .or_insert(ChannelReadState {
+                last_read_message_id: last_message_id,
+                mention_count: 0,
+            });
+    }
+
     /// Insert or replace a guild. With `replace_channels`, the guild's channel set becomes
     /// exactly the payload's (channels no longer present are dropped with their messages).
-    fn upsert_guild(&mut self, g: &Guild, replace_channels: bool) {
+    /// With `replace_threads`, the guild's active thread set is similarly replaced.
+    fn upsert_guild(&mut self, g: &Guild, replace_channels: bool, replace_threads: bool) {
         let mut stored = g.clone();
         let channels = std::mem::take(&mut stored.channels);
+        let threads = std::mem::take(&mut stored.threads);
         for m in std::mem::take(&mut stored.members) {
             self.cache_guild_member(g.id, &m);
         }
@@ -1175,24 +1433,57 @@ impl Store {
             self.guild_order.push(g.id);
         }
         self.guilds.insert(g.id, stored);
-        if !replace_channels {
-            return;
-        }
-        let new_ids: HashSet<Snowflake> = channels.iter().map(|c| c.id).collect();
-        let old = self.guild_channel_ids.remove(&g.id).unwrap_or_default();
-        for id in old.into_iter().filter(|id| !new_ids.contains(id)) {
-            self.drop_channel_data(id);
-        }
-        let mut ids = Vec::with_capacity(channels.len());
-        for mut ch in channels {
-            ch.guild_id = Some(g.id);
-            if let Some(prev) = self.channels.get(&ch.id) {
-                ch.last_message_id = ch.last_message_id.max(prev.last_message_id);
+        if replace_channels {
+            let new_ids: HashSet<Snowflake> = channels.iter().map(|c| c.id).collect();
+            let old = self.guild_channel_ids.remove(&g.id).unwrap_or_default();
+            for id in old.into_iter().filter(|id| !new_ids.contains(id)) {
+                self.drop_channel_data(id);
             }
-            ids.push(ch.id);
-            self.channels.insert(ch.id, ch);
+            let mut ids = Vec::with_capacity(channels.len());
+            for mut ch in channels {
+                ch.guild_id = Some(g.id);
+                if let Some(prev) = self.channels.get(&ch.id) {
+                    ch.last_message_id = ch.last_message_id.max(prev.last_message_id);
+                }
+                let id = ch.id;
+                let last = ch.last_message_id;
+                ids.push(id);
+                self.channels.insert(id, ch);
+                self.baseline_read_state(id, last);
+            }
+            self.guild_channel_ids.insert(g.id, ids);
         }
-        self.guild_channel_ids.insert(g.id, ids);
+        if replace_threads {
+            let new_ids: HashSet<Snowflake> = threads
+                .iter()
+                .filter(|t| !t.is_archived())
+                .map(|t| t.id)
+                .collect();
+            let old = self.guild_thread_ids.remove(&g.id).unwrap_or_default();
+            for id in old.into_iter().filter(|id| !new_ids.contains(id)) {
+                self.drop_channel_data(id);
+            }
+            let mut ids = Vec::with_capacity(new_ids.len());
+            for mut th in threads {
+                if th.is_archived() {
+                    continue;
+                }
+                th.guild_id = Some(g.id);
+                if let Some(prev) = self.channels.get(&th.id) {
+                    th.last_message_id = th.last_message_id.max(prev.last_message_id);
+                }
+                let id = th.id;
+                let last = th.last_message_id;
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+                self.channels.insert(id, th);
+                self.baseline_read_state(id, last);
+            }
+            if !ids.is_empty() {
+                self.guild_thread_ids.insert(g.id, ids);
+            }
+        }
     }
 
     fn remove_guild(&mut self, id: Snowflake) {
@@ -1208,9 +1499,16 @@ impl Store {
         for ch in self.guild_channel_ids.remove(&id).unwrap_or_default() {
             self.drop_channel_data(ch);
         }
+        for th in self.guild_thread_ids.remove(&id).unwrap_or_default() {
+            self.drop_channel_data(th);
+        }
     }
 
     fn upsert_channel(&mut self, ch: &Channel) {
+        if ch.kind.is_thread() {
+            self.upsert_thread(ch);
+            return;
+        }
         let mut ch = ch.clone();
         for u in &ch.recipients {
             self.cache_user(u);
@@ -1231,6 +1529,116 @@ impl Store {
         self.channels.insert(ch.id, ch);
     }
 
+    fn upsert_thread(&mut self, th: &Channel) {
+        let mut th = th.clone();
+        if th.guild_id.is_none() {
+            th.guild_id = th
+                .parent_id
+                .and_then(|p| self.channels.get(&p))
+                .and_then(|c| c.guild_id);
+        }
+        let prev_guild = if let Some(prev) = self.channels.get(&th.id) {
+            th.last_message_id = th.last_message_id.max(prev.last_message_id);
+            if th.parent_id.is_none() {
+                th.parent_id = prev.parent_id;
+            }
+            if th.guild_id.is_none() {
+                th.guild_id = prev.guild_id;
+            }
+            prev.guild_id
+        } else {
+            None
+        };
+
+        if th.is_archived() && !self.history_loaded.contains(&th.id) {
+            self.remove_thread(th.id, prev_guild.or(th.guild_id));
+            return;
+        }
+
+        if let Some(pg) = prev_guild {
+            if Some(pg) != th.guild_id {
+                if let Some(ids) = self.guild_thread_ids.get_mut(&pg) {
+                    ids.retain(|c| *c != th.id);
+                }
+            }
+        }
+        if let Some(gid) = th.guild_id {
+            let ids = self.guild_thread_ids.entry(gid).or_default();
+            if !ids.contains(&th.id) {
+                ids.push(th.id);
+            }
+        }
+        self.channels.insert(th.id, th);
+    }
+
+    fn remove_thread(&mut self, id: Snowflake, guild_id: Option<Snowflake>) {
+        let gid = self.channels.get(&id).and_then(|c| c.guild_id).or(guild_id);
+        match gid {
+            Some(g) => {
+                if let Some(ids) = self.guild_thread_ids.get_mut(&g) {
+                    ids.retain(|c| *c != id);
+                    if ids.is_empty() {
+                        self.guild_thread_ids.remove(&g);
+                    }
+                }
+            }
+            None => {
+                self.guild_thread_ids.retain(|_, ids| {
+                    ids.retain(|c| *c != id);
+                    !ids.is_empty()
+                });
+            }
+        }
+        self.drop_channel_data(id);
+    }
+
+    fn thread_list_sync(
+        &mut self,
+        guild_id: Snowflake,
+        channel_ids: &[Snowflake],
+        threads: &[Channel],
+    ) {
+        let scope: Option<HashSet<Snowflake>> =
+            (!channel_ids.is_empty()).then(|| channel_ids.iter().copied().collect());
+        let incoming: HashSet<Snowflake> = threads
+            .iter()
+            .filter(|t| !t.is_archived())
+            .map(|t| t.id)
+            .collect();
+
+        if let Some(existing) = self.guild_thread_ids.get(&guild_id).cloned() {
+            let mut dropped = Vec::new();
+            for tid in existing {
+                let in_scope = match &scope {
+                    None => true,
+                    Some(parents) => self
+                        .channels
+                        .get(&tid)
+                        .and_then(|c| c.parent_id)
+                        .is_some_and(|p| parents.contains(&p)),
+                };
+                if in_scope && !incoming.contains(&tid) {
+                    dropped.push(tid);
+                }
+            }
+            for tid in dropped {
+                self.remove_thread(tid, Some(guild_id));
+            }
+        }
+
+        for th in threads {
+            let mut th = th.clone();
+            th.guild_id = Some(guild_id);
+            let id = th.id;
+            let archived = th.is_archived();
+            self.upsert_thread(&th);
+            if !archived {
+                let last = self.channels.get(&id).and_then(|c| c.last_message_id);
+                self.baseline_read_state(id, last);
+            }
+        }
+    }
+
     fn detach_channel(&mut self, id: Snowflake, guild_id: Option<Snowflake>) {
         match guild_id {
             Some(gid) => {
@@ -1244,25 +1652,54 @@ impl Store {
 
     fn remove_channel(&mut self, id: Snowflake) {
         if let Some(prev) = self.channels.get(&id) {
+            if prev.kind.is_thread() {
+                let gid = prev.guild_id;
+                self.remove_thread(id, gid);
+                return;
+            }
             let gid = prev.guild_id;
             self.detach_channel(id, gid);
+            // Drop any threads parented to the deleted channel.
+            if let Some(gid) = gid {
+                let child_threads: Vec<Snowflake> = self
+                    .guild_thread_ids
+                    .get(&gid)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .filter(|tid| {
+                        self.channels
+                            .get(tid)
+                            .is_some_and(|t| t.parent_id == Some(id))
+                    })
+                    .collect();
+                for tid in child_threads {
+                    self.remove_thread(tid, Some(gid));
+                }
+            }
         }
         self.drop_channel_data(id);
     }
 
-    /// Remove a channel and everything hanging off it (not its list membership).
+    /// Remove a channel or thread and everything hanging off it (not its list membership).
     fn drop_channel_data(&mut self, id: Snowflake) {
         self.channels.remove(&id);
         self.messages.remove(&id);
         self.history_loaded.remove(&id);
         self.detached.remove(&id);
         self.typing.remove(&id);
+        self.read_states.remove(&id);
     }
 
     fn message_create(&mut self, m: &Message) {
+        let prev_last = self
+            .channels
+            .get(&m.channel_id)
+            .and_then(|c| c.last_message_id);
         self.cache_message_users(m);
         self.cache_member(m);
         self.bump_last_message(m.channel_id, m.id);
+        self.update_read_state_on_message(m, prev_last);
         if let Some(list) = self.typing.get_mut(&m.channel_id) {
             list.retain(|&(u, _)| u != m.author.id);
         }
@@ -1290,6 +1727,42 @@ impl Store {
         }
         cap(list);
     }
+
+    fn update_read_state_on_message(&mut self, m: &Message, prev_last: Option<Snowflake>) {
+        if self.me.as_ref().is_some_and(|u| u.id == m.author.id) {
+            self.mark_read_to(m.channel_id, m.id);
+            return;
+        }
+        // Ignore duplicates / replays of messages we have already seen or read.
+        if prev_last.is_some_and(|prev| m.id <= prev) {
+            return;
+        }
+        let already_read = self
+            .read_states
+            .get(&m.channel_id)
+            .and_then(|rs| rs.last_read_message_id)
+            .is_some_and(|read| m.id <= read);
+        if already_read {
+            return;
+        }
+        let is_dm = self
+            .channels
+            .get(&m.channel_id)
+            .is_some_and(|c| matches!(c.kind, ChannelKind::Dm | ChannelKind::GroupDm));
+        if is_dm || self.is_mentioned(m) {
+            let entry = self.read_states.entry(m.channel_id).or_default();
+            entry.mention_count = entry.mention_count.saturating_add(1);
+        }
+    }
+}
+
+/// Sort active threads most recently active first (matching `private_channels`).
+fn sort_threads(out: &mut [&Channel]) {
+    out.sort_by(|a, b| {
+        b.last_message_id
+            .cmp(&a.last_message_id)
+            .then(b.id.cmp(&a.id))
+    });
 }
 
 /// Unicode emoji compare by name, custom emoji by id (names can change).

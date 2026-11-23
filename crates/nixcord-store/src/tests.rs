@@ -1532,3 +1532,496 @@ fn guild_emojis_update_replaces_list() {
         emojis: vec![],
     });
 }
+
+// ---------------------------------------------------------------------------
+// Read state, unread counts, mention counts & notifications
+// ---------------------------------------------------------------------------
+
+fn thread(id: u64, guild: u64, parent: u64, last: Option<u64>) -> Channel {
+    Channel {
+        id: sf(id),
+        kind: ChannelKind::PublicThread,
+        guild_id: Some(sf(guild)),
+        name: Some(format!("t{id}")),
+        parent_id: Some(sf(parent)),
+        last_message_id: last.map(sf),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn ready_read_state_and_baseline() {
+    use nixcord_model::ReadState;
+    let mut c1 = chan(10, ChannelKind::Text, Some(100), None, 0);
+    c1.last_message_id = Some(sf(500)); // has explicit read_state behind 500 -> unread + mentions
+    let mut c2 = chan(11, ChannelKind::Text, Some(100), None, 1);
+    c2.last_message_id = Some(sf(600)); // absent from read_state -> starts read (baseline = 600)
+    let c3 = chan(12, ChannelKind::Text, Some(100), None, 2); // no messages yet -> not unread
+
+    let mut unavailable_g = guild(200, vec![]);
+    unavailable_g.unavailable = true;
+
+    let mut s = Store::new();
+    s.apply(&GatewayEvent::Ready(Box::new(Ready {
+        user: user(1),
+        guilds: vec![guild(100, vec![c1, c2, c3]), unavailable_g],
+        private_channels: vec![dm(20, Some(700), 2)],
+        session_id: "s".into(),
+        read_state: vec![
+            ReadState {
+                id: sf(10),
+                last_message_id: Some(sf(400)),
+                mention_count: 2,
+            },
+            // Read state for a channel in an unavailable guild should survive GUILD_CREATE.
+            ReadState {
+                id: sf(210),
+                last_message_id: Some(sf(800)),
+                mention_count: 3,
+            },
+            ReadState {
+                id: sf(20),
+                last_message_id: Some(sf(650)),
+                mention_count: 1,
+            },
+        ],
+        ..Default::default()
+    })));
+
+    assert_eq!(s.last_read_message_id(sf(10)), Some(sf(400)));
+    assert!(s.channel_unread(sf(10)));
+    assert_eq!(s.channel_mention_count(sf(10)), 2);
+
+    assert_eq!(s.last_read_message_id(sf(11)), Some(sf(600)));
+    assert!(!s.channel_unread(sf(11)));
+    assert_eq!(s.channel_mention_count(sf(11)), 0);
+
+    assert_eq!(s.last_read_message_id(sf(12)), None);
+    assert!(!s.channel_unread(sf(12)));
+
+    assert!(s.channel_unread(sf(20)));
+    assert_eq!(s.dm_mention_count(), 1);
+    assert_eq!(s.guild_unread_count(sf(100)), 1);
+    assert!(s.guild_unread(sf(100)));
+    assert_eq!(s.guild_mention_count(sf(100)), 2);
+    // Unavailable guild 200 isn't counted yet until GUILD_CREATE arrives.
+    assert_eq!(s.total_mention_count(), 3);
+
+    // Late GUILD_CREATE for guild 200 preserves its READY read_state!
+    let mut c210 = chan(210, ChannelKind::Text, Some(200), None, 0);
+    c210.last_message_id = Some(sf(850));
+    s.apply(&GatewayEvent::GuildCreate(Box::new(guild(200, vec![c210]))));
+    assert!(s.channel_unread(sf(210)));
+    assert_eq!(s.channel_mention_count(sf(210)), 3);
+    assert_eq!(s.guild_mention_count(sf(200)), 3);
+    assert_eq!(s.total_mention_count(), 6);
+}
+
+#[test]
+fn live_messages_mentions_dms_ack_and_mark_read() {
+    let mut g = guild(100, vec![chan(10, ChannelKind::Text, Some(100), None, 0)]);
+    g.roles = vec![
+        Role {
+            id: sf(100),
+            name: "@everyone".into(),
+            permissions: perm::VIEW_CHANNEL | perm::SEND_MESSAGES,
+            ..Default::default()
+        },
+        Role {
+            id: sf(500),
+            name: "devs".into(),
+            position: 1,
+            ..Default::default()
+        },
+    ];
+    g.members = vec![GuildMember {
+        user: Some(user(1)),
+        roles: vec![sf(500)],
+        ..Default::default()
+    }];
+
+    let mut s = Store::new();
+    s.apply(&ready(1, vec![g], vec![dm(20, Some(50), 2)]));
+
+    // Regular guild message -> unread, 0 mentions.
+    let m1 = msg(100, 10, 2);
+    s.apply(&GatewayEvent::MessageCreate(Box::new(m1)));
+    assert!(s.channel_unread(sf(10)));
+    assert_eq!(s.channel_mention_count(sf(10)), 0);
+    assert_eq!(s.guild_unread_count(sf(100)), 1);
+
+    // Direct mention of me -> +1.
+    let mut m2 = msg(101, 10, 2);
+    m2.mentions = vec![user(1)];
+    s.apply(&GatewayEvent::MessageCreate(Box::new(m2.clone())));
+    assert_eq!(s.channel_mention_count(sf(10)), 1);
+
+    // Duplicate delivery of the same message must NOT double-count.
+    s.apply(&GatewayEvent::MessageCreate(Box::new(m2)));
+    assert_eq!(s.channel_mention_count(sf(10)), 1);
+
+    // @everyone -> +1.
+    let mut m3 = msg(102, 10, 2);
+    m3.mention_everyone = true;
+    s.apply(&GatewayEvent::MessageCreate(Box::new(m3)));
+    assert_eq!(s.channel_mention_count(sf(10)), 2);
+
+    // Role mention of a role I hold -> +1; unrelated role -> +0.
+    let mut m4 = msg(103, 10, 2);
+    m4.mention_roles = vec![sf(500)];
+    s.apply(&GatewayEvent::MessageCreate(Box::new(m4)));
+    assert_eq!(s.channel_mention_count(sf(10)), 3);
+
+    let mut m5 = msg(104, 10, 2);
+    m5.mention_roles = vec![sf(999)];
+    s.apply(&GatewayEvent::MessageCreate(Box::new(m5)));
+    assert_eq!(s.channel_mention_count(sf(10)), 3);
+
+    // Incoming DM from another user -> increments DM mention count.
+    s.apply(&GatewayEvent::MessageCreate(Box::new(msg(60, 20, 2))));
+    assert!(s.channel_unread(sf(20)));
+    assert_eq!(s.channel_mention_count(sf(20)), 1);
+    assert_eq!(s.dm_mention_count(), 1);
+    assert_eq!(s.total_mention_count(), 4);
+
+    // Local mark_read clears unread and mentions for channel 10.
+    s.mark_read(sf(10));
+    assert!(!s.channel_unread(sf(10)));
+    assert_eq!(s.channel_mention_count(sf(10)), 0);
+    assert_eq!(s.last_read_message_id(sf(10)), Some(sf(104)));
+    assert_eq!(s.total_mention_count(), 1);
+
+    // Own message advances last_read and clears mentions on DM 20.
+    s.apply(&GatewayEvent::MessageCreate(Box::new(msg(61, 20, 1))));
+    assert!(!s.channel_unread(sf(20)));
+    assert_eq!(s.dm_mention_count(), 0);
+    assert_eq!(s.last_read_message_id(sf(20)), Some(sf(61)));
+
+    // MESSAGE_ACK with current id marks read; MESSAGE_ACK with older id marks unread again.
+    s.apply(&GatewayEvent::MessageCreate(Box::new(msg(110, 10, 2))));
+    assert!(s.channel_unread(sf(10)));
+    s.apply(&GatewayEvent::MessageAck {
+        channel_id: sf(10),
+        message_id: sf(110),
+    });
+    assert!(!s.channel_unread(sf(10)));
+    s.apply(&GatewayEvent::MessageAck {
+        channel_id: sf(10),
+        message_id: sf(105),
+    });
+    assert!(s.channel_unread(sf(10)));
+    assert_eq!(s.last_read_message_id(sf(10)), Some(sf(105)));
+
+    // mark_read_to is monotonic (does not move backward).
+    s.mark_read_to(sf(10), sf(110));
+    assert_eq!(s.last_read_message_id(sf(10)), Some(sf(110)));
+    s.mark_read_to(sf(10), sf(100));
+    assert_eq!(s.last_read_message_id(sf(10)), Some(sf(110)));
+}
+
+#[test]
+fn should_notify_rules() {
+    let hidden = pchan(12, None, vec![deny_everyone_view()]);
+    let visible = pchan(11, None, vec![]);
+    let mut s = perm_store(&[], None, vec![visible, hidden]);
+    s.apply(&GatewayEvent::ChannelCreate(Box::new(dm(20, None, 2))));
+
+    // Non-mention in guild channel -> false.
+    let plain = msg(1, 11, 2);
+    assert!(!s.should_notify(&plain, None));
+
+    // Direct mention -> true when not open, false when open.
+    let mut ping = msg(2, 11, 2);
+    ping.mentions = vec![user(ME)];
+    assert!(s.should_notify(&ping, None));
+    assert!(s.should_notify(&ping, Some(sf(20))));
+    assert!(!s.should_notify(&ping, Some(sf(11))));
+
+    // Own message -> false even if mentioning self or in DM.
+    let mut own = msg(3, 20, ME);
+    own.mentions = vec![user(ME)];
+    assert!(!s.should_notify(&own, None));
+
+    // DM from another user -> true unless open.
+    let dm_msg = msg(4, 20, 2);
+    assert!(s.should_notify(&dm_msg, None));
+    assert!(!s.should_notify(&dm_msg, Some(sf(20))));
+
+    // Hidden channel -> false even on @everyone.
+    let mut hidden_ping = msg(5, 12, 2);
+    hidden_ping.mention_everyone = true;
+    assert!(!s.should_notify(&hidden_ping, None));
+
+    // Do Not Disturb suppresses all notifications.
+    s.set_my_status(Status::Dnd);
+    assert!(!s.should_notify(&ping, None));
+    assert!(!s.should_notify(&dm_msg, None));
+}
+
+// ---------------------------------------------------------------------------
+// Threads lifecycle, ordering, permissions & cleanup
+// ---------------------------------------------------------------------------
+
+#[test]
+fn threads_from_ready_events_and_sync() {
+    use nixcord_model::ThreadMetadata;
+    let mut g = guild(
+        100,
+        vec![
+            chan(10, ChannelKind::Text, Some(100), None, 0),
+            chan(11, ChannelKind::Text, Some(100), None, 1),
+        ],
+    );
+    g.threads = vec![
+        thread(50, 100, 10, Some(200)),
+        thread(51, 100, 10, Some(300)),
+        thread(52, 100, 11, Some(100)),
+    ];
+
+    let mut s = Store::new();
+    s.apply(&ready(1, vec![g], vec![]));
+
+    // Stored guild has threads emptied; guild_channels excludes threads.
+    assert!(s.guild(sf(100)).unwrap().threads.is_empty());
+    assert_eq!(chan_ids(&s.guild_channels(sf(100))), vec![10, 11]);
+    // Ordered by last_message_id desc.
+    assert_eq!(chan_ids(&s.channel_threads(sf(10))), vec![51, 50]);
+    assert_eq!(chan_ids(&s.channel_threads(sf(11))), vec![52]);
+    assert_eq!(chan_ids(&s.guild_threads(sf(100))), vec![51, 50, 52]);
+
+    // GUILD_UPDATE without threads preserves existing threads.
+    let mut g_upd = guild(100, vec![]);
+    g_upd.name = "renamed".into();
+    s.apply(&GatewayEvent::GuildUpdate(Box::new(g_upd)));
+    assert_eq!(chan_ids(&s.guild_threads(sf(100))), vec![51, 50, 52]);
+
+    // THREAD_CREATE adds a thread; message inside bumps it and rolls up mentions.
+    s.apply(&GatewayEvent::ThreadCreate(Box::new(thread(
+        53, 100, 10, None,
+    ))));
+    let mut tm = msg(400, 53, 2);
+    tm.mentions = vec![user(1)];
+    s.apply(&GatewayEvent::MessageCreate(Box::new(tm)));
+    assert_eq!(chan_ids(&s.channel_threads(sf(10))), vec![53, 51, 50]);
+    assert!(s.channel_unread(sf(53)));
+    assert_eq!(s.guild_unread_count(sf(100)), 1);
+    assert_eq!(s.guild_mention_count(sf(100)), 1);
+    assert_eq!(s.total_mention_count(), 1);
+
+    // THREAD_UPDATE archiving a thread without loaded history drops it cleanly.
+    let mut arch50 = thread(50, 100, 10, Some(200));
+    arch50.thread_metadata = Some(ThreadMetadata {
+        archived: true,
+        locked: false,
+    });
+    s.apply(&GatewayEvent::ThreadUpdate(Box::new(arch50)));
+    assert!(s.channel(sf(50)).is_none());
+    assert_eq!(chan_ids(&s.channel_threads(sf(10))), vec![53, 51]);
+
+    // THREAD_UPDATE archiving a thread WITH loaded history hides it from lists but keeps channel.
+    s.insert_history(sf(51), vec![msg(300, 51, 2)]);
+    let mut arch51 = thread(51, 100, 10, Some(300));
+    arch51.thread_metadata = Some(ThreadMetadata {
+        archived: true,
+        locked: false,
+    });
+    s.apply(&GatewayEvent::ThreadUpdate(Box::new(arch51)));
+    assert!(s.channel(sf(51)).is_some());
+    assert_eq!(chan_ids(&s.channel_threads(sf(10))), vec![53]);
+
+    // Scoped THREAD_LIST_SYNC for parent 10 replaces parent 10's threads, leaving parent 11 untouched.
+    s.apply(&GatewayEvent::ThreadListSync {
+        guild_id: sf(100),
+        channel_ids: vec![sf(10)],
+        threads: vec![thread(54, 100, 10, Some(500))],
+    });
+    assert_eq!(chan_ids(&s.channel_threads(sf(10))), vec![54]);
+    assert!(s.channel(sf(53)).is_none());
+    assert!(s.channel(sf(51)).is_none());
+    assert_eq!(chan_ids(&s.channel_threads(sf(11))), vec![52]);
+
+    // THREAD_DELETE drops thread and its data.
+    s.insert_history(sf(54), vec![msg(500, 54, 2)]);
+    s.apply(&GatewayEvent::ThreadDelete {
+        id: sf(54),
+        guild_id: Some(sf(100)),
+        parent_id: Some(sf(10)),
+    });
+    assert!(s.channel(sf(54)).is_none());
+    assert!(s.messages(sf(54)).is_empty());
+
+    // Deleting parent channel 11 drops its child thread 52.
+    s.apply(&GatewayEvent::ChannelDelete(Box::new(chan(
+        11,
+        ChannelKind::Text,
+        Some(100),
+        None,
+        1,
+    ))));
+    assert!(s.channel(sf(52)).is_none());
+    assert!(s.guild_threads(sf(100)).is_empty());
+}
+
+#[test]
+fn thread_permissions_inherit_parent_and_guild_delete_cleans_up() {
+    let visible_parent = pchan(10, None, vec![]);
+    let hidden_parent = pchan(11, None, vec![deny_everyone_view()]);
+    let readonly_parent = pchan(
+        12,
+        None,
+        vec![Overwrite {
+            id: sf(G),
+            kind: OverwriteKind::Role,
+            allow: 0,
+            deny: perm::SEND_MESSAGES,
+        }],
+    );
+    let mut s = perm_store(
+        &[],
+        None,
+        vec![visible_parent, hidden_parent, readonly_parent],
+    );
+    s.apply(&GatewayEvent::ThreadCreate(Box::new(thread(
+        60,
+        G,
+        10,
+        Some(1),
+    ))));
+    s.apply(&GatewayEvent::ThreadCreate(Box::new(thread(
+        61,
+        G,
+        11,
+        Some(2),
+    ))));
+    s.apply(&GatewayEvent::ThreadCreate(Box::new(thread(
+        62,
+        G,
+        12,
+        Some(3),
+    ))));
+
+    assert!(s.can_view(sf(60)) && s.can_send(sf(60)));
+    assert!(!s.can_view(sf(61)) && !s.can_send(sf(61)));
+    assert!(s.can_view(sf(62)) && !s.can_send(sf(62)));
+    assert_eq!(chan_ids(&s.guild_threads(sf(G))), vec![62, 60]);
+    assert!(s.channel_threads(sf(11)).is_empty());
+
+    // GuildDelete drops all threads, their messages, and their read states.
+    s.insert_history(sf(60), vec![msg(10, 60, 2)]);
+    let mut ping = msg(11, 60, 2);
+    ping.mentions = vec![user(ME)];
+    s.apply(&GatewayEvent::MessageCreate(Box::new(ping)));
+    assert_eq!(s.channel_mention_count(sf(60)), 1);
+
+    s.apply(&GatewayEvent::GuildDelete {
+        id: sf(G),
+        unavailable: false,
+    });
+    assert!(s.channel(sf(60)).is_none());
+    assert!(s.channel(sf(61)).is_none());
+    assert!(s.messages(sf(60)).is_empty());
+    assert_eq!(s.channel_mention_count(sf(60)), 0);
+    assert!(s.guild_threads(sf(G)).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Profile popout query helpers
+// ---------------------------------------------------------------------------
+
+#[test]
+fn profile_helpers_roles_relationships_and_snapshot() {
+    let mut g = guild(100, vec![chan(10, ChannelKind::Text, Some(100), None, 0)]);
+    g.roles = vec![
+        Role {
+            id: sf(100),
+            name: "@everyone".into(),
+            color: 0,
+            position: 0,
+            ..Default::default()
+        },
+        Role {
+            id: sf(2),
+            name: "helper".into(),
+            color: 0x00FF00,
+            position: 1,
+            ..Default::default()
+        },
+        Role {
+            id: sf(3),
+            name: "mod-newer".into(),
+            color: 0x0000FF,
+            position: 5,
+            ..Default::default()
+        },
+        Role {
+            id: sf(1),
+            name: "mod-older".into(),
+            color: 0xFF0000,
+            position: 5,
+            ..Default::default()
+        },
+    ];
+    g.members = vec![GuildMember {
+        user: Some(user(42)),
+        roles: vec![sf(100), sf(2), sf(3), sf(1)],
+        nick: Some("Ace".into()),
+        avatar: Some("guild_av".into()),
+        ..Default::default()
+    }];
+
+    let mut s = Store::new();
+    s.apply(&GatewayEvent::Ready(Box::new(Ready {
+        user: user(1),
+        guilds: vec![g],
+        relationships: vec![Relationship {
+            id: sf(42),
+            kind: RelationshipKind::Friend,
+            user: Some(user(42)),
+            nickname: None,
+        }],
+        presences: vec![Presence {
+            user_id: sf(42),
+            guild_id: None,
+            status: Status::Idle,
+            ..Default::default()
+        }],
+        ..Default::default()
+    })));
+
+    // member_roles excludes @everyone, orders position desc, tie-breaks id asc.
+    let role_names: Vec<&str> = s
+        .member_roles(sf(100), sf(42))
+        .iter()
+        .map(|r| r.name.as_str())
+        .collect();
+    assert_eq!(role_names, vec!["mod-older", "mod-newer", "helper"]);
+    assert!(s.member_roles(sf(100), sf(999)).is_empty());
+
+    assert_eq!(s.relationship_kind(sf(42)), RelationshipKind::Friend);
+    assert_eq!(s.relationship_kind(sf(999)), RelationshipKind::None);
+
+    // Guild-scoped profile.
+    let p = s.user_profile(sf(42), Some(sf(100))).unwrap();
+    assert_eq!(p.user.id, sf(42));
+    assert_eq!(p.nick, Some("Ace"));
+    assert_eq!(p.member_avatar, Some("guild_av"));
+    assert_eq!(p.roles.len(), 3);
+    assert_eq!(p.color, Some(0xFF0000));
+    assert_eq!(p.status, Status::Idle);
+    assert!(p.presence.is_some());
+    assert_eq!(p.relationship, RelationshipKind::Friend);
+    assert!(!p.is_me);
+
+    // Non-guild profile (e.g. DM).
+    let dm_p = s.user_profile(sf(42), None).unwrap();
+    assert!(dm_p.nick.is_none());
+    assert!(dm_p.member_avatar.is_none());
+    assert!(dm_p.roles.is_empty());
+    assert!(dm_p.color.is_none());
+    assert_eq!(dm_p.status, Status::Idle);
+    assert_eq!(dm_p.relationship, RelationshipKind::Friend);
+
+    // Self profile & unknown user.
+    assert!(s.user_profile(sf(1), None).unwrap().is_me);
+    assert!(s.user_profile(sf(999), Some(sf(100))).is_none());
+}
