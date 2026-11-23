@@ -82,6 +82,9 @@ pub enum ChannelKind {
     GroupDm,
     Category,
     Announcement,
+    AnnouncementThread,
+    PublicThread,
+    PrivateThread,
     Forum,
     Other(u8),
 }
@@ -95,6 +98,9 @@ impl From<u8> for ChannelKind {
             3 => Self::GroupDm,
             4 => Self::Category,
             5 => Self::Announcement,
+            10 => Self::AnnouncementThread,
+            11 => Self::PublicThread,
+            12 => Self::PrivateThread,
             15 => Self::Forum,
             n => Self::Other(n),
         }
@@ -109,6 +115,9 @@ impl From<ChannelKind> for u8 {
             ChannelKind::GroupDm => 3,
             ChannelKind::Category => 4,
             ChannelKind::Announcement => 5,
+            ChannelKind::AnnouncementThread => 10,
+            ChannelKind::PublicThread => 11,
+            ChannelKind::PrivateThread => 12,
             ChannelKind::Forum => 15,
             ChannelKind::Other(n) => n,
         }
@@ -120,7 +129,20 @@ impl ChannelKind {
     pub fn is_textual(self) -> bool {
         matches!(
             self,
-            Self::Text | Self::Dm | Self::GroupDm | Self::Announcement
+            Self::Text
+                | Self::Dm
+                | Self::GroupDm
+                | Self::Announcement
+                | Self::AnnouncementThread
+                | Self::PublicThread
+                | Self::PrivateThread
+        )
+    }
+
+    pub fn is_thread(self) -> bool {
+        matches!(
+            self,
+            Self::AnnouncementThread | Self::PublicThread | Self::PrivateThread
         )
     }
 }
@@ -197,6 +219,15 @@ pub struct Overwrite {
     pub deny: u64,
 }
 
+/// Metadata carried on thread channels (`thread_metadata`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreadMetadata {
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub locked: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Channel {
     pub id: Snowflake,
@@ -219,6 +250,8 @@ pub struct Channel {
     pub last_message_id: Option<Snowflake>,
     #[serde(default, deserialize_with = "de_lenient_vec")]
     pub permission_overwrites: Vec<Overwrite>,
+    #[serde(default)]
+    pub thread_metadata: Option<ThreadMetadata>,
 }
 
 impl Channel {
@@ -235,6 +268,10 @@ impl Channel {
         } else {
             names.join(", ")
         }
+    }
+
+    pub fn is_archived(&self) -> bool {
+        self.thread_metadata.as_ref().is_some_and(|m| m.archived)
     }
 }
 
@@ -307,6 +344,10 @@ pub struct Guild {
     /// GUILD_EMOJIS_UPDATE). Entries without a name are dropped.
     #[serde(default, deserialize_with = "de_lenient_vec")]
     pub emojis: Vec<CustomEmoji>,
+    /// Active threads in the guild (READY / GUILD_CREATE `threads`). The store moves these
+    /// into its channel/thread maps and does not keep them on the guild.
+    #[serde(default, deserialize_with = "de_lenient_vec")]
+    pub threads: Vec<Channel>,
 }
 
 /// A guild's custom emoji. Shown in the picker and used by autocomplete; sent as
@@ -511,6 +552,9 @@ pub struct Message {
     /// Message flags (`components::IS_COMPONENTS_V2`, ...).
     #[serde(default)]
     pub flags: u64,
+    /// Application that owns an interaction/bot message (used for component interactions).
+    #[serde(default)]
+    pub application_id: Option<Snowflake>,
 }
 
 /// Nonce may come back as a string or a number.
@@ -905,6 +949,16 @@ pub struct ReadySupplemental {
     pub presences: Vec<Presence>,
 }
 
+/// Per-channel read state entry from READY `read_state`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadState {
+    pub id: Snowflake,
+    #[serde(default)]
+    pub last_message_id: Option<Snowflake>,
+    #[serde(default)]
+    pub mention_count: u32,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Ready {
     pub user: User,
@@ -923,6 +977,9 @@ pub struct Ready {
     /// Our own status from the (JSON) user settings, or the sessions list.
     #[serde(default)]
     pub status: Option<Status>,
+    /// Per-channel read states (last read message id and mention count).
+    #[serde(default)]
+    pub read_state: Vec<ReadState>,
 }
 
 /// High-level events the gateway crate hands to the app.
@@ -995,6 +1052,23 @@ pub enum GatewayEvent {
     GuildEmojisUpdate {
         guild_id: Snowflake,
         emojis: Vec<CustomEmoji>,
+    },
+    /// MESSAGE_ACK: a channel was marked read up to `message_id`.
+    MessageAck {
+        channel_id: Snowflake,
+        message_id: Snowflake,
+    },
+    ThreadCreate(Box<Channel>),
+    ThreadUpdate(Box<Channel>),
+    ThreadDelete {
+        id: Snowflake,
+        guild_id: Option<Snowflake>,
+        parent_id: Option<Snowflake>,
+    },
+    ThreadListSync {
+        guild_id: Snowflake,
+        channel_ids: Vec<Snowflake>,
+        threads: Vec<Channel>,
     },
 }
 

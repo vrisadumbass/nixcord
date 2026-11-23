@@ -474,6 +474,19 @@ impl Http {
     pub async fn guild_channels(&self, guild_id: Snowflake) -> Result<Vec<Channel>> {
         self.json(Route::guild_channels(guild_id)).await
     }
+
+    /// POST /interactions (type 3: message component). Implemented by protocol-eng.
+    pub async fn send_component_interaction(
+        &self,
+        _ix: &nixcord_model::components::ComponentInteraction,
+    ) -> Result<()> {
+        Err(HttpError::Transport("not implemented".into()))
+    }
+
+    /// POST /channels/{cid}/messages/{mid}/ack. Implemented by protocol-eng.
+    pub async fn ack_message(&self, _channel_id: Snowflake, _message_id: Snowflake) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

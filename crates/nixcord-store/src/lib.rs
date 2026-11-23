@@ -43,6 +43,20 @@ pub enum ConnectionState {
     Reconnecting,
 }
 
+/// Borrowed view of a user's profile data for profile popouts.
+#[derive(Debug, Clone)]
+pub struct UserProfile<'a> {
+    pub user: &'a User,
+    pub nick: Option<&'a str>,
+    pub member_avatar: Option<&'a str>,
+    pub roles: Vec<&'a Role>,
+    pub color: Option<u32>,
+    pub status: Status,
+    pub presence: Option<&'a Presence>,
+    pub relationship: RelationshipKind,
+    pub is_me: bool,
+}
+
 /// One user's presences, by scope. Discord sends an *overall* presence (no `guild_id`)
 /// for friends and implicit relationships, and *per-guild* presences for guild members,
 /// friends and DM recipients. A status is account-wide, but a per-guild "offline" (or a
@@ -261,6 +275,11 @@ impl Store {
                 });
                 list.push((*user_id, now));
             }
+            GatewayEvent::MessageAck { .. }
+            | GatewayEvent::ThreadCreate(_)
+            | GatewayEvent::ThreadUpdate(_)
+            | GatewayEvent::ThreadDelete { .. }
+            | GatewayEvent::ThreadListSync { .. } => {}
         }
     }
 
@@ -342,6 +361,72 @@ impl Store {
 
     pub fn channel(&self, id: Snowflake) -> Option<&Channel> {
         self.channels.get(&id)
+    }
+
+    // ---- notifications, threads & profile contract stubs (implemented by store-eng) ----
+
+    pub fn last_read_message_id(&self, _channel_id: Snowflake) -> Option<Snowflake> {
+        None
+    }
+
+    pub fn channel_unread(&self, _channel_id: Snowflake) -> bool {
+        false
+    }
+
+    pub fn channel_mention_count(&self, _channel_id: Snowflake) -> u32 {
+        0
+    }
+
+    pub fn guild_unread_count(&self, _guild_id: Snowflake) -> usize {
+        0
+    }
+
+    pub fn guild_unread(&self, _guild_id: Snowflake) -> bool {
+        false
+    }
+
+    pub fn guild_mention_count(&self, _guild_id: Snowflake) -> u32 {
+        0
+    }
+
+    pub fn dm_mention_count(&self) -> u32 {
+        0
+    }
+
+    pub fn total_mention_count(&self) -> u32 {
+        0
+    }
+
+    pub fn mark_read(&mut self, _channel_id: Snowflake) {}
+
+    pub fn mark_read_to(&mut self, _channel_id: Snowflake, _message_id: Snowflake) {}
+
+    pub fn should_notify(&self, _msg: &Message, _open_channel: Option<Snowflake>) -> bool {
+        false
+    }
+
+    pub fn channel_threads(&self, _parent_id: Snowflake) -> Vec<&Channel> {
+        Vec::new()
+    }
+
+    pub fn guild_threads(&self, _guild_id: Snowflake) -> Vec<&Channel> {
+        Vec::new()
+    }
+
+    pub fn member_roles(&self, _guild_id: Snowflake, _user_id: Snowflake) -> Vec<&Role> {
+        Vec::new()
+    }
+
+    pub fn relationship_kind(&self, _user_id: Snowflake) -> RelationshipKind {
+        RelationshipKind::None
+    }
+
+    pub fn user_profile(
+        &self,
+        _user_id: Snowflake,
+        _guild_id: Option<Snowflake>,
+    ) -> Option<UserProfile<'_>> {
+        None
     }
 
     /// Oldest-first.

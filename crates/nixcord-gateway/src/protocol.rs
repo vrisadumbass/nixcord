@@ -546,6 +546,7 @@ pub fn decode_ready(d: &str) -> Result<Ready, JsonError> {
         presences,
         relationships,
         status,
+        read_state: Vec::new(),
     })
 }
 

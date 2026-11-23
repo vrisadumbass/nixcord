@@ -133,7 +133,7 @@ impl SelectKind {
         })
     }
 
-    fn type_id(self) -> u64 {
+    pub fn type_id(self) -> u64 {
         match self {
             Self::String => 3,
             Self::User => 5,
@@ -142,6 +142,22 @@ impl SelectKind {
             Self::Channel => 8,
         }
     }
+}
+
+/// Payload data for a Discord type-3 (MESSAGE_COMPONENT) interaction (`POST /interactions`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComponentInteraction {
+    pub guild_id: Option<Snowflake>,
+    pub channel_id: Snowflake,
+    pub message_id: Snowflake,
+    pub message_flags: u64,
+    pub application_id: Snowflake,
+    pub session_id: String,
+    /// Component `type`: 2 = button, 3 = string select, 5..=8 = entity selects.
+    pub component_type: u8,
+    pub custom_id: String,
+    /// Selected option values (used for select menus; omitted for buttons).
+    pub values: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

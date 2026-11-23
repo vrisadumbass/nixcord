@@ -201,6 +201,7 @@ fn guild(id: u64, name: &str, channels: Vec<Channel>) -> Guild {
             ..Default::default()
         }],
         emojis: demo_guild_emojis(id),
+        threads: Vec::new(),
     }
 }
 
@@ -417,6 +418,7 @@ fn ready() -> Ready {
             })
             .collect(),
         status: Some(Status::Online),
+        read_state: Vec::new(),
     }
 }
 
