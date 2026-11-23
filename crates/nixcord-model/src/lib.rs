@@ -157,6 +157,9 @@ pub mod permissions {
     pub const ADMINISTRATOR: u64 = 1 << 3;
     pub const VIEW_CHANNEL: u64 = 1 << 10;
     pub const SEND_MESSAGES: u64 = 1 << 11;
+    pub const MANAGE_THREADS: u64 = 1 << 34;
+    pub const CREATE_PUBLIC_THREADS: u64 = 1 << 35;
+    pub const SEND_MESSAGES_IN_THREADS: u64 = 1 << 38;
     pub const ALL: u64 = u64::MAX;
 }
 
@@ -253,6 +256,9 @@ pub struct Channel {
     pub kind: ChannelKind,
     #[serde(default)]
     pub guild_id: Option<Snowflake>,
+    /// Threads: the user who created it.
+    #[serde(default)]
+    pub owner_id: Option<Snowflake>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -1102,6 +1108,13 @@ pub struct Ready {
     /// Server folders and ordering from `user_settings.guild_folders` / `guild_positions`.
     #[serde(default)]
     pub guild_folders: Vec<GuildFolder>,
+    /// Our own custom status from `user_settings.custom_status`. Outer `None` means the
+    /// settings didn't say (no JSON user settings); `Some(None)` means none is set.
+    #[serde(default)]
+    pub custom_status: Option<Option<CustomStatus>>,
+    /// `user_settings.custom_status.expires_at` (ISO 8601), when the custom status expires.
+    #[serde(default)]
+    pub custom_status_expires_at: Option<String>,
 }
 
 /// High-level events the gateway crate hands to the app.

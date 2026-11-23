@@ -178,9 +178,9 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
     // Clipboard image / file paste (Ctrl+V / Cmd+V):
     // 1. egui-winit 0.37 intercepts Ctrl+V on key-press and emits `egui::Event::PasteImage`
     //    when the OS clipboard holds an image bitmap (Snipping Tool, PrtScn, browser Copy Image).
-    // 2. When the user copies file(s) in File Explorer (`CF_HDROP`) or in headless/fallback
-    //    contexts, no `Paste` or `PasteImage` is emitted on press; we catch `Ctrl+V` and query
-    //    `arboard` for either an image bitmap or a copied `file_list()`.
+    // 2. When the user copies file(s) in File Explorer (`CF_HDROP`), egui-winit emits nothing
+    //    on the press (it swallows the paste shortcut), so we catch the `Ctrl+V` release and
+    //    ask `arboard` for a copied `file_list()`.
     if can_accept_paste {
         let pasted_images = take_pasted_color_images(ui);
         if !pasted_images.is_empty() {
@@ -650,18 +650,10 @@ fn spawn_clipboard_paste(ctx: egui::Context, composer: &mut ComposerState, max_f
             let Ok(mut cb) = arboard::Clipboard::new() else {
                 return;
             };
-            if let Ok(img) = cb.get_image() {
-                let batch = match encode_rgba_png(img.width, img.height, img.bytes.as_ref()) {
-                    Ok(png_bytes) => (
-                        vec![UploadFile::from_bytes("pasted-image.png", png_bytes)],
-                        Vec::new(),
-                    ),
-                    Err(err) => (Vec::new(), vec![err]),
-                };
-                let _ = tx.send(batch);
-                ctx.request_repaint();
-                return;
-            }
+            // Images already arrived as `Event::PasteImage` on the key press; this path runs
+            // on the key release, so it only picks up copied files (CF_HDROP). Reading the
+            // image here too would attach every pasted image twice, and attach a stray bitmap
+            // when pasting text from Word or Excel.
             if let Ok(paths) = cb.get().file_list() {
                 if !paths.is_empty() && max_files > 0 {
                     let batch = load_paths(&paths, max_files);

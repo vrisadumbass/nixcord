@@ -802,6 +802,8 @@ impl Http {
         let auth = self.inner.auth.clone().ok_or(HttpError::Unauthorized)?;
         let route = Route::new(method, path.to_string());
         let url = route.url(&self.inner.base).map_err(HttpError::Transport)?;
+        // Shared buffer: a 429 retry re-sends it without copying up to 25 MiB again.
+        let body = bytes::Bytes::from(body);
 
         let mut retried = false;
         loop {

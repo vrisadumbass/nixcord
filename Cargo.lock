@@ -2366,6 +2366,7 @@ dependencies = [
 name = "nixcord-http"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "nixcord-model",
  "reqwest",
  "serde",

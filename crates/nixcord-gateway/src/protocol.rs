@@ -637,6 +637,11 @@ pub fn decode_ready(d: &str) -> Result<Ready, JsonError> {
         .map(decode_guild_folders)
         .unwrap_or_default();
 
+    let (custom_status, custom_status_expires_at) = extras
+        .user_settings
+        .as_ref()
+        .map_or((None, None), decode_custom_status);
+
     Ok(Ready {
         user: raw.user,
         guilds,
@@ -648,7 +653,46 @@ pub fn decode_ready(d: &str) -> Result<Ready, JsonError> {
         status,
         read_state,
         guild_folders,
+        custom_status,
+        custom_status_expires_at,
     })
+}
+
+/// Decode `user_settings.custom_status` (`{text, emoji_id, emoji_name, expires_at}` or
+/// null). Returns `(None, None)` when the key is missing, so callers can tell "unknown"
+/// from "none set".
+fn decode_custom_status(settings: &Value) -> (Option<Option<CustomStatus>>, Option<String>) {
+    let Some(v) = settings.get("custom_status") else {
+        return (None, None);
+    };
+    if v.is_null() {
+        return (Some(None), None);
+    }
+    let text = v.get("text").and_then(Value::as_str).map(str::to_owned);
+    let emoji_name = v
+        .get("emoji_name")
+        .and_then(Value::as_str)
+        .filter(|n| !n.is_empty())
+        .map(str::to_owned);
+    let emoji_id = v
+        .get("emoji_id")
+        .and_then(|id| match id {
+            Value::String(s) => s.parse().ok(),
+            Value::Number(n) => n.as_u64(),
+            _ => None,
+        })
+        .map(Snowflake);
+    let emoji = (emoji_name.is_some() || emoji_id.is_some()).then_some(Emoji {
+        id: emoji_id,
+        name: emoji_name,
+        animated: false,
+    });
+    let expires_at = v
+        .get("expires_at")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let status = CustomStatus { text, emoji }.normalized();
+    (Some(status), expires_at)
 }
 
 /// Decode `user_settings.guild_folders` (or fall back to `user_settings.guild_positions`).
@@ -1597,6 +1641,22 @@ mod tests {
         assert_eq!(r.private_channels[1].kind, ChannelKind::GroupDm);
         assert_eq!(r.private_channels[1].label(), "bob, carol");
         assert!(r.resume_gateway_url.is_none());
+    }
+
+    #[test]
+    fn ready_custom_status_from_user_settings() {
+        let set = json!({"custom_status": {"text": " brb ", "emoji_name": "☕",
+            "emoji_id": null, "expires_at": "2030-01-01T00:00:00+00:00"}});
+        let (cs, exp) = decode_custom_status(&set);
+        let cs = cs.expect("key present").expect("status set");
+        assert_eq!(cs.text.as_deref(), Some("brb"));
+        assert_eq!(cs.emoji.and_then(|e| e.name).as_deref(), Some("☕"));
+        assert_eq!(exp.as_deref(), Some("2030-01-01T00:00:00+00:00"));
+        assert_eq!(
+            decode_custom_status(&json!({"custom_status": null})).0,
+            Some(None)
+        );
+        assert_eq!(decode_custom_status(&json!({"status": "dnd"})).0, None);
     }
 
     // ---- presence fixtures (shapes per Userdoccers gateway-events / presence docs) ----

@@ -49,6 +49,35 @@ pub struct Prefs {
     pub collapsed_folders: HashSet<u64>,
 }
 
+/// The account-specific part of [`Prefs`] (status and server rail layout). Demo mode shares
+/// eframe storage with the real app, so it keeps these in memory only and saves the real
+/// account's values back untouched.
+#[derive(Clone, Debug, Default)]
+struct AccountPrefs {
+    saved_status: Option<String>,
+    custom_status: Option<nixcord_model::CustomStatus>,
+    guild_layout: Vec<nixcord_model::GuildFolder>,
+    collapsed_folders: HashSet<u64>,
+}
+
+impl AccountPrefs {
+    fn take_from(prefs: &mut Prefs) -> Self {
+        Self {
+            saved_status: prefs.saved_status.take(),
+            custom_status: prefs.custom_status.take(),
+            guild_layout: std::mem::take(&mut prefs.guild_layout),
+            collapsed_folders: std::mem::take(&mut prefs.collapsed_folders),
+        }
+    }
+
+    fn write_into(&self, prefs: &mut Prefs) {
+        prefs.saved_status.clone_from(&self.saved_status);
+        prefs.custom_status.clone_from(&self.custom_status);
+        prefs.guild_layout.clone_from(&self.guild_layout);
+        prefs.collapsed_folders.clone_from(&self.collapsed_folders);
+    }
+}
+
 impl Default for Prefs {
     fn default() -> Self {
         Self {
@@ -98,9 +127,21 @@ pub struct ComposerState {
     /// Staged files to upload with the next sent message.
     pub attachments: Vec<nixcord_http::UploadFile>,
     /// Background file-picker / drag-drop loader receivers returning `(files, error_messages)`.
-    pub attach_rxs: Vec<std::sync::mpsc::Receiver<(Vec<nixcord_http::UploadFile>, Vec<String>)>>,
+    pub attach_rxs: Vec<AttachRx>,
     /// True while a native OS file picker dialog is currently open.
     pub attach_dialog_open: bool,
+}
+
+pub type AttachRx = std::sync::mpsc::Receiver<(Vec<nixcord_http::UploadFile>, Vec<String>)>;
+
+/// Byte cap for attachments kept for channels other than the open one.
+const MAX_STASHED_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Staged files of a channel the user switched away from.
+pub struct AttachmentDraft {
+    pub files: Vec<nixcord_http::UploadFile>,
+    pub rxs: Vec<AttachRx>,
+    pub stashed_at: Instant,
 }
 
 /// Target message to scroll into view and briefly highlight after a search jump.
@@ -161,6 +202,8 @@ pub struct ViewState {
     pub exhausted: HashSet<Snowflake>,
     pub forbidden: HashSet<Snowflake>,
     pub drafts: HashMap<Snowflake, String>,
+    /// Staged attachments of channels other than the open one (see `stash_attachments`).
+    pub attachment_drafts: HashMap<Snowflake, AttachmentDraft>,
     pub mic_muted: bool,
     pub deafened: bool,
     pub confirm_delete: Option<(Snowflake, Snowflake)>,
@@ -193,6 +236,8 @@ pub struct NixApp {
     pub prefs: Prefs,
     pub theme: &'static Theme,
     pub demo: bool,
+    /// Demo only: the real account's status and rail layout, saved back instead of the demo's.
+    real_account: Option<AccountPrefs>,
     pub view: ViewState,
     pub composer: ComposerState,
     pub chat: ChatState,
@@ -228,6 +273,7 @@ impl NixApp {
         theme::apply(&cc.egui_ctx, theme);
         prefs.zoom = ui::settings::snap_zoom(prefs.zoom);
         cc.egui_ctx.set_zoom_factor(prefs.zoom);
+        let real_account = demo.then(|| AccountPrefs::take_from(&mut prefs));
 
         let backend = backend::spawn(cc.egui_ctx.clone(), demo);
         let mut app = Self {
@@ -239,6 +285,7 @@ impl NixApp {
             prefs,
             theme,
             demo,
+            real_account,
             view: ViewState::default(),
             composer: ComposerState::default(),
             chat: ChatState::default(),
@@ -375,8 +422,8 @@ impl NixApp {
                     self.seen_dirty = true;
                 }
                 self.store.apply(&ev);
-                if matches!(ev, GatewayEvent::Ready(_)) {
-                    self.restore_saved_presence();
+                if let GatewayEvent::Ready(ref ready) = ev {
+                    self.restore_saved_presence(ready);
                 }
                 if let GatewayEvent::MessageCreate(ref m) = ev {
                     if self.store.should_notify(m, self.view.channel) {
@@ -407,6 +454,15 @@ impl NixApp {
                 }
             }
             AppEvent::Sent(m) => self.store.apply(&GatewayEvent::MessageCreate(m)),
+            AppEvent::SendFailed {
+                channel,
+                content,
+                attachments,
+                error,
+            } => {
+                self.restore_failed_send(channel, content, attachments);
+                self.toast_err(error);
+            }
             AppEvent::Forbidden { channel } => {
                 self.view.forbidden.insert(channel);
                 self.toast_err("You don't have permission to send messages in this channel.");
@@ -500,6 +556,10 @@ impl NixApp {
                 }
                 if !self.store.history_loaded(channel) {
                     self.view.history_failed.insert(channel);
+                } else {
+                    // A failed `around` jump in a channel that already has history: drop the
+                    // guard set by JumpToMessage so normal loading keeps working.
+                    self.view.history_requested.remove(&channel);
                 }
                 self.toast_err(error);
             }
@@ -747,15 +807,24 @@ impl NixApp {
                 self.send(Command::SendFriendRequest { username: trimmed });
             }
             Action::SearchMessages { raw, offset } => {
-                let scope = match self.view.guild {
-                    Some(gid) => ui::search::SearchScope::Guild(gid),
-                    None => match self.view.channel {
-                        Some(cid) => ui::search::SearchScope::Channel(cid),
-                        None => return,
-                    },
+                // Paging keeps the scope of the first page, even if the view moved since.
+                let kept_scope = self.view.search.scope.filter(|_| offset > 0);
+                let scope = if let Some(scope) = kept_scope {
+                    scope
+                } else {
+                    match self.view.guild {
+                        Some(gid) => ui::search::SearchScope::Guild(gid),
+                        None => match self.view.channel {
+                            Some(cid) => ui::search::SearchScope::Channel(cid),
+                            None => return,
+                        },
+                    }
                 };
-                let parsed =
-                    ui::search::parse_search_query(&raw, &self.store, self.view.guild, offset);
+                let scope_guild = match scope {
+                    ui::search::SearchScope::Guild(g) => Some(g),
+                    ui::search::SearchScope::Channel(_) => None,
+                };
+                let parsed = ui::search::parse_search_query(&raw, &self.store, scope_guild, offset);
                 self.view.search.request_id = self.view.search.request_id.wrapping_add(1);
                 let request_id = self.view.search.request_id;
                 self.view.search.open = true;
@@ -932,18 +1001,111 @@ impl NixApp {
                 self.view.drafts.remove(&old);
             }
         }
+        let leaving = std::mem::take(&mut self.composer);
+        if let Some(old) = self.view.channel {
+            self.stash_attachments(old, leaving.attachments, leaving.attach_rxs);
+        }
+        let stashed = ch.and_then(|c| self.view.attachment_drafts.remove(&c));
+        let (attachments, attach_rxs) = stashed.map_or_else(Default::default, |d| (d.files, d.rxs));
         self.composer = ComposerState {
             text: ch
                 .and_then(|c| self.view.drafts.remove(&c))
                 .unwrap_or_default(),
             want_focus: ch.is_some(),
+            attachments,
+            attach_rxs,
             ..ComposerState::default()
         };
+        // A DM-scoped search belongs to that DM; guild searches are closed on guild change.
+        if matches!(self.view.search.scope, Some(ui::search::SearchScope::Channel(c)) if Some(c) != ch)
+        {
+            self.view.search.close();
+        }
         self.view.channel = ch;
         if let Some(c) = ch {
             self.view.last_channel.insert(self.view.guild, c);
         }
         self.chat.reset();
+    }
+
+    /// Keep staged files (and in-flight picker/drop loads) of a channel we're leaving, so
+    /// they're still there on return. Capped by bytes: the oldest stashes go first.
+    fn stash_attachments(
+        &mut self,
+        channel: Snowflake,
+        files: Vec<nixcord_http::UploadFile>,
+        rxs: Vec<AttachRx>,
+    ) {
+        if files.is_empty() && rxs.is_empty() {
+            return;
+        }
+        self.view.attachment_drafts.insert(
+            channel,
+            AttachmentDraft {
+                files,
+                rxs,
+                stashed_at: Instant::now(),
+            },
+        );
+        let total = |d: &HashMap<Snowflake, AttachmentDraft>| -> usize {
+            d.values()
+                .flat_map(|d| &d.files)
+                .map(|f| f.bytes.len())
+                .sum()
+        };
+        let mut dropped = 0;
+        while total(&self.view.attachment_drafts) > MAX_STASHED_ATTACHMENT_BYTES {
+            let oldest = self
+                .view
+                .attachment_drafts
+                .iter()
+                .filter(|(c, _)| **c != channel)
+                .min_by_key(|(_, d)| d.stashed_at)
+                .map(|(c, _)| *c);
+            let Some(c) = oldest else { break };
+            if let Some(d) = self.view.attachment_drafts.remove(&c) {
+                dropped += d.files.len();
+            }
+        }
+        if dropped > 0 {
+            self.toast_err(format!(
+                "Dropped {dropped} staged attachment(s) from another channel to save memory."
+            ));
+        }
+    }
+
+    /// Put a message that failed to send back into its channel's composer (or draft), so
+    /// the text and files aren't lost.
+    fn restore_failed_send(
+        &mut self,
+        channel: Snowflake,
+        content: String,
+        attachments: Vec<nixcord_http::UploadFile>,
+    ) {
+        if self.view.channel == Some(channel) {
+            if self.composer.text.trim().is_empty() {
+                self.composer.text = content;
+                self.composer.cursor_to_end = true;
+            }
+            let room =
+                nixcord_http::MAX_ATTACHMENTS.saturating_sub(self.composer.attachments.len());
+            self.composer
+                .attachments
+                .extend(attachments.into_iter().take(room));
+            return;
+        }
+        if !content.trim().is_empty() {
+            self.view.drafts.entry(channel).or_insert(content);
+        }
+        let mut files = self
+            .view
+            .attachment_drafts
+            .remove(&channel)
+            .map(|d| (d.files, d.rxs))
+            .unwrap_or_default();
+        let room = nixcord_http::MAX_ATTACHMENTS.saturating_sub(files.0.len());
+        files.0.extend(attachments.into_iter().take(room));
+        self.stash_attachments(channel, files.0, files.1);
     }
 
     /// Drop a detached (scrolled-back) window; `ensure_history` then refetches the newest
@@ -1357,7 +1519,13 @@ impl eframe::App for NixApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, PREFS_KEY, &self.prefs);
+        if let Some(real) = &self.real_account {
+            let mut prefs = self.prefs.clone();
+            real.write_into(&mut prefs);
+            eframe::set_value(storage, PREFS_KEY, &prefs);
+        } else {
+            eframe::set_value(storage, PREFS_KEY, &self.prefs);
+        }
     }
 
     fn persist_egui_memory(&self) -> bool {

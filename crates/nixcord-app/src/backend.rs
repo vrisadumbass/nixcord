@@ -40,6 +40,13 @@ pub enum AppEvent {
     },
     /// Our own message was accepted by the server.
     Sent(Box<Message>),
+    /// Sending failed: hand the text and files back so the composer can restore them.
+    SendFailed {
+        channel: Snowflake,
+        content: String,
+        attachments: Vec<UploadFile>,
+        error: String,
+    },
     /// Sending into this channel returned 403: show a read-only notice.
     Forbidden {
         channel: Snowflake,
@@ -364,7 +371,12 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
         {
             Ok(m) => events.send(AppEvent::Sent(Box::new(m))),
             Err(HttpError::Forbidden) => events.send(AppEvent::Forbidden { channel }),
-            Err(e) => events.send(AppEvent::Error(format!("Couldn't send: {e}"))),
+            Err(e) => events.send(AppEvent::SendFailed {
+                channel,
+                content,
+                attachments,
+                error: format!("Couldn't send: {e}"),
+            }),
         },
         Command::React {
             channel,
@@ -486,7 +498,10 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
                     around,
                     messages,
                 }),
-                Err(e) => events.send(AppEvent::Error(format!("Couldn't jump to message: {e}"))),
+                Err(e) => events.send(AppEvent::HistoryFailed {
+                    channel,
+                    error: format!("Couldn't jump to message: {e}"),
+                }),
             }
         }
         Command::CreateThread {

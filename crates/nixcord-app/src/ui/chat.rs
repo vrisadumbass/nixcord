@@ -97,8 +97,10 @@ pub fn header(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Ac
         .cloned();
 
     let can_create_thread = matches!(channel.kind, ChannelKind::Text | ChannelKind::Announcement)
-        && app.store.can_send(ch)
+        && app.store.can_create_thread(ch)
         && !app.view.forbidden.contains(&ch);
+    let can_lock = is_thread && app.store.can_manage_thread(ch);
+    let can_archive = is_thread && app.store.can_archive_thread(ch, !is_archived);
 
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         // Search box: Enter executes guild/DM message search; Escape or × closes.
@@ -221,7 +223,7 @@ pub fn header(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Ac
             } else {
                 "Lock Thread"
             };
-            if thread_header_button(ui, t, lock_label, is_locked, lock_tip).clicked() {
+            if can_lock && thread_header_button(ui, t, lock_label, is_locked, lock_tip).clicked() {
                 actions.push(Action::UpdateThread {
                     thread_id: ch,
                     archived: None,
@@ -235,7 +237,9 @@ pub fn header(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Ac
             } else {
                 "Archive Thread"
             };
-            if thread_header_button(ui, t, arch_label, is_archived, arch_tip).clicked() {
+            if can_archive
+                && thread_header_button(ui, t, arch_label, is_archived, arch_tip).clicked()
+            {
                 actions.push(Action::UpdateThread {
                     thread_id: ch,
                     archived: Some(!is_archived),
@@ -638,6 +642,8 @@ pub fn messages(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<
     if let Some(channel) = app.store.channel(ch).filter(|c| c.kind.is_thread()) {
         let is_archived = channel.is_archived();
         let is_locked = channel.thread_metadata.as_ref().is_some_and(|m| m.locked);
+        let can_unarchive = app.store.can_archive_thread(ch, false);
+        let can_unlock = app.store.can_manage_thread(ch);
         if let Some(notice) = thread_banner_notice(is_archived, is_locked) {
             Frame::new()
                 .fill(t.elevated)
@@ -647,6 +653,7 @@ pub fn messages(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         if is_archived
+                            && can_unarchive
                             && thread_header_button(ui, t, "Unarchive", false, "Unarchive Thread")
                                 .clicked()
                         {
@@ -657,6 +664,7 @@ pub fn messages(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<
                             });
                         }
                         if is_locked
+                            && can_unlock
                             && thread_header_button(ui, t, "Unlock", false, "Unlock Thread")
                                 .clicked()
                         {

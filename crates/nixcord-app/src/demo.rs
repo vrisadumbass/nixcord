@@ -569,6 +569,8 @@ fn ready() -> Ready {
             },
         ],
         guild_folders: Vec::new(),
+        custom_status: None,
+        custom_status_expires_at: None,
     }
 }
 

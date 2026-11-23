@@ -213,6 +213,9 @@ impl Store {
                 }
                 self.apply_presence_batch("READY", &ready.presences);
                 self.my_status = ready.status.unwrap_or(Status::Online);
+                if let Some(custom) = &ready.custom_status {
+                    self.my_custom_status = custom.clone().and_then(|c| c.normalized());
+                }
                 self.connection = ConnectionState::Connected;
             }
             GatewayEvent::ReadySupplemental(sup) => {
@@ -1111,6 +1114,50 @@ impl Store {
         }
         self.channel_permissions(channel_id)
             .is_none_or(|p| p & perm::VIEW_CHANNEL != 0 && p & perm::SEND_MESSAGES != 0)
+    }
+
+    /// Do I have all of `bits` in this guild channel (threads use their parent)? DMs and
+    /// unknown permissions fail open, like `can_send`.
+    fn has_permissions(&self, channel_id: Snowflake, bits: u64) -> bool {
+        let Some(ch) = self.channels.get(&channel_id) else {
+            return false;
+        };
+        if ch.guild_id.is_none() {
+            return true;
+        }
+        self.channel_permissions(channel_id)
+            .is_none_or(|p| p & perm::VIEW_CHANNEL != 0 && p & bits == bits)
+    }
+
+    /// Can I start a public thread from this channel?
+    pub fn can_create_thread(&self, channel_id: Snowflake) -> bool {
+        self.has_permissions(channel_id, perm::CREATE_PUBLIC_THREADS)
+    }
+
+    /// Can I lock/unlock this thread (and archive or unarchive it in any state)?
+    pub fn can_manage_thread(&self, thread_id: Snowflake) -> bool {
+        self.has_permissions(thread_id, perm::MANAGE_THREADS)
+    }
+
+    /// Can I archive or unarchive this thread? Moderators always; otherwise only while it's
+    /// not locked: archiving is for the thread's creator, unarchiving for anyone who can
+    /// post in threads (Discord's rules for `PATCH /channels/{thread}`).
+    pub fn can_archive_thread(&self, thread_id: Snowflake, archive: bool) -> bool {
+        if self.can_manage_thread(thread_id) {
+            return true;
+        }
+        let Some(ch) = self.channels.get(&thread_id) else {
+            return false;
+        };
+        if ch.thread_metadata.as_ref().is_some_and(|m| m.locked) {
+            return false;
+        }
+        if archive {
+            let me = self.me.as_ref().map(|u| u.id);
+            me.is_some() && ch.owner_id == me
+        } else {
+            self.has_permissions(thread_id, perm::SEND_MESSAGES_IN_THREADS)
+        }
     }
 
     /// `guild_channels` without what the official client hides: channels I can't view,

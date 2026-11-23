@@ -99,6 +99,14 @@ impl CustomStatusModal {
     }
 }
 
+/// Whether a custom status `expires_at` (ISO 8601) is in the past. Unparseable or missing
+/// means it doesn't expire.
+fn custom_status_expired(expires_at: Option<&str>) -> bool {
+    expires_at
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .is_some_and(|t| t < chrono::Utc::now())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ModalOutcome {
     Open,
@@ -107,30 +115,44 @@ enum ModalOutcome {
 }
 
 impl NixApp {
-    /// Restore any saved status and custom status from `Prefs` on `READY`.
-    pub(crate) fn restore_saved_presence(&mut self) {
-        let saved_status = self
-            .prefs
-            .saved_status
-            .as_deref()
-            .and_then(Status::parse_known)
-            .map(|s| match s {
-                Status::Offline => Status::Invisible,
-                other => other,
-            });
-        let saved_custom = self
-            .prefs
-            .custom_status
-            .as_ref()
-            .and_then(CustomStatus::normalized);
-        if let Some(s) = saved_status {
-            self.store.set_my_status(s);
+    /// Set this session's presence on `READY`.
+    ///
+    /// The account's own settings (from READY's `user_settings`) win, so a status set on
+    /// another device isn't overwritten; prefs then mirror them. The saved status in prefs is
+    /// only a fallback for when READY carries no settings. Either way op 3 is sent, because
+    /// a new gateway session starts out online with no custom status.
+    pub(crate) fn restore_saved_presence(&mut self, ready: &nixcord_model::Ready) {
+        let status = match ready.status {
+            Some(s) => Some(s),
+            None => self
+                .prefs
+                .saved_status
+                .as_deref()
+                .and_then(Status::parse_known),
         }
-        self.store.set_my_custom_status(saved_custom.clone());
-        if saved_status.is_some() || saved_custom.is_some() {
+        .map(|s| match s {
+            Status::Offline => Status::Invisible,
+            other => other,
+        });
+        let custom = match &ready.custom_status {
+            Some(c) if !custom_status_expired(ready.custom_status_expires_at.as_deref()) => {
+                c.clone()
+            }
+            Some(_) => None,
+            None => self.prefs.custom_status.clone(),
+        }
+        .and_then(|c| c.normalized());
+
+        if let Some(s) = status {
+            self.store.set_my_status(s);
+            self.prefs.saved_status = Some(s.as_str().to_string());
+        }
+        self.store.set_my_custom_status(custom.clone());
+        self.prefs.custom_status.clone_from(&custom);
+        if status.is_some_and(|s| s != Status::Online) || custom.is_some() {
             self.send(Command::Gateway(GatewayCommand::SetPresence {
                 status: self.store.my_status(),
-                custom_status: saved_custom,
+                custom_status: custom,
             }));
         }
     }

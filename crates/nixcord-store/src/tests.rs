@@ -2091,3 +2091,41 @@ fn mark_guild_read_forum_mark_read_and_my_custom_status() {
     s.set_my_custom_status(Some(CustomStatus::default()));
     assert!(s.my_custom_status().is_none());
 }
+
+fn thread_in(id: u64, parent: u64, owner: Option<u64>, locked: bool) -> Channel {
+    Channel {
+        owner_id: owner.map(sf),
+        thread_metadata: Some(nixcord_model::ThreadMetadata {
+            archived: false,
+            locked,
+        }),
+        ..chan(id, ChannelKind::PublicThread, Some(G), Some(parent), 0)
+    }
+}
+
+#[test]
+fn thread_controls_follow_permissions() {
+    // @everyone can view + send, but has no thread permissions.
+    let chans = vec![
+        pchan(10, None, vec![]),
+        thread_in(20, 10, Some(ME), false),
+        thread_in(21, 10, Some(2), false),
+        thread_in(22, 10, Some(ME), true),
+    ];
+    let s = perm_store(&[], None, chans.clone());
+    assert!(!s.can_create_thread(sf(10)));
+    assert!(!s.can_manage_thread(sf(20)), "lock needs MANAGE_THREADS");
+    assert!(s.can_archive_thread(sf(20), true), "creator may archive");
+    assert!(!s.can_archive_thread(sf(21), true), "others may not");
+    assert!(!s.can_archive_thread(sf(22), true), "not once locked");
+    assert!(
+        !s.can_archive_thread(sf(20), false),
+        "unarchive needs SEND_MESSAGES_IN_THREADS"
+    );
+
+    // Admin (ROLE_B) can do everything.
+    let s = perm_store(&[ROLE_B], None, chans);
+    assert!(s.can_create_thread(sf(10)));
+    assert!(s.can_manage_thread(sf(22)));
+    assert!(s.can_archive_thread(sf(21), true));
+}

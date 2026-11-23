@@ -861,15 +861,14 @@ fn apply_rail_drop(
 
 pub fn rail(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
     let t = app.theme;
-    let avail_guilds: Vec<Snowflake> = app
-        .store
-        .guilds()
-        .into_iter()
-        .filter(|g| !g.unavailable)
-        .map(|g| g.id)
-        .collect();
-    let remote_folders = app.store.guild_folders().to_vec();
-    reconcile_guild_layout(&mut app.prefs.guild_layout, &remote_folders, &avail_guilds);
+    // Reconcile only once READY has arrived: before that the guild list is empty and would
+    // wipe the saved layout. Unavailable guilds (outages) keep their place; they're just
+    // not drawn.
+    if app.store.me().is_some() {
+        let known_guilds: Vec<Snowflake> = app.store.guilds().into_iter().map(|g| g.id).collect();
+        let remote_folders = app.store.guild_folders().to_vec();
+        reconcile_guild_layout(&mut app.prefs.guild_layout, &remote_folders, &known_guilds);
+    }
 
     egui::Panel::bottom("rail_add")
         .exact_size(64.0)
@@ -945,7 +944,8 @@ pub fn rail(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
                             let Some(&gid) = entry.guild_ids.first() else {
                                 continue;
                             };
-                            let Some(guild) = app.store.guild(gid) else {
+                            let Some(guild) = app.store.guild(gid).filter(|g| !g.unavailable)
+                            else {
                                 continue;
                             };
                             let sel = app.view.guild == Some(guild.id);
@@ -1035,6 +1035,7 @@ pub fn rail(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
                             .guild_ids
                             .iter()
                             .filter_map(|id| app.store.guild(*id))
+                            .filter(|g| !g.unavailable)
                             .collect();
                         if f_guilds.is_empty() {
                             continue;
