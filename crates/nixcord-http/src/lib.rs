@@ -1384,6 +1384,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn update_thread_routes() {
+        let tid = Snowflake(333);
+
+        let arch = Route::update_thread(tid, Some(true), None);
+        assert_eq!(arch.method, Method::Patch);
+        assert_eq!(
+            arch.url(API_BASE).unwrap().as_str(),
+            "https://discord.com/api/v10/channels/333"
+        );
+        assert_eq!(arch.body, Some(serde_json::json!({ "archived": true })));
+
+        let lock = Route::update_thread(tid, None, Some(true));
+        assert_eq!(lock.method, Method::Patch);
+        assert_eq!(lock.body, Some(serde_json::json!({ "locked": true })));
+
+        let both = Route::update_thread(tid, Some(false), Some(false));
+        assert_eq!(
+            both.body,
+            Some(serde_json::json!({ "archived": false, "locked": false }))
+        );
+
+        let neither = Route::update_thread(tid, None, None);
+        assert_eq!(neither.body, Some(serde_json::json!({})));
+    }
+
+    #[tokio::test]
+    async fn update_thread_mock() {
+        let thread_json = r#"{"id":"333","type":11,"guild_id":"10","parent_id":"102","name":"v0.4-thread","thread_metadata":{"archived":true,"locked":true}}"#;
+        let (base, h) = mock(vec![resp(
+            "200 OK",
+            "Content-Type: application/json\r\n",
+            thread_json,
+        )])
+        .await;
+        let http = Http::with_base_url("t".into(), base);
+        let ch = http
+            .update_thread(Snowflake(333), Some(true), Some(true))
+            .await
+            .unwrap();
+        assert_eq!(ch.id, Snowflake(333));
+        assert!(ch.is_archived());
+        assert!(ch.thread_metadata.as_ref().is_some_and(|m| m.locked));
+
+        let reqs = h.await.unwrap();
+        assert!(reqs[0].starts_with("PATCH /channels/333 "));
+        let body: serde_json::Value =
+            serde_json::from_str(reqs[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["archived"], true);
+        assert_eq!(body["locked"], true);
+    }
+
     #[tokio::test]
     async fn interactions_ack_relationships_and_search_mock() {
         let search_json = r#"{"total_results":1,"messages":[[{"id":"9","channel_id":"111","author":{"id":"42","username":"nix"},"content":"found it","timestamp":"2024-01-01T00:00:00+00:00","hit":true}]]}"#;
