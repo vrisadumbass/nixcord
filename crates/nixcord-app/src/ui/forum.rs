@@ -405,7 +405,7 @@ fn render_forum_board(
                     Frame::new()
                         .inner_margin(Margin::symmetric(24, 16))
                         .show(ui, |ui| {
-                            let content_w = ui.available_width().min(CONTENT_MAX_W).max(260.0);
+                            let content_w = ui.available_width().clamp(260.0, CONTENT_MAX_W);
                             ui.set_max_width(content_w);
 
                             // Top toolbar: search box + "+ New Post" button.

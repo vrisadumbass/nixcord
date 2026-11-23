@@ -62,8 +62,9 @@ crates/
                     Presence, member-list ops, permissions, GatewayEvent, CDN URL helpers
   nixcord-gateway   websocket: zlib-stream decompression, identify, heartbeat/zombie detection,
                     resume, backoff, close codes; op 37 guild subscriptions, op 3 presence; GatewayCommand
-  nixcord-http      REST: history, send/reply/edit/delete, reactions, typing, interactions,
-                    acks, relationships, message search; 429 handling
+  nixcord-http      REST: history (before/around), send/reply/multipart uploads/edit/delete,
+                    reactions, typing, interactions, acks, relationships, create DM, threads,
+                    message search; 429 handling
   nixcord-store     pure state: messages (sliding window, cap 250/channel), read state &
                     mention counts, threads, presences (per-scope), member lists, permissions,
                     reactions, typing, emoji, profile helpers
@@ -77,8 +78,8 @@ crates/
     src/demo.rs       fake Ready/messages (invented data only); demo_assets.rs loads assets/demo
     src/media.rs      textures, avatars, icons, Twemoji, image viewer state
     src/platform.rs   renderer choice (D3D12 on Windows with glow fallback), working-set trim
-    src/ui/           sidebar, chat, composer, markdown, components, emoji_picker,
-                      emoji_text, presence, profile, viewer, settings, login
+    src/ui/           sidebar, chat, composer, forum, friends, search, markdown, components,
+                      emoji_picker, emoji_text, presence, profile, viewer, settings, login
 assets/demo/        CC0 / public-domain / Apache-2.0 demo avatars, icons, photos, GIFs, emoji
 docs/               ARCHITECTURE.md, screenshots/ (from --demo only)
 ```
@@ -92,10 +93,11 @@ then calls `request_repaint()`. The UI sends `Command`s to the backend. UI code 
 - **Core:**
   - Token login, saved in the OS keychain.
   - Gateway reconnect/resume with `zlib-stream` transport compression.
-  - Servers, channels, active threads and DMs.
-  - History with scroll-back (a sliding window past the 250-message cap) and "Jump to present".
-  - Send, edit (Up arrow), delete, reply.
-  - Reactions, typing indicators, unread & mention badges (channels, threads, DMs, server rail,
+  - Servers, channels, Forum post boards (tag filters & new posts), active threads (+ thread creation) and DMs.
+  - History with scroll-back (a sliding window past the 250-message cap), "Jump to present",
+    and Message Search (`Ctrl+F`, `from:` / `in:` filters, paginated results drawer, jump-to-message).
+  - Send (including multipart file uploads via picker or drag-and-drop), edit (Up arrow), delete, reply.
+  - Reactions, typing indicators, unread & mention badges (channels, threads, forums, DMs, server rail,
     window title) and clickable in-app mention toasts.
 - **Rendering:**
   - Markdown with syntax-highlighted code, spoilers, color-emoji mention pills and timestamps.
@@ -119,7 +121,7 @@ then calls `request_repaint()`. The UI sends `Command`s to the backend. UI code 
   - Own status picker (op 3).
   - Real member list via op 37 and GUILD_MEMBER_LIST_UPDATE, with role groups and Online/Offline.
   - Floating user profile popouts (avatar, status, custom status, activity, role pills, DM & copy actions).
-  - Friends list from READY.
+  - Friends home view (Online, All, Pending, Blocked, Add Friend) with accept/decline/remove/block/DM actions.
 - **Permissions:** channels you can't view are hidden; read-only channels show the notice
   up front.
 - **UI:**
@@ -145,20 +147,19 @@ demo mode only:
 - Save/copy in the image viewer, and drag-to-pan.
 - `zlib-stream` gateway compression against live Discord.
 - Live component interactions (`POST /interactions`), message acks (`POST /channels/{c}/messages/{m}/ack`),
-  and `READY.read_state` / `MESSAGE_ACK` / `THREAD_*` events on real servers.
+  multipart uploads, message search / `around` jumps, Friends/DM creation routes, Forum/thread creation
+  (`POST /channels/{id}/threads`), and `READY.read_state` / `MESSAGE_ACK` / `THREAD_*` events on real servers.
 
 Not built yet:
 - Voice and video calls, screen share.
 - Native OS desktop notifications (in-app mention toasts, mention badges, unread counts and
   window title badges are built).
-- Forum channels and thread creation/archiving UI (active text-channel threads are viewable
-  and clickable).
+- Thread archiving/locking controls and clipboard image paste (`Ctrl+V` upload; file picker and
+  drag-and-drop uploads are built).
 - Entity select menus (user/role/mentionable/channel) and modals for bot interactions
   (buttons and string selects are interactive).
-- Sending attachments and uploads, stickers, the GIF picker, message search UI (search REST
-  routes exist in `nixcord-http`).
-- Friends page UI actions (REST routes exist in `nixcord-http`), full profile modals
-  (bio/banners/mutuals), server settings.
+- Stickers, the GIF picker.
+- Full profile modals (bio/banners/mutuals), server settings.
 - Saving status changes to the account (currently session-only), custom status editing.
 - Plugin API (planned: a stable Rust trait plus WASM).
 

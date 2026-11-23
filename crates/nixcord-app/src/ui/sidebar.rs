@@ -588,8 +588,10 @@ fn dm_list(ui: &mut Ui, app: &NixApp, actions: &mut Vec<Action>) {
     } else {
         t.muted
     };
-    let icon_rect =
-        Rect::from_center_size(Pos2::new(f_rect.left() + 22.0, f_rect.center().y), Vec2::splat(22.0));
+    let icon_rect = Rect::from_center_size(
+        Pos2::new(f_rect.left() + 22.0, f_rect.center().y),
+        Vec2::splat(22.0),
+    );
     super::paint_icon(ui, Icon::Members, icon_rect, f_color);
     ui.painter().text(
         Pos2::new(f_rect.left() + 44.0, f_rect.center().y),

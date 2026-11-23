@@ -12,8 +12,8 @@ use crate::app::NixApp;
 use crate::media::Media;
 use crate::theme::Theme;
 use eframe::egui::{
-    self, Align, Align2, Color32, CornerRadius, CursorIcon, Frame, Layout, Margin, Pos2, Rect,
-    RichText, Sense, Stroke, TextFormat, Ui, Vec2,
+    self, Align, Align2, Color32, CornerRadius, CursorIcon, Frame, Layout, Margin, RichText, Sense,
+    Stroke, TextFormat, Ui, Vec2,
 };
 use nixcord_http::{MessageSearchQuery, MessageSearchResult};
 use nixcord_model::{Channel, ChannelKind, Message, Snowflake, User};
@@ -53,15 +53,6 @@ pub struct ParsedSearch {
     pub terms: Vec<String>,
     pub author_filter: Option<FilterToken>,
     pub channel_filter: Option<FilterToken>,
-}
-
-impl ParsedSearch {
-    /// True when the query has no free-text content and no filters at all.
-    pub fn is_empty(&self) -> bool {
-        self.query.content.is_none()
-            && self.author_filter.is_none()
-            && self.channel_filter.is_none()
-    }
 }
 
 /// Per-session message search UI state (lives in `ViewState`, cleared on scope change / logout).
@@ -525,7 +516,7 @@ pub fn local_search<'a>(
         .cloned()
         .collect();
     // Discord search defaults to newest first.
-    matched.sort_by(|a, b| b.id.cmp(&a.id));
+    matched.sort_by_key(|a| std::cmp::Reverse(a.id));
     let total_results = matched.len() as u32;
     let page = matched
         .into_iter()
@@ -1403,25 +1394,25 @@ mod tests {
         // Ensure member nick is cached via a GuildMemberUpdate too.
         store.apply(&GatewayEvent::GuildMemberUpdate {
             guild_id: Snowflake(10),
-            member: GuildMember {
+            member: Box::new(GuildMember {
                 user: Some(ferris),
                 nick: Some("Ferris the Crab".into()),
                 ..Default::default()
-            },
+            }),
         });
         store.apply(&GatewayEvent::GuildMemberUpdate {
             guild_id: Snowflake(10),
-            member: GuildMember {
+            member: Box::new(GuildMember {
                 user: Some(sol),
                 ..Default::default()
-            },
+            }),
         });
         store.apply(&GatewayEvent::GuildMemberUpdate {
             guild_id: Snowflake(10),
-            member: GuildMember {
+            member: Box::new(GuildMember {
                 user: Some(otto),
                 ..Default::default()
-            },
+            }),
         });
         store
     }
@@ -1770,12 +1761,16 @@ mod tests {
         for state in &states {
             let mut actions = Vec::new();
             let raw = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(360.0, 680.0))),
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(360.0, 680.0),
+                )),
                 ..Default::default()
             };
-            let _ = ctx.run_ui(raw, |ui| {
+            let mut out = ctx.run_ui(raw, |ui| {
                 render_panel(ui, &store, &media, t, false, state, &mut actions);
             });
+            out.textures_delta.clear();
         }
     }
 }

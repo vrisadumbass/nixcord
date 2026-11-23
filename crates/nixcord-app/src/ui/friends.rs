@@ -22,7 +22,7 @@ const HEADER_H: f32 = 48.0;
 const ROW_H: f32 = 62.0;
 const AVATAR_D: f32 = 36.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum FriendsTab {
     #[default]
     Online,
@@ -49,7 +49,7 @@ pub struct FriendsState {
 }
 
 /// One filtered, sorted row in the Friends list.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FriendEntry<'a> {
     pub user: &'a User,
     pub kind: RelationshipKind,
@@ -563,7 +563,7 @@ fn friend_row(
                     actions.push(Action::AcceptFriendRequest(entry.user.id));
                 }
             }
-            RelationshipKind::OutgoingRequest => {
+            RelationshipKind::OutgoingRequest
                 if pill_button(
                     &mut row_ui,
                     t,
@@ -571,10 +571,9 @@ fn friend_row(
                     BtnStyle::DangerSubtle,
                     "Cancel outgoing friend request",
                 )
-                .clicked()
-                {
-                    actions.push(Action::RemoveRelationship(entry.user.id));
-                }
+                .clicked() =>
+            {
+                actions.push(Action::RemoveRelationship(entry.user.id));
             }
             _ => {}
         },
@@ -594,7 +593,7 @@ fn friend_row(
     let left_resp = row_ui
         .interact(
             left_rect,
-            row_ui.id().with(("friend_row", entry.user.id.0)),
+            row_ui.scope_id().with(("friend_row", entry.user.id.0)),
             Sense::click(),
         )
         .on_hover_cursor(CursorIcon::PointingHand);
@@ -697,7 +696,7 @@ fn add_friend_view(ui: &mut Ui, state: &mut FriendsState, t: &Theme, actions: &m
         None => None,
     };
 
-    let input_id = ui.id().with("add_friend_input");
+    let input_id = ui.scope_id().with("add_friend_input");
     let focused = ui.ctx().memory(|m| m.has_focus(input_id));
     let border = feedback_stroke.unwrap_or(if focused { t.accent } else { t.divider });
 
@@ -989,10 +988,10 @@ mod tests {
 
         // Accepting an incoming request decrements incoming & total pending counts.
         let mira = store.user(Snowflake(6)).unwrap().clone();
-        store.apply(&GatewayEvent::RelationshipAdd(mk_rel(
+        store.apply(&GatewayEvent::RelationshipAdd(Box::new(mk_rel(
             &mira,
             RelationshipKind::Friend,
-        )));
+        ))));
         assert_eq!(pending_counts(&store), (1, 2));
 
         // Removing the outgoing request decrements total pending only.
@@ -1065,9 +1064,10 @@ mod tests {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 640.0))),
                     ..Default::default()
                 };
-                let _ = ctx.run_ui(raw, |ui| {
+                let mut out = ctx.run_ui(raw, |ui| {
                     show_inner(ui, &store, &mut state, t, &media, &mut actions);
                 });
+                out.textures_delta.clear();
                 assert!(actions.is_empty());
             }
         }

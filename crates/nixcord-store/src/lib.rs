@@ -673,7 +673,10 @@ impl Store {
         messages.dedup_by_key(|m| m.id);
         cap(&mut messages);
         let newest = messages.last().map(|m| m.id);
-        let channel_last = self.channels.get(&channel_id).and_then(|c| c.last_message_id);
+        let channel_last = self
+            .channels
+            .get(&channel_id)
+            .and_then(|c| c.last_message_id);
         if matches!((newest, channel_last), (Some(n), Some(last)) if n < last) {
             self.detached.insert(channel_id);
         } else {

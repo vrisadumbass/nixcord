@@ -110,7 +110,11 @@ pub fn header(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Ac
         );
         if has_query {
             let clear = ui
-                .interact(icon_rect, ui.scope_id().with("search_clear"), Sense::click())
+                .interact(
+                    icon_rect,
+                    ui.scope_id().with("search_clear"),
+                    Sense::click(),
+                )
                 .on_hover_text("Clear search")
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
             ui.painter().text(
@@ -188,8 +192,7 @@ pub fn header(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Ac
             ui.add_space(4.0);
             let (tr, tresp) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
             if tresp.hovered() {
-                ui.painter()
-                    .rect_filled(tr, CornerRadius::same(4), t.hover);
+                ui.painter().rect_filled(tr, CornerRadius::same(4), t.hover);
             }
             paint_plus(
                 ui,
@@ -585,7 +588,9 @@ pub fn messages(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<
                 .position(|r| matches!(r, Row::Msg { idx, .. } if msgs[*idx].id == jt.message))
             {
                 let target_y = (tops[i] - 120.0).max(0.0);
-                scroll = scroll.stick_to_bottom(false).vertical_scroll_offset(target_y);
+                scroll = scroll
+                    .stick_to_bottom(false)
+                    .vertical_scroll_offset(target_y);
                 jt.scrolled = true;
                 jt.highlighted_at = Some(std::time::Instant::now());
             }

@@ -34,7 +34,7 @@ are CC0, public domain or Apache-2.0; see [assets/demo/LICENSES.md](assets/demo/
 
 Early (v0.1). Working:
 
-- Login, servers, channels, active threads, DMs, history, and send/edit/delete/reply.
+- Login, servers, channels, Forum channels, active threads (with creation), DMs, Friends page, history, message search (`Ctrl+F`), and send (with file uploads & drag-and-drop)/edit/delete/reply.
 - Reactions, typing indicators, unread/mention badges, in-app mention toasts, and `zlib-stream` reconnect/resume.
 - Markdown with code highlighting, embeds, and interactive bot components (V2 layouts, clickable buttons and string selects).
 - Avatars and server icons, color emoji (Twemoji) with a picker and `:shortcode:`
@@ -43,7 +43,7 @@ Early (v0.1). Working:
 - Presence and status, floating user profile popouts, the member list with role groups, and permission-aware channel lists.
 - Themes.
 
-Not yet: voice, OS desktop notifications, forum channels, and file uploads.
+Not yet: voice, OS desktop notifications, stickers/GIF picker, and plugins.
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design and roadmap.
 
 ## Network

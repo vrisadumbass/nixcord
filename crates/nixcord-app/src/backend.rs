@@ -433,7 +433,9 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
         }
         Command::RemoveRelationship { user_id } => {
             if let Err(e) = http.remove_relationship(user_id).await {
-                events.send(AppEvent::Error(format!("Couldn't update relationship: {e}")));
+                events.send(AppEvent::Error(format!(
+                    "Couldn't update relationship: {e}"
+                )));
             }
         }
         Command::BlockUser { user_id } => {

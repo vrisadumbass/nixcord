@@ -544,47 +544,10 @@ fn handle_drag_and_drop(ctx: &egui::Context, app: &mut NixApp, channel_label: &s
         return;
     }
 
-    let mut inline_files = Vec::new();
-    let mut paths = Vec::new();
-    let mut errors = Vec::new();
-
-    for file in dropped {
-        if let Some(bytes) = file.bytes {
-            let name = if !file.name.is_empty() {
-                file.name
-            } else {
-                file.path
-                    .as_deref()
-                    .and_then(|p| p.file_name())
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "attachment".into())
-            };
-            if bytes.len() > MAX_FILE_BYTES {
-                errors.push(format!(
-                    "`{name}` exceeds the {} limit.",
-                    fmt_size(MAX_FILE_BYTES as u64)
-                ));
-            } else {
-                let mut upload = UploadFile::from_bytes(name, bytes.to_vec());
-                if !file.mime.trim().is_empty() {
-                    upload.content_type =
-                        nixcord_http::multipart::sanitize_content_type(&file.mime);
-                }
-                inline_files.push(upload);
-            }
-        } else if let Some(path) = file.path {
-            paths.push(path);
-        }
-    }
-
-    if !inline_files.is_empty() {
-        let (added, stage_errs) = stage_attachments(&mut app.composer.attachments, inline_files);
-        errors.extend(stage_errs);
-        if added > 0 {
-            app.composer.want_focus = true;
-        }
-    }
-    report_attach_errors(app, &errors);
+    let paths: Vec<PathBuf> = dropped
+        .into_iter()
+        .map(|file| file.path().to_path_buf())
+        .collect();
 
     if !paths.is_empty() {
         let slots = MAX_ATTACHMENTS.saturating_sub(app.composer.attachments.len());
@@ -611,16 +574,12 @@ fn load_paths(paths: &[PathBuf], max_files: usize) -> (Vec<UploadFile>, Vec<Stri
     let mut files = Vec::new();
     let mut errors = Vec::new();
     let mut total_bytes: usize = 0;
-    let mut limit_warned = false;
 
     for path in paths {
         if files.len() >= max_files {
-            if !limit_warned {
-                errors.push(format!(
-                    "Maximum {MAX_ATTACHMENTS} attachments per message."
-                ));
-                limit_warned = true;
-            }
+            errors.push(format!(
+                "Maximum {MAX_ATTACHMENTS} attachments per message."
+            ));
             break;
         }
         let name = path

@@ -421,8 +421,7 @@ impl NixApp {
                         ));
                     }
                     Some(err) => {
-                        self.view.friends.add_feedback =
-                            Some(ui::friends::AddFeedback::Err(err));
+                        self.view.friends.add_feedback = Some(ui::friends::AddFeedback::Err(err));
                     }
                 }
             }
@@ -737,7 +736,8 @@ impl NixApp {
                         None => return,
                     },
                 };
-                let parsed = ui::search::parse_search_query(&raw, &self.store, self.view.guild, offset);
+                let parsed =
+                    ui::search::parse_search_query(&raw, &self.store, self.view.guild, offset);
                 self.view.search.request_id = self.view.search.request_id.wrapping_add(1);
                 let request_id = self.view.search.request_id;
                 self.view.search.open = true;
