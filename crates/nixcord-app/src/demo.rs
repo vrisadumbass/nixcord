@@ -204,6 +204,7 @@ fn guild(id: u64, name: &str, channels: Vec<Channel>) -> Guild {
         emojis: demo_guild_emojis(id),
         stickers: demo_guild_stickers(id),
         threads: Vec::new(),
+        voice_states: Vec::new(),
     }
 }
 
@@ -2046,6 +2047,24 @@ pub async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx
             // SESSIONS_REPLACE.
             Command::Gateway(GatewayCommand::SetPresence { status, .. }) => {
                 events.send(AppEvent::Gateway(GatewayEvent::OwnStatus(status)));
+            }
+            Command::Gateway(GatewayCommand::UpdateVoiceState {
+                guild_id,
+                channel_id,
+                self_mute,
+                self_deaf,
+            }) => {
+                events.send(AppEvent::Gateway(GatewayEvent::VoiceStateUpdate(
+                    nixcord_model::VoiceState {
+                        guild_id,
+                        channel_id,
+                        user_id: Snowflake(ME),
+                        session_id: "demo-voice-session".into(),
+                        self_mute,
+                        self_deaf,
+                        ..Default::default()
+                    },
+                )));
             }
         }
     }

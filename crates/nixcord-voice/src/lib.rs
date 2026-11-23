@@ -6,6 +6,17 @@
 //!   encryption/decryption (`aead_aes256_gcm_rtpsize`), Opus codec abstraction, and `cpal`
 //!   mic capture / multi-speaker mixing.
 
+pub mod audio;
+pub mod codec;
+pub mod crypto;
+pub mod gateway;
+pub mod mixer;
+pub mod protocol;
+pub mod rtp;
+pub mod session;
+pub mod udp;
+pub mod vad;
+
 use nixcord_model::Snowflake;
 
 /// Commands sent from the app/backend to an active voice session.

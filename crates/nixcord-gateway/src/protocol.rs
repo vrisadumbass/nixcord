@@ -7,7 +7,7 @@ use nixcord_model::{
     Activity, Channel, ClientStatus, CustomStatus, Emoji, GatewayEvent, Guild, GuildFolder,
     GuildMember, ListMember, MemberListGroup, MemberListItem, MemberListOp, MemberListUpdate,
     Message, MessageUpdate, Presence, ReadState, Ready, ReadySupplemental, Relationship, Snowflake,
-    Status, User,
+    Status, User, VoiceServerUpdate, VoiceState,
 };
 use serde::de::{DeserializeOwned, Error as _};
 use serde::Deserialize;
@@ -19,6 +19,8 @@ pub const OP_HEARTBEAT: u8 = 1;
 pub const OP_IDENTIFY: u8 = 2;
 /// Presence Update (send). Rate limit: 5 per 20 s.
 pub const OP_PRESENCE_UPDATE: u8 = 3;
+/// Voice State Update (send): join, move, mute/deafen, or disconnect (`channel_id: null`).
+pub const OP_VOICE_STATE_UPDATE: u8 = 4;
 /// Guild Subscriptions Bulk (send). Supersedes the deprecated op 14.
 pub const OP_GUILD_SUBSCRIPTIONS_BULK: u8 = 37;
 pub const OP_RESUME: u8 = 6;
@@ -135,6 +137,26 @@ pub fn presence_payload(status: Status, custom: Option<&CustomStatus>) -> String
             "since": 0,
             "activities": activities,
             "afk": false,
+        },
+    })
+    .to_string()
+}
+
+/// Voice State Update (op 4): join, move, mute/deafen, or leave (`channel_id: None`) a
+/// voice channel.
+pub fn voice_state_payload(
+    guild_id: Option<Snowflake>,
+    channel_id: Option<Snowflake>,
+    self_mute: bool,
+    self_deaf: bool,
+) -> String {
+    json!({
+        "op": OP_VOICE_STATE_UPDATE,
+        "d": {
+            "guild_id": guild_id,
+            "channel_id": channel_id,
+            "self_mute": self_mute,
+            "self_deaf": self_deaf,
         },
     })
     .to_string()
@@ -515,6 +537,12 @@ pub fn decode_dispatch(t: &str, d: &str) -> Result<Option<GatewayEvent>, JsonErr
                 added_user_ids,
                 removed_user_ids,
             }
+        }
+        "VOICE_STATE_UPDATE" => {
+            GatewayEvent::VoiceStateUpdate(serde_json::from_str::<VoiceState>(d)?)
+        }
+        "VOICE_SERVER_UPDATE" => {
+            GatewayEvent::VoiceServerUpdate(serde_json::from_str::<VoiceServerUpdate>(d)?)
         }
         _ => return Ok(None),
     };
@@ -2254,5 +2282,68 @@ mod emoji_tests {
             .url(160)
             .unwrap()
             .contains("/stickers/9.gif"));
+    }
+
+    #[test]
+    fn voice_state_payload_and_dispatch_decoding() {
+        let v = |s: &str| serde_json::from_str::<Value>(s).unwrap();
+        let join = v(&voice_state_payload(
+            Some(Snowflake(100)),
+            Some(Snowflake(200)),
+            true,
+            false,
+        ));
+        assert_eq!(
+            join,
+            v(
+                r#"{"op":4,"d":{"guild_id":"100","channel_id":"200","self_mute":true,"self_deaf":false}}"#
+            )
+        );
+        let leave = v(&voice_state_payload(
+            Some(Snowflake(100)),
+            None,
+            false,
+            false,
+        ));
+        assert_eq!(
+            leave,
+            v(
+                r#"{"op":4,"d":{"guild_id":"100","channel_id":null,"self_mute":false,"self_deaf":false}}"#
+            )
+        );
+
+        let vsu_json = r#"{"guild_id":"100","channel_id":"200","user_id":"42","session_id":"abc","self_mute":true,"self_deaf":false,"self_stream":true}"#;
+        match decode_dispatch("VOICE_STATE_UPDATE", vsu_json)
+            .unwrap()
+            .unwrap()
+        {
+            GatewayEvent::VoiceStateUpdate(vs) => {
+                assert_eq!(vs.guild_id, Some(Snowflake(100)));
+                assert_eq!(vs.channel_id, Some(Snowflake(200)));
+                assert_eq!(vs.user_id, Snowflake(42));
+                assert_eq!(vs.session_id, "abc");
+                assert!(vs.self_mute);
+                assert!(vs.self_stream);
+                assert!(!vs.self_deaf && !vs.mute && !vs.deaf);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let srv_json =
+            r#"{"token":"voice_secret_123","guild_id":"100","endpoint":"syd1.discord.media:443"}"#;
+        match decode_dispatch("VOICE_SERVER_UPDATE", srv_json)
+            .unwrap()
+            .unwrap()
+        {
+            GatewayEvent::VoiceServerUpdate(srv) => {
+                assert_eq!(srv.token, "voice_secret_123");
+                assert_eq!(srv.guild_id, Snowflake(100));
+                assert_eq!(srv.endpoint.as_deref(), Some("syd1.discord.media:443"));
+                let dbg = format!("{srv:?}");
+                assert!(!dbg.contains("voice_secret_123"));
+                assert!(dbg.contains("<redacted>"));
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

@@ -17,7 +17,7 @@
 use nixcord_model::{
     permissions as perm, Channel, ChannelKind, CustomStatus, Emoji, GatewayEvent, Guild,
     GuildFolder, GuildMember, Message, MessageUpdate, OverwriteKind, PartialMember, Presence,
-    Reaction, Relationship, RelationshipKind, Role, Snowflake, Status, User,
+    Reaction, Relationship, RelationshipKind, Role, Snowflake, Status, User, VoiceState,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -154,6 +154,8 @@ pub struct Store {
     my_custom_status: Option<CustomStatus>,
     /// Threads the current user has joined (only these are listed in the sidebar).
     joined_threads: HashSet<Snowflake>,
+    /// Active voice states by user id (only users currently in a voice channel).
+    voice_states: HashMap<Snowflake, VoiceState>,
     /// Member list of the focused guild only (see `set_member_list_focus`).
     member_list: Option<(Snowflake, MemberList)>,
     list_focus: Option<Snowflake>,
@@ -187,7 +189,7 @@ impl Store {
                     );
                 }
                 for guild in &ready.guilds {
-                    self.upsert_guild(guild, true, true);
+                    self.upsert_guild(guild, true, true, true);
                 }
                 self.guild_folders.clone_from(&ready.guild_folders);
                 if !self.guild_folders.is_empty() {
@@ -265,7 +267,7 @@ impl Store {
                 };
             }
             GatewayEvent::AuthFailed => self.connection = ConnectionState::Offline,
-            GatewayEvent::GuildCreate(g) => self.upsert_guild(g, true, true),
+            GatewayEvent::GuildCreate(g) => self.upsert_guild(g, true, true, true),
             GatewayEvent::GuildUpdate(g) => {
                 let replace_channels = !g.channels.is_empty() || !self.guilds.contains_key(&g.id);
                 let replace_threads = !g.threads.is_empty();
@@ -278,7 +280,7 @@ impl Store {
                             .map(|o| std::mem::take(&mut o.emojis))
                     })
                     .flatten();
-                self.upsert_guild(g, replace_channels, replace_threads);
+                self.upsert_guild(g, replace_channels, replace_threads, false);
                 if let (Some(old), Some(new)) = (old, self.guilds.get_mut(&g.id)) {
                     new.emojis = old;
                 }
@@ -379,6 +381,8 @@ impl Store {
             } => {
                 self.thread_list_sync(*guild_id, channel_ids, threads);
             }
+            GatewayEvent::VoiceStateUpdate(vs) => self.voice_state_update(vs),
+            GatewayEvent::VoiceServerUpdate(_) => {}
         }
     }
 
@@ -1158,6 +1162,36 @@ impl Store {
             .is_none_or(|p| p & perm::VIEW_CHANNEL != 0 && p & perm::SEND_MESSAGES != 0)
     }
 
+    /// Can I connect to this voice channel (needs VIEW_CHANNEL + CONNECT)? Fails open like
+    /// `can_send` when permissions are unknown.
+    pub fn can_connect(&self, channel_id: Snowflake) -> bool {
+        self.has_permissions(channel_id, perm::CONNECT)
+    }
+
+    // ---- voice states ----
+
+    /// Active voice states in `channel_id`, sorted deterministically by `user_id`.
+    pub fn voice_states_in(&self, channel_id: Snowflake) -> Vec<&VoiceState> {
+        let mut out: Vec<&VoiceState> = self
+            .voice_states
+            .values()
+            .filter(|vs| vs.channel_id == Some(channel_id))
+            .collect();
+        out.sort_by_key(|vs| vs.user_id);
+        out
+    }
+
+    /// Active voice state of `user_id`, if they are currently in a voice channel.
+    pub fn user_voice_state(&self, user_id: Snowflake) -> Option<&VoiceState> {
+        self.voice_states.get(&user_id)
+    }
+
+    /// Active voice state of the current user, if connected to a voice channel.
+    pub fn my_voice_state(&self) -> Option<&VoiceState> {
+        let me = self.me.as_ref()?.id;
+        self.user_voice_state(me)
+    }
+
     /// Do I have all of `bits` in this guild channel (threads use their parent)? DMs and
     /// unknown permissions fail open, like `can_send`.
     fn has_permissions(&self, channel_id: Snowflake, bits: u64) -> bool {
@@ -1641,10 +1675,18 @@ impl Store {
     /// Insert or replace a guild. With `replace_channels`, the guild's channel set becomes
     /// exactly the payload's (channels no longer present are dropped with their messages).
     /// With `replace_threads`, the guild's active thread set is similarly replaced.
-    fn upsert_guild(&mut self, g: &Guild, replace_channels: bool, replace_threads: bool) {
+    /// With `replace_voice_states`, the guild's active voice states are similarly replaced.
+    fn upsert_guild(
+        &mut self,
+        g: &Guild,
+        replace_channels: bool,
+        replace_threads: bool,
+        replace_voice_states: bool,
+    ) {
         let mut stored = g.clone();
         let channels = std::mem::take(&mut stored.channels);
         let threads = std::mem::take(&mut stored.threads);
+        let voice_states = std::mem::take(&mut stored.voice_states);
         for m in std::mem::take(&mut stored.members) {
             self.cache_guild_member(g.id, &m);
         }
@@ -1652,6 +1694,15 @@ impl Store {
             self.guild_order.push(g.id);
         }
         self.guilds.insert(g.id, stored);
+        if replace_voice_states {
+            self.voice_states.retain(|_, vs| vs.guild_id != Some(g.id));
+            for mut vs in voice_states {
+                if vs.channel_id.is_some() {
+                    vs.guild_id = Some(g.id);
+                    self.voice_states.insert(vs.user_id, vs);
+                }
+            }
+        }
         if replace_channels {
             let new_ids: HashSet<Snowflake> = channels.iter().map(|c| c.id).collect();
             let old = self.guild_channel_ids.remove(&g.id).unwrap_or_default();
@@ -1705,10 +1756,23 @@ impl Store {
         }
     }
 
+    fn voice_state_update(&mut self, vs: &VoiceState) {
+        if vs.channel_id.is_some() {
+            self.voice_states.insert(vs.user_id, vs.clone());
+        } else if self
+            .voice_states
+            .get(&vs.user_id)
+            .is_some_and(|cur| vs.guild_id.is_none() || cur.guild_id == vs.guild_id)
+        {
+            self.voice_states.remove(&vs.user_id);
+        }
+    }
+
     fn remove_guild(&mut self, id: Snowflake) {
         self.guilds.remove(&id);
         self.guild_order.retain(|g| *g != id);
         self.members.retain(|&(g, _), _| g != id);
+        self.voice_states.retain(|_, vs| vs.guild_id != Some(id));
         // Per-guild presence copies of a guild we left would never be updated again.
         // Overall (friend) presences and other guilds' copies stay.
         self.presences.retain(|_, e| {
@@ -1912,6 +1976,7 @@ impl Store {
         self.detached.remove(&id);
         self.typing.remove(&id);
         self.read_states.remove(&id);
+        self.voice_states.retain(|_, vs| vs.channel_id != Some(id));
     }
 
     fn message_create(&mut self, m: &Message) {
@@ -2009,3 +2074,272 @@ mod tests;
 
 #[cfg(test)]
 mod presence_tests;
+
+#[cfg(test)]
+mod voice_tests {
+    use super::*;
+    use nixcord_model::{Overwrite, Ready, VoiceServerUpdate};
+
+    fn user(id: u64, name: &str) -> User {
+        User {
+            id: Snowflake(id),
+            username: name.into(),
+            ..Default::default()
+        }
+    }
+
+    fn voice_channel(id: u64, guild_id: u64, overwrites: Vec<Overwrite>) -> Channel {
+        Channel {
+            id: Snowflake(id),
+            kind: ChannelKind::Voice,
+            guild_id: Some(Snowflake(guild_id)),
+            name: Some(format!("vc-{id}")),
+            permission_overwrites: overwrites,
+            ..Default::default()
+        }
+    }
+
+    fn vs(
+        guild_id: Option<u64>,
+        channel_id: Option<u64>,
+        user_id: u64,
+        self_mute: bool,
+    ) -> VoiceState {
+        VoiceState {
+            guild_id: guild_id.map(Snowflake),
+            channel_id: channel_id.map(Snowflake),
+            user_id: Snowflake(user_id),
+            session_id: format!("sess-{user_id}"),
+            self_mute,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn voice_state_lifecycle_ready_guild_create_update_delete() {
+        let mut s = Store::new();
+        let g1 = Guild {
+            id: Snowflake(100),
+            name: "Guild 1".into(),
+            channels: vec![
+                voice_channel(10, 100, vec![]),
+                voice_channel(11, 100, vec![]),
+            ],
+            // `guild_id` intentionally omitted here (as Discord does inside READY/GUILD_CREATE).
+            voice_states: vec![
+                vs(None, Some(10), 30, false),
+                vs(None, Some(10), 1, true),
+                vs(None, Some(10), 20, false),
+            ],
+            ..Default::default()
+        };
+        s.apply(&GatewayEvent::Ready(Box::new(Ready {
+            user: user(1, "me"),
+            guilds: vec![g1],
+            session_id: "s1".into(),
+            ..Default::default()
+        })));
+
+        // Guild's own voice_states were moved out into Store.
+        assert!(s.guild(Snowflake(100)).unwrap().voice_states.is_empty());
+
+        // voice_states_in is deterministically sorted by user_id and has guild_id attached.
+        let in_vc10 = s.voice_states_in(Snowflake(10));
+        let ids: Vec<Snowflake> = in_vc10.iter().map(|v| v.user_id).collect();
+        assert_eq!(ids, vec![Snowflake(1), Snowflake(20), Snowflake(30)]);
+        assert_eq!(in_vc10[0].guild_id, Some(Snowflake(100)));
+        assert_eq!(s.my_voice_state().unwrap().channel_id, Some(Snowflake(10)));
+        assert!(s.my_voice_state().unwrap().self_mute);
+
+        // User 20 moves to channel 11.
+        s.apply(&GatewayEvent::VoiceStateUpdate(vs(
+            Some(100),
+            Some(11),
+            20,
+            true,
+        )));
+        assert_eq!(
+            s.voice_states_in(Snowflake(10))
+                .iter()
+                .map(|v| v.user_id)
+                .collect::<Vec<_>>(),
+            vec![Snowflake(1), Snowflake(30)]
+        );
+        assert_eq!(
+            s.user_voice_state(Snowflake(20)).unwrap().channel_id,
+            Some(Snowflake(11))
+        );
+
+        // User 1 disconnects (channel_id: None).
+        s.apply(&GatewayEvent::VoiceStateUpdate(vs(
+            Some(100),
+            None,
+            1,
+            false,
+        )));
+        assert!(s.my_voice_state().is_none());
+        assert!(s.user_voice_state(Snowflake(1)).is_none());
+
+        // GUILD_UPDATE without voice_states must preserve existing voice states.
+        s.apply(&GatewayEvent::GuildUpdate(Box::new(Guild {
+            id: Snowflake(100),
+            name: "Guild 1 Renamed".into(),
+            ..Default::default()
+        })));
+        assert_eq!(s.voice_states_in(Snowflake(10)).len(), 1);
+        assert_eq!(s.voice_states_in(Snowflake(11)).len(), 1);
+
+        // GUILD_CREATE for a second guild populates its voice states too.
+        s.apply(&GatewayEvent::GuildCreate(Box::new(Guild {
+            id: Snowflake(200),
+            name: "Guild 2".into(),
+            channels: vec![voice_channel(20, 200, vec![])],
+            voice_states: vec![vs(None, Some(20), 40, false)],
+            ..Default::default()
+        })));
+        assert_eq!(
+            s.user_voice_state(Snowflake(40)).unwrap().guild_id,
+            Some(Snowflake(200))
+        );
+
+        // VoiceServerUpdate is accepted cleanly without disturbing voice states.
+        s.apply(&GatewayEvent::VoiceServerUpdate(VoiceServerUpdate {
+            token: "secret".into(),
+            guild_id: Snowflake(100),
+            endpoint: Some("us-east.discord.media:443".into()),
+        }));
+        assert_eq!(s.voice_states_in(Snowflake(10)).len(), 1);
+
+        // GUILD_DELETE removes only that guild's voice states.
+        s.apply(&GatewayEvent::GuildDelete {
+            id: Snowflake(100),
+            unavailable: false,
+        });
+        assert!(s.voice_states_in(Snowflake(10)).is_empty());
+        assert!(s.voice_states_in(Snowflake(11)).is_empty());
+        assert!(s.user_voice_state(Snowflake(30)).is_none());
+        assert!(s.user_voice_state(Snowflake(40)).is_some());
+
+        // Fresh READY resets all voice states.
+        s.apply(&GatewayEvent::Ready(Box::new(Ready {
+            user: user(1, "me"),
+            guilds: vec![],
+            session_id: "s2".into(),
+            ..Default::default()
+        })));
+        assert!(s.user_voice_state(Snowflake(40)).is_none());
+    }
+
+    #[test]
+    fn can_connect_checks_view_and_connect_and_fails_open() {
+        let mut s = Store::new();
+        let guild_id = Snowflake(100);
+        let role_id = Snowflake(500);
+        let vc_open = voice_channel(10, 100, vec![]);
+        let vc_no_connect = voice_channel(
+            11,
+            100,
+            vec![Overwrite {
+                id: guild_id,
+                kind: OverwriteKind::Role,
+                allow: 0,
+                deny: perm::CONNECT,
+            }],
+        );
+        let vc_no_view = voice_channel(
+            12,
+            100,
+            vec![Overwrite {
+                id: guild_id,
+                kind: OverwriteKind::Role,
+                allow: 0,
+                deny: perm::VIEW_CHANNEL,
+            }],
+        );
+        let vc_role_override = voice_channel(
+            13,
+            100,
+            vec![
+                Overwrite {
+                    id: guild_id,
+                    kind: OverwriteKind::Role,
+                    allow: 0,
+                    deny: perm::CONNECT,
+                },
+                Overwrite {
+                    id: role_id,
+                    kind: OverwriteKind::Role,
+                    allow: perm::CONNECT,
+                    deny: 0,
+                },
+            ],
+        );
+
+        let guild = Guild {
+            id: guild_id,
+            name: "G".into(),
+            channels: vec![vc_open, vc_no_connect, vc_no_view, vc_role_override],
+            roles: vec![
+                Role {
+                    id: guild_id,
+                    name: "@everyone".into(),
+                    permissions: perm::VIEW_CHANNEL | perm::CONNECT,
+                    ..Default::default()
+                },
+                Role {
+                    id: role_id,
+                    name: "VIP".into(),
+                    permissions: 0,
+                    ..Default::default()
+                },
+            ],
+            members: vec![GuildMember {
+                user: Some(user(1, "me")),
+                roles: vec![role_id],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let dm = Channel {
+            id: Snowflake(99),
+            kind: ChannelKind::Dm,
+            ..Default::default()
+        };
+
+        s.apply(&GatewayEvent::Ready(Box::new(Ready {
+            user: user(1, "me"),
+            guilds: vec![guild],
+            private_channels: vec![dm],
+            session_id: "s1".into(),
+            ..Default::default()
+        })));
+
+        assert!(!s.can_connect(Snowflake(999)), "unknown channel");
+        assert!(s.can_connect(Snowflake(99)), "DM always connectable");
+        assert!(s.can_connect(Snowflake(10)), "VIEW_CHANNEL + CONNECT");
+        assert!(!s.can_connect(Snowflake(11)), "CONNECT denied");
+        assert!(!s.can_connect(Snowflake(12)), "VIEW_CHANNEL denied");
+        assert!(
+            s.can_connect(Snowflake(13)),
+            "role allow overrides @everyone deny"
+        );
+
+        // Fail open when member/role permissions are unknown.
+        let mut s_unknown = Store::new();
+        s_unknown.apply(&GatewayEvent::Ready(Box::new(Ready {
+            user: user(1, "me"),
+            guilds: vec![Guild {
+                id: guild_id,
+                name: "G".into(),
+                channels: vec![voice_channel(10, 100, vec![])],
+                ..Default::default()
+            }],
+            session_id: "s1".into(),
+            ..Default::default()
+        })));
+        assert!(
+            s_unknown.can_connect(Snowflake(10)),
+            "fails open when permissions unknown"
+        );
+    }
+}

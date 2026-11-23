@@ -2331,6 +2331,7 @@ dependencies = [
  "nixcord-model",
  "nixcord-store",
  "nixcord-video",
+ "nixcord-voice",
  "rfd",
  "serde",
  "tokio",

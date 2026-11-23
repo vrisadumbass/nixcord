@@ -35,6 +35,13 @@ pub enum GatewayCommand {
         status: Status,
         custom_status: Option<CustomStatus>,
     },
+    /// Join, move, mute/deafen, or leave (`channel_id: None`) a voice channel (op 4).
+    UpdateVoiceState {
+        guild_id: Option<Snowflake>,
+        channel_id: Option<Snowflake>,
+        self_mute: bool,
+        self_deaf: bool,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -42,6 +49,7 @@ pub struct Outbox {
     subs: BTreeMap<Snowflake, GuildSubscription>,
     presence: Option<(Status, Option<CustomStatus>)>,
     last_presence: Option<(Status, Option<CustomStatus>)>,
+    voice_state: Option<(Option<Snowflake>, Option<Snowflake>, bool, bool)>,
     sub_sent: Option<Instant>,
     presence_sent: Option<Instant>,
 }
@@ -72,6 +80,14 @@ impl Outbox {
                 self.presence = Some((status, norm.clone()));
                 self.last_presence = Some((status, norm));
             }
+            GatewayCommand::UpdateVoiceState {
+                guild_id,
+                channel_id,
+                self_mute,
+                self_deaf,
+            } => {
+                self.voice_state = Some((guild_id, channel_id, self_mute, self_deaf));
+            }
         }
     }
 
@@ -84,7 +100,7 @@ impl Outbox {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.subs.is_empty() && self.presence.is_none()
+        self.subs.is_empty() && self.presence.is_none() && self.voice_state.is_none()
     }
 
     /// Earliest time something can be sent, `None` if nothing is pending.
@@ -95,10 +111,8 @@ impl Outbox {
             .presence
             .is_some()
             .then(|| due(self.presence_sent, PRESENCE_INTERVAL));
-        match (subs, pres) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        let voice = self.voice_state.is_some().then_some(now);
+        [subs, pres, voice].into_iter().flatten().min()
     }
 
     /// Payloads that may be sent at `now`.
@@ -115,6 +129,11 @@ impl Outbox {
                 out.push(protocol::presence_payload(status, custom.as_ref()));
                 self.presence_sent = Some(now);
             }
+        }
+        if let Some((guild_id, channel_id, self_mute, self_deaf)) = self.voice_state.take() {
+            out.push(protocol::voice_state_payload(
+                guild_id, channel_id, self_mute, self_deaf,
+            ));
         }
         out
     }
@@ -280,5 +299,76 @@ mod tests {
             p["d"]["activities"],
             v(r#"[{"type":4,"name":"Custom Status","state":"deep work"}]"#)
         );
+    }
+
+    #[test]
+    fn voice_state_flushes_immediately_coalesces_and_does_not_resend_on_fresh_session() {
+        let t0 = Instant::now();
+        let mut o = Outbox::new();
+
+        // Queued before ready: latest wins.
+        o.push(GatewayCommand::UpdateVoiceState {
+            guild_id: Some(Snowflake(10)),
+            channel_id: Some(Snowflake(20)),
+            self_mute: false,
+            self_deaf: false,
+        });
+        o.push(GatewayCommand::UpdateVoiceState {
+            guild_id: Some(Snowflake(10)),
+            channel_id: Some(Snowflake(21)),
+            self_mute: true,
+            self_deaf: false,
+        });
+        assert!(!o.is_empty());
+        assert_eq!(o.next_due(t0), Some(t0));
+        let sent = o.take_due(t0);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            v(&sent[0]),
+            v(
+                r#"{"op":4,"d":{"guild_id":"10","channel_id":"21","self_mute":true,"self_deaf":false}}"#
+            )
+        );
+        assert!(o.is_empty());
+
+        // Immediate flush with no 4s presence throttle: pushing again at the same instant
+        // flushes right away, even while presence is throttled.
+        o.push(GatewayCommand::SetPresence {
+            status: Status::Online,
+            custom_status: None,
+        });
+        assert_eq!(o.take_due(t0).len(), 1);
+        o.push(GatewayCommand::SetPresence {
+            status: Status::Idle,
+            custom_status: None,
+        });
+        o.push(GatewayCommand::UpdateVoiceState {
+            guild_id: Some(Snowflake(10)),
+            channel_id: None,
+            self_mute: false,
+            self_deaf: false,
+        });
+        assert_eq!(o.next_due(t0), Some(t0));
+        let sent = o.take_due(t0);
+        assert_eq!(
+            sent.len(),
+            1,
+            "only Op 4 flushes while presence is throttled"
+        );
+        assert_eq!(v(&sent[0])["op"], 4);
+        assert_eq!(v(&sent[0])["d"]["channel_id"], Value::Null);
+
+        // Fresh session (READY) must NOT auto-resend the last voice state.
+        let mut o2 = Outbox::new();
+        o2.push(GatewayCommand::UpdateVoiceState {
+            guild_id: Some(Snowflake(10)),
+            channel_id: Some(Snowflake(20)),
+            self_mute: false,
+            self_deaf: false,
+        });
+        assert_eq!(o2.take_due(t0).len(), 1);
+        assert!(o2.is_empty());
+        o2.on_session_start(true);
+        assert!(o2.is_empty(), "fresh session must not re-send voice state");
     }
 }

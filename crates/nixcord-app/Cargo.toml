@@ -10,9 +10,11 @@ name = "nixcord"
 path = "src/main.rs"
 
 [features]
-default = ["video"]
+default = ["video", "voice"]
 # Inline video player (H.264 MP4/MOV). Adds about 0.7 MB to the release exe.
 video = ["dep:nixcord-video"]
+# Discord voice calls (Voice Gateway, AEAD RTP, cpal capture/playback).
+voice = ["dep:nixcord-voice"]
 
 [dependencies]
 nixcord-model.workspace = true
@@ -24,6 +26,8 @@ nixcord-media.workspace = true
 nixcord-emoji.workspace = true
 # Inline video playback (OpenH264 + symphonia + cpal); `--no-default-features` drops it.
 nixcord-video = { workspace = true, optional = true }
+# Discord voice calls; `--no-default-features` drops it.
+nixcord-voice = { workspace = true, optional = true }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

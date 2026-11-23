@@ -157,6 +157,8 @@ pub mod permissions {
     pub const ADMINISTRATOR: u64 = 1 << 3;
     pub const VIEW_CHANNEL: u64 = 1 << 10;
     pub const SEND_MESSAGES: u64 = 1 << 11;
+    pub const CONNECT: u64 = 1 << 20;
+    pub const SPEAK: u64 = 1 << 21;
     pub const MANAGE_THREADS: u64 = 1 << 34;
     pub const CREATE_PUBLIC_THREADS: u64 = 1 << 35;
     pub const SEND_MESSAGES_IN_THREADS: u64 = 1 << 38;
@@ -390,6 +392,56 @@ pub struct Guild {
     /// into its channel/thread maps and does not keep them on the guild.
     #[serde(default, deserialize_with = "de_lenient_vec")]
     pub threads: Vec<Channel>,
+    /// Active voice states in the guild (READY / GUILD_CREATE `voice_states`). The store
+    /// moves these into its voice state map and does not keep them on the guild.
+    #[serde(default, deserialize_with = "de_lenient_vec")]
+    pub voice_states: Vec<VoiceState>,
+}
+
+/// A user's voice connection state (READY / GUILD_CREATE `voice_states`, VOICE_STATE_UPDATE).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VoiceState {
+    #[serde(default)]
+    pub guild_id: Option<Snowflake>,
+    #[serde(default)]
+    pub channel_id: Option<Snowflake>,
+    pub user_id: Snowflake,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub deaf: bool,
+    #[serde(default)]
+    pub mute: bool,
+    #[serde(default)]
+    pub self_deaf: bool,
+    #[serde(default)]
+    pub self_mute: bool,
+    #[serde(default)]
+    pub self_stream: bool,
+    #[serde(default)]
+    pub self_video: bool,
+    #[serde(default)]
+    pub suppress: bool,
+}
+
+/// Voice server connection details (VOICE_SERVER_UPDATE).
+/// `Debug` always redacts `token` so it can never leak into logs.
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VoiceServerUpdate {
+    pub token: String,
+    pub guild_id: Snowflake,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+}
+
+impl fmt::Debug for VoiceServerUpdate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VoiceServerUpdate")
+            .field("token", &"<redacted>")
+            .field("guild_id", &self.guild_id)
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
 }
 
 /// Sticker image formats (`format_type`).
@@ -1307,6 +1359,8 @@ pub enum GatewayEvent {
         added_user_ids: Vec<Snowflake>,
         removed_user_ids: Vec<Snowflake>,
     },
+    VoiceStateUpdate(VoiceState),
+    VoiceServerUpdate(VoiceServerUpdate),
 }
 
 /// Discord CDN URL helpers. `size` should be a power of two (16..=4096).
@@ -1457,5 +1511,61 @@ mod tests {
         assert_eq!(rs.id, Snowflake(10));
         assert_eq!(rs.last_message_id, Some(Snowflake(99)));
         assert_eq!(rs.mention_count, 4);
+    }
+
+    #[test]
+    fn voice_types_permissions_and_redacted_debug() {
+        assert_eq!(permissions::CONNECT, 1 << 20);
+        assert_eq!(permissions::SPEAK, 1 << 21);
+
+        let vs: VoiceState = serde_json::from_str(
+            r#"{"user_id":"42","channel_id":"100","guild_id":"7","session_id":"sess1","self_mute":true}"#,
+        )
+        .unwrap();
+        assert_eq!(vs.user_id, Snowflake(42));
+        assert_eq!(vs.channel_id, Some(Snowflake(100)));
+        assert_eq!(vs.guild_id, Some(Snowflake(7)));
+        assert_eq!(vs.session_id, "sess1");
+        assert!(vs.self_mute);
+        assert!(
+            !vs.deaf
+                && !vs.mute
+                && !vs.self_deaf
+                && !vs.self_stream
+                && !vs.self_video
+                && !vs.suppress
+        );
+
+        let minimal: VoiceState = serde_json::from_str(r#"{"user_id":"9"}"#).unwrap();
+        assert_eq!(minimal.user_id, Snowflake(9));
+        assert_eq!(minimal.channel_id, None);
+        assert_eq!(minimal.session_id, "");
+
+        let vsu: VoiceServerUpdate = serde_json::from_str(
+            r#"{"token":"super_secret_voice_token","guild_id":"7","endpoint":"us-east1.discord.media:443"}"#,
+        )
+        .unwrap();
+        assert_eq!(vsu.token, "super_secret_voice_token");
+        assert_eq!(vsu.guild_id, Snowflake(7));
+        assert_eq!(vsu.endpoint.as_deref(), Some("us-east1.discord.media:443"));
+        let dbg = format!("{vsu:?}");
+        assert!(
+            !dbg.contains("super_secret_voice_token"),
+            "Debug output must never contain token: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "Debug output must redact token: {dbg}"
+        );
+
+        let g: Guild = serde_json::from_str(
+            r#"{"id":"7","name":"G","voice_states":[
+                {"user_id":"42","channel_id":"100","session_id":"s1"},
+                {"bogus":true}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(g.voice_states.len(), 1);
+        assert_eq!(g.voice_states[0].user_id, Snowflake(42));
     }
 }
