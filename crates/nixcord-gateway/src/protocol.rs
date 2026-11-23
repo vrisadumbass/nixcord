@@ -112,7 +112,12 @@ pub fn presence_payload(status: Status, custom: Option<&CustomStatus>) -> String
                 if let Some(id) = emoji.id {
                     em.insert("id".into(), json!(id));
                 }
-                if let Some(name) = emoji.name {
+                if let Some(name) = emoji
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
                     em.insert("name".into(), json!(name));
                 }
                 if emoji.animated {
@@ -1907,5 +1912,56 @@ mod emoji_tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn presence_payload_serializes_custom_status_and_roundtrips_activity() {
+        let v = |s: &str| serde_json::from_str::<Value>(s).unwrap();
+        let plain = v(&presence_payload(Status::Offline, None));
+        assert_eq!(plain["op"], 3);
+        assert_eq!(plain["d"]["status"], "invisible");
+        assert_eq!(plain["d"]["activities"], v("[]"));
+
+        let empty = CustomStatus {
+            text: Some("   ".into()),
+            emoji: None,
+        };
+        assert_eq!(
+            v(&presence_payload(Status::Online, Some(&empty)))["d"]["activities"],
+            v("[]")
+        );
+
+        let full = CustomStatus {
+            text: Some("  shipping v0.4  ".into()),
+            emoji: Some(Emoji {
+                id: None,
+                name: Some(" 🚀 ".into()),
+                animated: false,
+            }),
+        };
+        let payload = v(&presence_payload(Status::Dnd, Some(&full)));
+        assert_eq!(payload["d"]["status"], "dnd");
+        let acts = payload["d"]["activities"].as_array().unwrap();
+        assert_eq!(acts.len(), 1);
+        assert_eq!(acts[0]["type"], 4);
+        assert_eq!(acts[0]["name"], "Custom Status");
+        assert_eq!(acts[0]["state"], "shipping v0.4");
+        assert_eq!(acts[0]["emoji"], v(r#"{"name":"🚀"}"#));
+
+        let decoded: Activity = serde_json::from_value(acts[0].clone()).unwrap();
+        assert_eq!(decoded.label().as_deref(), Some("🚀 shipping v0.4"));
+
+        let emoji_only = CustomStatus {
+            text: None,
+            emoji: Some(Emoji {
+                id: None,
+                name: Some("☕".into()),
+                animated: false,
+            }),
+        };
+        let p_emoji = v(&presence_payload(Status::Idle, Some(&emoji_only)));
+        let act_emoji: Activity =
+            serde_json::from_value(p_emoji["d"]["activities"][0].clone()).unwrap();
+        assert_eq!(act_emoji.label().as_deref(), Some("☕"));
     }
 }

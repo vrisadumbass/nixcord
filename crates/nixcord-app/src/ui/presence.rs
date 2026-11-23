@@ -8,16 +8,27 @@
 //! an empty subscription for the guild it left. The store keeps the list of the focused
 //! guild only. The gateway coalesces and throttles the actual op 37 frames.
 
-use super::{member_name, prop, role_color, Action};
+use super::{bold, hline, member_name, paint_icon, prop, role_color, Action, Icon};
 use crate::app::NixApp;
 use crate::backend::Command;
+use crate::media::Media;
 use crate::theme::Theme;
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, CursorIcon, Pos2, Rect, RichText, Sense, Ui, Vec2,
+    self, Align, Align2, Color32, CornerRadius, CursorIcon, Frame, Id, Layout, Margin, Pos2, Rect,
+    RichText, Sense, Stroke, Ui, Vec2,
 };
 use nixcord_gateway::GatewayCommand;
-use nixcord_model::{ChannelKind, Presence, Snowflake, Status, User};
+use nixcord_model::{ChannelKind, CustomStatus, Emoji, Presence, Snowflake, Status, User};
 use nixcord_store::{ListSection, MEMBER_LIST_MAX_ROWS};
+use std::cell::RefCell;
+
+/// Maximum custom status text length enforced by Discord and the modal editor.
+pub const MAX_CUSTOM_STATUS_CHARS: usize = CustomStatus::MAX_CHARS;
+
+/// Quick-pick unicode emoji palette in the custom status modal.
+pub const QUICK_PICK_EMOJIS: &[&str] = &[
+    "☕", "🦀", "💻", "🎮", "🎧", "📚", "✨", "🔥", "🌙", "💤", "🚀", "🎉",
+];
 
 /// Rows per member-list range, as Discord expects.
 const RANGE_ROWS: u32 = 100;
@@ -38,22 +49,92 @@ pub struct SubState {
     pub near_end: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PresenceAction {
     SetStatus(Status),
+    SetCustomStatus(Option<CustomStatus>),
+    OpenCustomStatusModal,
 }
 
 /// Modal state for editing our own custom status.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CustomStatusModal {
     pub text: String,
     pub emoji: Option<String>,
     pub focus_text: bool,
 }
 
+impl CustomStatusModal {
+    /// Create modal state pre-populated from the current custom status.
+    pub fn from_current(current: Option<&CustomStatus>) -> Self {
+        let text = current
+            .and_then(|c| c.text.as_deref())
+            .unwrap_or_default()
+            .to_string();
+        let emoji = current
+            .and_then(|c| c.emoji.as_ref())
+            .filter(|e| e.id.is_none())
+            .and_then(|e| e.name.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        Self {
+            text,
+            emoji,
+            focus_text: true,
+        }
+    }
+
+    /// Normalize the draft fields into an optional [`CustomStatus`].
+    pub fn to_custom_status(&self) -> Option<CustomStatus> {
+        CustomStatus {
+            text: Some(self.text.clone()),
+            emoji: self.emoji.as_ref().map(|name| Emoji {
+                id: None,
+                name: Some(name.clone()),
+                animated: false,
+            }),
+        }
+        .normalized()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModalOutcome {
+    Open,
+    Cancel,
+    Save(Option<CustomStatus>),
+}
+
 impl NixApp {
     /// Restore any saved status and custom status from `Prefs` on `READY`.
-    pub(crate) fn restore_saved_presence(&mut self) {}
+    pub(crate) fn restore_saved_presence(&mut self) {
+        let saved_status = self
+            .prefs
+            .saved_status
+            .as_deref()
+            .and_then(Status::parse_known)
+            .map(|s| match s {
+                Status::Offline => Status::Invisible,
+                other => other,
+            });
+        let saved_custom = self
+            .prefs
+            .custom_status
+            .as_ref()
+            .and_then(CustomStatus::normalized);
+        if let Some(s) = saved_status {
+            self.store.set_my_status(s);
+        }
+        self.store.set_my_custom_status(saved_custom.clone());
+        if saved_status.is_some() || saved_custom.is_some() {
+            self.send(Command::Gateway(GatewayCommand::SetPresence {
+                status: self.store.my_status(),
+                custom_status: saved_custom,
+            }));
+        }
+    }
+
     /// Keep the gateway subscription in line with the open channel. Cheap when nothing
     /// changed; call once per frame.
     pub(crate) fn sync_member_subscription(&mut self) {
@@ -116,17 +197,290 @@ impl NixApp {
         match a {
             PresenceAction::SetStatus(status) => {
                 self.store.set_my_status(status);
+                self.prefs.saved_status = Some(status.as_str().to_string());
                 self.send(Command::Gateway(GatewayCommand::SetPresence {
                     status,
                     custom_status: self.store.my_custom_status().cloned(),
                 }));
+            }
+            PresenceAction::SetCustomStatus(custom) => {
+                let norm = custom.and_then(|c| c.normalized());
+                self.store.set_my_custom_status(norm.clone());
+                self.prefs.custom_status = norm.clone();
+                self.send(Command::Gateway(GatewayCommand::SetPresence {
+                    status: self.store.my_status(),
+                    custom_status: norm,
+                }));
+            }
+            PresenceAction::OpenCustomStatusModal => {
+                self.view.custom_status_modal = Some(CustomStatusModal::from_current(
+                    self.store.my_custom_status(),
+                ));
             }
         }
     }
 }
 
 /// Floating modal window for editing or clearing our custom status.
-pub fn custom_status_modal(_ctx: &egui::Context, _app: &mut NixApp, _actions: &mut Vec<Action>) {}
+pub fn custom_status_modal(ctx: &egui::Context, app: &mut NixApp, _actions: &mut Vec<Action>) {
+    let has_existing = app.store.my_custom_status().is_some();
+    let outcome = {
+        let Some(modal) = app.view.custom_status_modal.as_mut() else {
+            return;
+        };
+        render_custom_status_modal(ctx, app.theme, &app.media, has_existing, modal)
+    };
+    match outcome {
+        ModalOutcome::Open => {}
+        ModalOutcome::Cancel => {
+            app.view.custom_status_modal = None;
+        }
+        ModalOutcome::Save(custom) => {
+            app.view.custom_status_modal = None;
+            app.presence_action(PresenceAction::SetCustomStatus(custom));
+        }
+    }
+}
+
+fn render_custom_status_modal(
+    ctx: &egui::Context,
+    t: &Theme,
+    media: &RefCell<Media>,
+    has_existing: bool,
+    modal: &mut CustomStatusModal,
+) -> ModalOutcome {
+    let modal_w = (ctx.content_rect().width() - 40.0).clamp(300.0, 420.0);
+    let mut outcome = ModalOutcome::Open;
+
+    let resp = egui::Modal::new(Id::unique("custom-status-modal"))
+        .backdrop_color(Color32::from_black_alpha(170))
+        .frame(
+            Frame::new()
+                .fill(t.elevated.to_opaque())
+                .stroke(Stroke::new(1.0, t.divider))
+                .corner_radius(CornerRadius::same(10))
+                .inner_margin(Margin::same(20)),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(modal_w);
+            ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+
+            ui.label(
+                RichText::new("Custom Status")
+                    .font(bold(19.0))
+                    .color(t.strong),
+            );
+            ui.label(
+                RichText::new("Displayed under your name across nixcord.")
+                    .font(prop(13.0))
+                    .color(t.muted),
+            );
+            ui.add_space(4.0);
+
+            // Quick-pick unicode emoji palette.
+            ui.label(RichText::new("QUICK EMOJI").font(bold(11.5)).color(t.muted));
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                for &emoji in QUICK_PICK_EMOJIS {
+                    let selected = modal.emoji.as_deref() == Some(emoji);
+                    let (rect, item) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
+                    let fill = if selected {
+                        t.selected
+                    } else if item.hovered() {
+                        t.hover
+                    } else {
+                        t.chat.to_opaque()
+                    };
+                    let stroke = if selected {
+                        Stroke::new(1.5, t.accent)
+                    } else {
+                        Stroke::new(1.0, t.divider)
+                    };
+                    ui.painter().rect(
+                        rect,
+                        CornerRadius::same(6),
+                        fill,
+                        stroke,
+                        egui::StrokeKind::Inside,
+                    );
+                    let icon_rect = Rect::from_center_size(rect.center(), Vec2::splat(18.0));
+                    super::emoji_text::paint_emoji_ui(ui, icon_rect, emoji, media, t.strong);
+                    if item.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                        if selected {
+                            modal.emoji = None;
+                        } else {
+                            modal.emoji = Some(emoji.to_string());
+                        }
+                    }
+                }
+            });
+
+            ui.add_space(2.0);
+            let char_count = modal.text.trim().chars().count();
+            ui.allocate_ui_with_layout(
+                Vec2::new(ui.available_width(), 18.0),
+                Layout::right_to_left(Align::Center),
+                |ui| {
+                    ui.label(
+                        RichText::new(format!("{char_count}/{MAX_CUSTOM_STATUS_CHARS}"))
+                            .font(prop(11.5))
+                            .color(if char_count > MAX_CUSTOM_STATUS_CHARS {
+                                t.danger
+                            } else {
+                                t.muted
+                            }),
+                    );
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.label(RichText::new("STATUS TEXT").font(bold(11.5)).color(t.muted));
+                    });
+                },
+            );
+
+            let mut submit_enter = false;
+            Frame::new()
+                .fill(t.chat.to_opaque())
+                .stroke(Stroke::new(1.0, t.divider))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        if let Some(selected_emoji) = modal.emoji.clone() {
+                            let (erect, eresp) =
+                                ui.allocate_exact_size(Vec2::splat(22.0), Sense::click());
+                            if eresp.hovered() {
+                                ui.painter()
+                                    .rect_filled(erect, CornerRadius::same(4), t.hover);
+                            }
+                            let icon_r = Rect::from_center_size(erect.center(), Vec2::splat(16.0));
+                            super::emoji_text::paint_emoji_ui(
+                                ui,
+                                icon_r,
+                                &selected_emoji,
+                                media,
+                                t.strong,
+                            );
+                            if eresp
+                                .on_hover_cursor(CursorIcon::PointingHand)
+                                .on_hover_text("Click to clear emoji")
+                                .clicked()
+                            {
+                                modal.emoji = None;
+                            }
+                        } else {
+                            let (erect, _) =
+                                ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
+                            paint_icon(ui, Icon::Smile, erect, t.muted);
+                        }
+                        let text_resp = ui.add(
+                            egui::TextEdit::singleline(&mut modal.text)
+                                .hint_text("What's happening?")
+                                .char_limit(MAX_CUSTOM_STATUS_CHARS)
+                                .frame(Frame::NONE)
+                                .font(prop(14.5))
+                                .desired_width(f32::INFINITY),
+                        );
+                        if modal.focus_text {
+                            text_resp.request_focus();
+                            modal.focus_text = false;
+                        }
+                        if text_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            submit_enter = true;
+                        }
+                    });
+                });
+
+            if submit_enter {
+                outcome = ModalOutcome::Save(modal.to_custom_status());
+            }
+
+            ui.add_space(6.0);
+            let can_clear = has_existing || modal.emoji.is_some() || !modal.text.trim().is_empty();
+            ui.allocate_ui_with_layout(
+                Vec2::new(ui.available_width(), 34.0),
+                Layout::right_to_left(Align::Center),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    if modal_button(ui, t, "Save", true, true).clicked() {
+                        outcome = ModalOutcome::Save(modal.to_custom_status());
+                    }
+                    if modal_button(ui, t, "Clear", false, can_clear).clicked() {
+                        outcome = ModalOutcome::Save(None);
+                    }
+                    if modal_button(ui, t, "Cancel", false, true).clicked() {
+                        outcome = ModalOutcome::Cancel;
+                    }
+                },
+            );
+        });
+
+    if matches!(outcome, ModalOutcome::Open) && resp.should_close() {
+        outcome = ModalOutcome::Cancel;
+    }
+    outcome
+}
+
+fn modal_button(
+    ui: &mut Ui,
+    t: &Theme,
+    label: &str,
+    primary: bool,
+    enabled: bool,
+) -> egui::Response {
+    let fg = if primary {
+        if enabled {
+            t.on_accent
+        } else {
+            t.on_accent.gamma_multiply(0.55)
+        }
+    } else if enabled {
+        t.text
+    } else {
+        t.muted.gamma_multiply(0.55)
+    };
+    let font = if primary { bold(13.5) } else { prop(13.5) };
+    let galley = ui.painter().layout_no_wrap(label.into(), font, fg);
+    let size = Vec2::new((galley.size().x + 24.0).max(74.0), 32.0);
+    let (rect, resp) = ui.allocate_exact_size(
+        size,
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    let fill = if primary {
+        if !enabled {
+            t.accent.gamma_multiply(0.45)
+        } else if resp.hovered() {
+            t.accent.gamma_multiply(0.88)
+        } else {
+            t.accent
+        }
+    } else if enabled && resp.hovered() {
+        t.hover
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(6),
+        fill,
+        if primary {
+            Stroke::NONE
+        } else {
+            Stroke::new(1.0, t.divider)
+        },
+        egui::StrokeKind::Inside,
+    );
+    ui.painter()
+        .galley(rect.center() - galley.size() / 2.0, galley, fg);
+    if enabled {
+        resp.on_hover_cursor(CursorIcon::PointingHand)
+    } else {
+        resp
+    }
+}
 
 // ---- dots ---------------------------------------------------------------------------
 
@@ -228,51 +582,192 @@ pub fn paint_user_status(
 
 // ---- status picker ------------------------------------------------------------------
 
-/// Small menu under the user panel: Online / Idle / Do Not Disturb / Invisible.
+/// Small menu under the user panel: Online / Idle / Do Not Disturb / Invisible,
+/// plus Custom Status (view, quick clear, set/edit).
 pub fn status_menu(resp: &egui::Response, app: &mut NixApp) {
     let t = app.theme;
     let current = app.store.my_status();
-    let mut picked = None;
+    let custom_label = app.store.my_custom_status_text();
+    let mut action: Option<PresenceAction> = None;
+
     egui::Popup::menu(resp)
         .align(egui::RectAlign::TOP_START)
         .gap(6.0)
-        .width(200.0)
+        .width(220.0)
         .show(|ui| {
-            for s in [Status::Online, Status::Idle, Status::Dnd, Status::Invisible] {
-                let (rect, item) =
-                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
-                if item.hovered() || s == current {
-                    ui.painter().rect_filled(
-                        rect,
-                        CornerRadius::same(4),
-                        if item.hovered() { t.hover } else { t.selected },
-                    );
-                }
-                let dot = Pos2::new(rect.left() + 14.0, rect.center().y);
-                let bg = ui.visuals().window_fill;
-                // A 12px dot: paint_status places it relative to an avatar, so derive a
-                // fake avatar center that puts the dot at `dot`.
-                let d = 34.0;
-                let r = (d * 0.16f32).max(3.5);
-                let fake = dot - Vec2::splat(d * 0.5 - r * 0.9);
-                paint_status(ui, t, fake, d, bg, s, false);
-                ui.painter().text(
-                    Pos2::new(rect.left() + 30.0, rect.center().y),
-                    Align2::LEFT_CENTER,
-                    s.label(),
-                    prop(14.0),
-                    t.strong,
-                );
-                if item.clicked() {
-                    picked = Some(s);
+            render_status_menu_contents(
+                ui,
+                t,
+                &app.media,
+                current,
+                custom_label.as_deref(),
+                &mut action,
+            );
+        });
+
+    if let Some(act) = action {
+        match act {
+            PresenceAction::SetStatus(s) => {
+                if s != current {
+                    app.presence_action(PresenceAction::SetStatus(s));
                 }
             }
-        });
-    if let Some(s) = picked {
-        if s != current {
-            app.presence_action(PresenceAction::SetStatus(s));
+            other => app.presence_action(other),
         }
         egui::Popup::close_all(&resp.ctx);
+    }
+}
+
+fn render_status_menu_contents(
+    ui: &mut Ui,
+    t: &Theme,
+    media: &RefCell<Media>,
+    current: Status,
+    custom_label: Option<&str>,
+    action: &mut Option<PresenceAction>,
+) {
+    for s in [Status::Online, Status::Idle, Status::Dnd, Status::Invisible] {
+        let (rect, item) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
+        if item.hovered() || s == current {
+            ui.painter().rect_filled(
+                rect,
+                CornerRadius::same(4),
+                if item.hovered() { t.hover } else { t.selected },
+            );
+        }
+        let dot = Pos2::new(rect.left() + 14.0, rect.center().y);
+        let bg = ui.visuals().window_fill;
+        // A 12px dot: paint_status places it relative to an avatar, so derive a
+        // fake avatar center that puts the dot at `dot`.
+        let d = 34.0;
+        let r = (d * 0.16f32).max(3.5);
+        let fake = dot - Vec2::splat(d * 0.5 - r * 0.9);
+        paint_status(ui, t, fake, d, bg, s, false);
+        ui.painter().text(
+            Pos2::new(rect.left() + 30.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            s.label(),
+            prop(14.0),
+            t.strong,
+        );
+        if item.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+            *action = Some(PresenceAction::SetStatus(s));
+        }
+    }
+
+    ui.add_space(4.0);
+    let (sep_rect, _) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+    hline(ui, sep_rect, sep_rect.center().y, t.divider);
+    ui.add_space(4.0);
+
+    if let Some(label) = custom_label {
+        // Current custom status preview row + quick Clear pill on the right.
+        let (row_rect, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::hover());
+        let clear_w = 44.0;
+        let clear_rect = Rect::from_min_max(
+            Pos2::new(row_rect.right() - clear_w - 4.0, row_rect.top() + 3.0),
+            Pos2::new(row_rect.right() - 4.0, row_rect.bottom() - 3.0),
+        );
+        let preview_rect = Rect::from_min_max(
+            row_rect.min,
+            Pos2::new(clear_rect.left() - 4.0, row_rect.bottom()),
+        );
+        let preview_resp = ui.interact(
+            preview_rect,
+            ui.scope_id().with("custom_status_preview"),
+            Sense::click(),
+        );
+        if preview_resp.hovered() {
+            ui.painter()
+                .rect_filled(preview_rect, CornerRadius::same(4), t.hover);
+        }
+        let clip = preview_rect
+            .shrink2(Vec2::new(8.0, 0.0))
+            .intersect(ui.clip_rect());
+        let p = ui.painter().with_clip_rect(clip);
+        let g = super::emoji_text::layout(&p, label, prop(12.5), t.muted, clip.width(), 1);
+        g.paint(
+            &p,
+            Pos2::new(clip.left(), preview_rect.center().y - g.size().y / 2.0),
+            media,
+        );
+        if preview_resp
+            .on_hover_cursor(CursorIcon::PointingHand)
+            .clicked()
+        {
+            *action = Some(PresenceAction::OpenCustomStatusModal);
+        }
+
+        let clear_resp = ui.interact(
+            clear_rect,
+            ui.scope_id().with("custom_status_clear"),
+            Sense::click(),
+        );
+        let clear_fill = if clear_resp.hovered() {
+            t.hover
+        } else {
+            Color32::TRANSPARENT
+        };
+        ui.painter().rect(
+            clear_rect,
+            CornerRadius::same(4),
+            clear_fill,
+            Stroke::new(1.0, t.divider),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().text(
+            clear_rect.center(),
+            Align2::CENTER_CENTER,
+            "Clear",
+            prop(11.5),
+            if clear_resp.hovered() {
+                t.strong
+            } else {
+                t.muted
+            },
+        );
+        if clear_resp
+            .on_hover_cursor(CursorIcon::PointingHand)
+            .on_hover_text("Clear custom status")
+            .clicked()
+        {
+            *action = Some(PresenceAction::SetCustomStatus(None));
+        }
+    }
+
+    let edit_label = if custom_label.is_some() {
+        "Edit Custom Status"
+    } else {
+        "Set Custom Status"
+    };
+    let (rect, item) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
+    if item.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(4), t.hover);
+    }
+    let icon_rect = Rect::from_center_size(
+        Pos2::new(rect.left() + 14.0, rect.center().y),
+        Vec2::splat(18.0),
+    );
+    paint_icon(
+        ui,
+        Icon::Smile,
+        icon_rect,
+        if item.hovered() { t.strong } else { t.muted },
+    );
+    ui.painter().text(
+        Pos2::new(rect.left() + 30.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        edit_label,
+        prop(14.0),
+        t.strong,
+    );
+    if item.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+        *action = Some(PresenceAction::OpenCustomStatusModal);
     }
 }
 
@@ -490,4 +985,83 @@ pub fn member_row(
         });
     }
     resp.on_hover_cursor(CursorIcon::PointingHand);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme;
+
+    #[test]
+    fn custom_status_modal_roundtrips_and_normalizes() {
+        let m = CustomStatusModal::from_current(None);
+        assert!(m.text.is_empty());
+        assert!(m.emoji.is_none());
+        assert!(m.focus_text);
+        assert!(m.to_custom_status().is_none());
+
+        let existing = CustomStatus {
+            text: Some("  reviewing PRs  ".into()),
+            emoji: Some(Emoji {
+                id: None,
+                name: Some(" 🦀 ".into()),
+                animated: false,
+            }),
+        };
+        let mut m = CustomStatusModal::from_current(Some(&existing));
+        assert_eq!(m.text, "  reviewing PRs  ");
+        assert_eq!(m.emoji.as_deref(), Some("🦀"));
+
+        let norm = m.to_custom_status().unwrap();
+        assert_eq!(norm.text.as_deref(), Some("reviewing PRs"));
+        assert_eq!(
+            norm.emoji.as_ref().and_then(|e| e.name.as_deref()),
+            Some("🦀")
+        );
+        assert_eq!(norm.label().as_deref(), Some("🦀 reviewing PRs"));
+
+        // Over-limit text is clamped to MAX_CUSTOM_STATUS_CHARS (128).
+        m.text = "x".repeat(200);
+        m.emoji = None;
+        let clamped = m.to_custom_status().unwrap();
+        assert_eq!(
+            clamped.text.as_deref().unwrap().chars().count(),
+            MAX_CUSTOM_STATUS_CHARS
+        );
+
+        // Whitespace-only without emoji normalizes to None.
+        m.text = "   \t  ".into();
+        assert!(m.to_custom_status().is_none());
+    }
+
+    #[test]
+    fn status_menu_and_custom_status_modal_render_headlessly() {
+        let ctx = egui::Context::default();
+        let t = theme::by_name(theme::DEFAULT_THEME);
+        let media = RefCell::new(Media::new(&ctx, true));
+        let mut modal = CustomStatusModal {
+            text: "working on nixcord".into(),
+            emoji: Some("🦀".into()),
+            focus_text: true,
+        };
+
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let mut act = None;
+                render_status_menu_contents(ui, t, &media, Status::Online, None, &mut act);
+                render_status_menu_contents(
+                    ui,
+                    t,
+                    &media,
+                    Status::Dnd,
+                    Some("🦀 working on nixcord"),
+                    &mut act,
+                );
+                let outcome = render_custom_status_modal(ui.ctx(), t, &media, true, &mut modal);
+                assert_eq!(outcome, ModalOutcome::Open);
+            });
+            out.textures_delta.clear();
+        }
+        assert!(!modal.focus_text, "focus requested on first frame");
+    }
 }
