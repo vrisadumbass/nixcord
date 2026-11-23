@@ -131,6 +131,18 @@ pub fn builtin() -> &'static [Theme] {
                 0xf2f3f5,
                 0x00a8fc,
             )),
+            onyx(s(
+                "Onyx",
+                (0x000000, 0x000000),
+                0x000000,
+                (255, 255, 255),
+                0x111214,
+                0x5865f2,
+                0xdbdee1,
+                0x949ba4,
+                0xf2f3f5,
+                0x00a8fc,
+            )),
             s(
                 "Midnight",
                 (0x0d1024, 0x1e2347),
@@ -400,6 +412,20 @@ fn graphite(mut t: Theme) -> Theme {
 
 /// Pure black with hairline borders, like the official client's darkest theme.
 fn amoled(mut t: Theme) -> Theme {
+    t.hover = hex(0x121213);
+    t.selected = hex(0x242426);
+    t.divider = hex(0x1e1e20);
+    t
+}
+
+/// Pure black everywhere, like the official client's darkest theme (hairline borders,
+/// faintly lifted input and selection).
+fn onyx(mut t: Theme) -> Theme {
+    t.rail = hex(0x000000);
+    t.sidebar = hex(0x0a0a0b);
+    t.chat = hex(0x000000);
+    t.header = hex(0x000000);
+    t.elevated = hex(0x111214);
     t.hover = hex(0x121213);
     t.selected = hex(0x242426);
     t.divider = hex(0x1e1e20);

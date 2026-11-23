@@ -547,3 +547,448 @@ fn message_clears_typing_for_author() {
     // Other channel unaffected.
     assert_eq!(s.typing(sf(20), now), vec![sf(3)]);
 }
+
+// ---- reactions ----------------------------------------------------------------------
+
+fn uni(name: &str) -> nixcord_model::Emoji {
+    nixcord_model::Emoji {
+        id: None,
+        name: Some(name.into()),
+        animated: false,
+    }
+}
+
+fn custom(id: u64, name: &str) -> nixcord_model::Emoji {
+    nixcord_model::Emoji {
+        id: Some(sf(id)),
+        name: Some(name.into()),
+        animated: false,
+    }
+}
+
+fn react(add: bool, msg_id: u64, user: u64, emoji: nixcord_model::Emoji) -> GatewayEvent {
+    if add {
+        GatewayEvent::ReactionAdd {
+            channel_id: sf(10),
+            message_id: sf(msg_id),
+            user_id: sf(user),
+            emoji,
+        }
+    } else {
+        GatewayEvent::ReactionRemove {
+            channel_id: sf(10),
+            message_id: sf(msg_id),
+            user_id: sf(user),
+            emoji,
+        }
+    }
+}
+
+fn reactions(s: &Store, id: u64) -> Vec<(Option<String>, u32, bool)> {
+    s.messages(sf(10))
+        .iter()
+        .find(|m| m.id == sf(id))
+        .unwrap()
+        .reactions
+        .iter()
+        .map(|r| (r.emoji.name.clone(), r.count, r.me))
+        .collect()
+}
+
+#[test]
+fn reaction_add_and_remove_counts() {
+    let mut s = basic();
+    s.insert_history(sf(10), vec![msg(5, 10, 3)]);
+    s.apply(&react(true, 5, 3, uni("a")));
+    s.apply(&react(true, 5, 4, uni("a")));
+    s.apply(&react(true, 5, 3, uni("b")));
+    assert_eq!(
+        reactions(&s, 5),
+        vec![(Some("a".into()), 2, false), (Some("b".into()), 1, false)]
+    );
+    s.apply(&react(false, 5, 3, uni("a")));
+    assert_eq!(reactions(&s, 5)[0], (Some("a".into()), 1, false));
+    // Count 0 removes the reaction entirely.
+    s.apply(&react(false, 5, 3, uni("b")));
+    assert_eq!(reactions(&s, 5), vec![(Some("a".into()), 1, false)]);
+    // Removing a reaction that does not exist is a no-op.
+    s.apply(&react(false, 5, 3, uni("zzz")));
+    assert_eq!(reactions(&s, 5).len(), 1);
+    // Unknown message / channel: ignored, no panic.
+    s.apply(&react(true, 999, 3, uni("a")));
+    s.apply(&GatewayEvent::ReactionAdd {
+        channel_id: sf(12345),
+        message_id: sf(5),
+        user_id: sf(3),
+        emoji: uni("a"),
+    });
+}
+
+#[test]
+fn reaction_me_flag_and_idempotence() {
+    let mut s = basic(); // me = 1
+    s.insert_history(sf(10), vec![msg(5, 10, 3)]);
+    s.apply(&react(true, 5, 1, uni("a")));
+    assert_eq!(reactions(&s, 5), vec![(Some("a".into()), 1, true)]);
+    // Echo of our own add (optimistic + gateway) does not double count.
+    s.apply(&react(true, 5, 1, uni("a")));
+    assert_eq!(reactions(&s, 5), vec![(Some("a".into()), 1, true)]);
+    s.apply(&react(true, 5, 2, uni("a")));
+    assert_eq!(reactions(&s, 5), vec![(Some("a".into()), 2, true)]);
+    s.apply(&react(false, 5, 1, uni("a")));
+    assert_eq!(reactions(&s, 5), vec![(Some("a".into()), 1, false)]);
+    // Duplicate removal of ours is a no-op.
+    s.apply(&react(false, 5, 1, uni("a")));
+    assert_eq!(reactions(&s, 5), vec![(Some("a".into()), 1, false)]);
+}
+
+#[test]
+fn custom_emoji_reactions_match_by_id() {
+    let mut s = basic();
+    s.insert_history(sf(10), vec![msg(5, 10, 3)]);
+    s.apply(&react(true, 5, 3, custom(77, "blob")));
+    // Same id, renamed emoji: same reaction.
+    s.apply(&react(true, 5, 4, custom(77, "blob_renamed")));
+    // Unicode with the same name is a different reaction.
+    s.apply(&react(true, 5, 4, uni("blob")));
+    assert_eq!(
+        reactions(&s, 5),
+        vec![
+            (Some("blob".into()), 2, false),
+            (Some("blob".into()), 1, false)
+        ]
+    );
+    s.apply(&react(false, 5, 3, custom(77, "x")));
+    s.apply(&react(false, 5, 4, custom(77, "x")));
+    assert_eq!(reactions(&s, 5), vec![(Some("blob".into()), 1, false)]);
+}
+
+// ---- members, colors, nicks ---------------------------------------------------------
+
+fn role(id: u64, color: u32, position: i32) -> nixcord_model::Role {
+    nixcord_model::Role {
+        id: sf(id),
+        name: format!("r{id}"),
+        color,
+        position,
+    }
+}
+
+fn member_msg(id: u64, author: u64, roles: &[u64], nick: Option<&str>) -> Message {
+    Message {
+        member: Some(nixcord_model::PartialMember {
+            roles: roles.iter().copied().map(sf).collect(),
+            nick: nick.map(Into::into),
+            avatar: None,
+        }),
+        ..msg(id, 10, author)
+    }
+}
+
+/// me=1, guild 100 (channel 10) with roles: 500 red pos 1, 501 green pos 5,
+/// 502 uncolored pos 9, 503 blue pos 5 (ties 501 on position, higher id).
+fn with_roles() -> Store {
+    let mut g = guild(100, vec![chan(10, ChannelKind::Text, None, None, 0)]);
+    g.roles = vec![
+        role(500, 0xFF0000, 1),
+        role(501, 0x00FF00, 5),
+        role(502, 0, 9),
+        role(503, 0x0000FF, 5),
+    ];
+    let mut s = Store::new();
+    s.apply(&ready(1, vec![g], vec![]));
+    s
+}
+
+#[test]
+fn member_color_highest_colored_role() {
+    let mut s = with_roles();
+    // REST history: no guild_id on the message; the guild comes from the channel.
+    s.insert_history(
+        sf(10),
+        vec![
+            member_msg(1, 3, &[500, 502], Some("Nick")),
+            member_msg(2, 4, &[502], None),
+            member_msg(3, 5, &[500, 501, 503], Some("")),
+        ],
+    );
+    // 502 is higher but uncolored, so 500 wins.
+    assert_eq!(s.member_color(sf(100), sf(3)), Some(0xFF0000));
+    // Only uncolored roles.
+    assert_eq!(s.member_color(sf(100), sf(4)), None);
+    // Tie on position 5: the lower id (501) ranks higher.
+    assert_eq!(s.member_color(sf(100), sf(5)), Some(0x00FF00));
+    // Unknown member / guild.
+    assert_eq!(s.member_color(sf(100), sf(99)), None);
+    assert_eq!(s.member_color(sf(999), sf(3)), None);
+
+    assert_eq!(s.member_nick(sf(100), sf(3)), Some("Nick"));
+    assert_eq!(s.member_nick(sf(100), sf(4)), None);
+    assert_eq!(s.member_nick(sf(100), sf(5)), None, "empty nick ignored");
+
+    // A live message updates the cached member.
+    let mut m = member_msg(10, 3, &[501], Some("New"));
+    m.guild_id = Some(sf(100));
+    s.apply(&GatewayEvent::MessageCreate(Box::new(m)));
+    assert_eq!(s.member_color(sf(100), sf(3)), Some(0x00FF00));
+    assert_eq!(s.member_nick(sf(100), sf(3)), Some("New"));
+}
+
+#[test]
+fn members_dropped_with_guild_but_not_on_outage() {
+    let mut s = with_roles();
+    s.insert_history(sf(10), vec![member_msg(1, 3, &[500], Some("N"))]);
+    s.apply(&GatewayEvent::GuildDelete {
+        id: sf(100),
+        unavailable: true,
+    });
+    assert_eq!(s.member_nick(sf(100), sf(3)), Some("N"));
+    s.apply(&GatewayEvent::GuildDelete {
+        id: sf(100),
+        unavailable: false,
+    });
+    assert_eq!(s.member_nick(sf(100), sf(3)), None);
+}
+
+// ---- guild outage -------------------------------------------------------------------
+
+#[test]
+fn guild_delete_unavailable_keeps_guild_then_create_restores() {
+    let mut s = basic();
+    s.insert_history(sf(10), vec![msg(5, 10, 3)]);
+    s.apply(&GatewayEvent::GuildDelete {
+        id: sf(100),
+        unavailable: true,
+    });
+    let g = s.guild(sf(100)).unwrap();
+    assert!(g.unavailable);
+    assert_eq!(g.name, "g100");
+    assert_eq!(s.guilds().len(), 1);
+    assert_eq!(chan_ids(&s.guild_channels(sf(100))), vec![10]);
+    assert_eq!(ids(s.messages(sf(10))), vec![5]);
+    assert!(s.history_loaded(sf(10)));
+
+    s.apply(&GatewayEvent::GuildCreate(Box::new(guild(
+        100,
+        vec![chan(10, ChannelKind::Text, None, None, 0)],
+    ))));
+    assert!(!s.guild(sf(100)).unwrap().unavailable);
+    assert_eq!(s.guilds().len(), 1, "not duplicated in order");
+    assert_eq!(
+        ids(s.messages(sf(10))),
+        vec![5],
+        "same channel keeps messages"
+    );
+
+    // Outage for an unknown guild is ignored.
+    s.apply(&GatewayEvent::GuildDelete {
+        id: sf(4242),
+        unavailable: true,
+    });
+    assert!(s.guild(sf(4242)).is_none());
+}
+
+// ---- message update: embeds / mentions ----------------------------------------------
+
+#[test]
+fn message_update_embeds_and_mentions() {
+    let mut s = basic();
+    let mut original = msg(5, 10, 3);
+    original.embeds = vec![nixcord_model::Embed {
+        title: Some("old".into()),
+        ..Default::default()
+    }];
+    original.mentions = vec![user(4)];
+    s.insert_history(sf(10), vec![original]);
+
+    // Absent fields leave existing ones alone.
+    s.apply(&GatewayEvent::MessageUpdate(Box::new(MessageUpdate {
+        id: sf(5),
+        channel_id: sf(10),
+        content: Some("edited".into()),
+        ..Default::default()
+    })));
+    let m = &s.messages(sf(10))[0];
+    assert_eq!(m.embeds[0].title.as_deref(), Some("old"));
+    assert_eq!(m.mentions.len(), 1);
+
+    // Embed unfurl after send: embeds replaced; new mentions cached as users.
+    let mut new_user = user(8);
+    new_user.global_name = Some("Eight".into());
+    s.apply(&GatewayEvent::MessageUpdate(Box::new(MessageUpdate {
+        id: sf(5),
+        channel_id: sf(10),
+        embeds: Some(vec![nixcord_model::Embed {
+            title: Some("new".into()),
+            ..Default::default()
+        }]),
+        mentions: Some(vec![new_user]),
+        ..Default::default()
+    })));
+    let m = &s.messages(sf(10))[0];
+    assert_eq!(m.content, "edited");
+    assert_eq!(m.embeds.len(), 1);
+    assert_eq!(m.embeds[0].title.as_deref(), Some("new"));
+    assert_eq!(
+        m.mentions.iter().map(|u| u.id.0).collect::<Vec<_>>(),
+        vec![8]
+    );
+    assert_eq!(s.user(sf(8)).unwrap().display_name(), "Eight");
+
+    // Empty embeds clears them.
+    s.apply(&GatewayEvent::MessageUpdate(Box::new(MessageUpdate {
+        id: sf(5),
+        channel_id: sf(10),
+        embeds: Some(vec![]),
+        ..Default::default()
+    })));
+    assert!(s.messages(sf(10))[0].embeds.is_empty());
+}
+
+// ---- mentions -----------------------------------------------------------------------
+
+#[test]
+fn is_mentioned_direct_everyone_and_roles() {
+    let mut s = with_roles(); // me = 1
+    let plain = msg(5, 10, 3);
+    assert!(!s.is_mentioned(&plain));
+
+    let mut direct = msg(6, 10, 3);
+    direct.mentions = vec![user(4), user(1)];
+    assert!(s.is_mentioned(&direct));
+
+    let mut other = msg(7, 10, 3);
+    other.mentions = vec![user(4)];
+    assert!(!s.is_mentioned(&other));
+
+    let mut everyone = msg(8, 10, 3);
+    everyone.mention_everyone = true;
+    assert!(s.is_mentioned(&everyone));
+
+    let mut role_ping = msg(9, 10, 3);
+    role_ping.mention_roles = vec![sf(501)];
+    // My roles are unknown until I have posted in the guild.
+    assert!(!s.is_mentioned(&role_ping));
+    s.insert_history(sf(10), vec![member_msg(2, 1, &[500, 501], None)]);
+    assert!(s.is_mentioned(&role_ping));
+    role_ping.mention_roles = vec![sf(503)];
+    assert!(!s.is_mentioned(&role_ping));
+
+    // No `me` (before READY): never mentioned.
+    let s = Store::new();
+    assert!(!s.is_mentioned(&direct));
+}
+
+// ---- sliding window / detached ------------------------------------------------------
+
+#[test]
+fn older_history_slides_window_and_detaches() {
+    let mut s = basic();
+    let max = MAX_MESSAGES_PER_CHANNEL as u64;
+    // Newest page fills the cap: ids 1001..=1000+max.
+    s.insert_history(sf(10), (1001..=1000 + max).map(|i| msg(i, 10, 3)).collect());
+    assert!(!s.is_detached(sf(10)));
+
+    // An older page of 50: the newest 50 are evicted.
+    s.insert_older_history(sf(10), (951..=1000).rev().map(|i| msg(i, 10, 3)).collect());
+    let got = ids(s.messages(sf(10)));
+    assert_eq!(got.len(), MAX_MESSAGES_PER_CHANNEL);
+    assert_eq!(got[0], 951);
+    assert_eq!(*got.last().unwrap(), 950 + max);
+    assert!(got.windows(2).all(|w| w[0] < w[1]));
+    assert!(s.is_detached(sf(10)));
+
+    // Live messages are not appended while detached (but still bump last_message_id).
+    s.apply(&GatewayEvent::MessageCreate(Box::new(msg(5000, 10, 3))));
+    assert_eq!(*ids(s.messages(sf(10))).last().unwrap(), 950 + max);
+    assert_eq!(s.channel(sf(10)).unwrap().last_message_id, Some(sf(5000)));
+
+    // Deletes still apply to what is in the window.
+    s.apply(&GatewayEvent::MessageDelete {
+        id: sf(951),
+        channel_id: sf(10),
+    });
+    assert_eq!(ids(s.messages(sf(10)))[0], 952);
+
+    // Jump to present: window dropped, history unloaded, re-attached.
+    s.jump_to_present(sf(10));
+    assert!(!s.is_detached(sf(10)));
+    assert!(!s.history_loaded(sf(10)));
+    assert!(s.messages(sf(10)).is_empty());
+    s.insert_history(sf(10), vec![msg(4999, 10, 3), msg(5000, 10, 3)]);
+    s.apply(&GatewayEvent::MessageCreate(Box::new(msg(5001, 10, 3))));
+    assert_eq!(ids(s.messages(sf(10))), vec![4999, 5000, 5001]);
+}
+
+#[test]
+fn older_history_under_cap_does_not_detach() {
+    let mut s = basic();
+    s.insert_history(sf(10), vec![msg(100, 10, 3), msg(101, 10, 3)]);
+    s.insert_older_history(
+        sf(10),
+        vec![msg(99, 10, 3), msg(98, 10, 3), msg(100, 10, 3)],
+    );
+    assert_eq!(ids(s.messages(sf(10))), vec![98, 99, 100, 101]);
+    assert!(!s.is_detached(sf(10)));
+    s.apply(&GatewayEvent::MessageCreate(Box::new(msg(102, 10, 3))));
+    assert_eq!(*ids(s.messages(sf(10))).last().unwrap(), 102);
+}
+
+#[test]
+fn newest_page_while_detached_reattaches() {
+    let mut s = basic();
+    let max = MAX_MESSAGES_PER_CHANNEL as u64;
+    s.insert_history(sf(10), (1001..=1000 + max).map(|i| msg(i, 10, 3)).collect());
+    s.insert_older_history(sf(10), vec![msg(1, 10, 3)]);
+    assert!(s.is_detached(sf(10)));
+    // A fresh newest page replaces the detached window instead of merging into it.
+    s.insert_history(sf(10), vec![msg(9000, 10, 3), msg(9001, 10, 3)]);
+    assert!(!s.is_detached(sf(10)));
+    assert_eq!(ids(s.messages(sf(10))), vec![9000, 9001]);
+}
+
+#[test]
+fn detached_state_cleared_with_channel_and_ready() {
+    let mut s = basic();
+    let max = MAX_MESSAGES_PER_CHANNEL as u64;
+    s.insert_history(sf(10), (1001..=1000 + max).map(|i| msg(i, 10, 3)).collect());
+    s.insert_older_history(sf(10), vec![msg(1, 10, 3)]);
+    assert!(s.is_detached(sf(10)));
+    s.apply(&GatewayEvent::ChannelDelete(Box::new(chan(
+        10,
+        ChannelKind::Text,
+        Some(100),
+        None,
+        0,
+    ))));
+    assert!(!s.is_detached(sf(10)));
+
+    let mut s = basic();
+    s.insert_history(sf(10), (1001..=1000 + max).map(|i| msg(i, 10, 3)).collect());
+    s.insert_older_history(sf(10), vec![msg(1, 10, 3)]);
+    s.apply(&ready(1, vec![], vec![]));
+    assert!(!s.is_detached(sf(10)));
+}
+
+#[test]
+fn member_top_role_ignores_color() {
+    let mut s = with_roles();
+    s.insert_history(
+        sf(10),
+        vec![
+            member_msg(1, 3, &[500, 502], None),
+            member_msg(2, 5, &[501, 503], None),
+        ],
+    );
+    // 502 is uncolored but has the highest position.
+    assert_eq!(
+        s.member_top_role(sf(100), sf(3)).map(|r| r.id),
+        Some(sf(502))
+    );
+    // Tie on position 5: the lower id wins.
+    assert_eq!(
+        s.member_top_role(sf(100), sf(5)).map(|r| r.id),
+        Some(sf(501))
+    );
+    assert!(s.member_top_role(sf(100), sf(99)).is_none());
+}

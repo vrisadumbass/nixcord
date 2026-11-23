@@ -54,7 +54,7 @@ pub async fn run(
 ) -> Result<(), GatewayError> {
     // tokio-tungstenite's rustls config needs a process-default crypto provider.
     // Err just means one is already installed.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let emit = |ev: GatewayEvent| events.send(ev).map_err(|_| GatewayError::ReceiverClosed);
     let mut session = Session::new();

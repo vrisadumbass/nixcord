@@ -14,6 +14,7 @@ thiserror.workspace = true
 tracing.workspace = true
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
-# tokio-tungstenite builds rustls with no crypto provider; pick `ring` (no cmake/nasm needed
-# on Windows) and install it as the process default at startup.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# tokio-tungstenite builds rustls with no crypto provider. Use aws-lc-rs, the same provider
+# reqwest's `rustls` feature uses, so only one crypto backend is compiled; it is installed
+# as the process default at startup.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }

@@ -1,0 +1,13 @@
+[package]
+name = "nixcord-media"
+description = "Image fetching, decoding and caching for nixcord"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+# Same TLS stack as nixcord-http, so only one crypto backend gets compiled.
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "gif"] }

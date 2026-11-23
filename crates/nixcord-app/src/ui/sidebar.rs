@@ -1,15 +1,15 @@
 //! Guild rail, channel column (guild channels or DM list) and the user panel.
 
 use super::{
-    bold, icon_button, initials, paint_avatar, paint_chevron, paint_plus, paint_search,
-    paint_status_dot, prop, Action, Icon,
+    bold, icon_button, initials, paint_chevron, paint_plus, paint_search, paint_status_dot, prop,
+    Action, Icon,
 };
 use crate::app::NixApp;
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, Pos2, Rect, RichText, Sense,
     Stroke, Ui, Vec2,
 };
-use nixcord_model::{Channel, ChannelKind, Snowflake};
+use nixcord_model::{Channel, ChannelKind, Guild, Snowflake};
 use nixcord_store::ConnectionState;
 
 // ---- guild rail ---------------------------------------------------------------------
@@ -44,7 +44,7 @@ pub fn rail(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
     ui.vertical_centered(|ui| {
         ui.add_space(12.0);
         let home_sel = app.view.guild.is_none();
-        if rail_item(ui, app, home_sel, "Direct Messages", "N").clicked() {
+        if rail_item(ui, app, home_sel, false, "Direct Messages", "N", None).clicked() {
             actions.push(Action::SelectHome);
         }
         ui.add_space(4.0);
@@ -59,18 +59,18 @@ pub fn rail(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
-                    let guilds: Vec<(Snowflake, String)> = app
-                        .store
-                        .guilds()
-                        .iter()
-                        .filter(|g| !g.unavailable)
-                        .map(|g| (g.id, g.name.clone()))
-                        .collect();
-                    for (id, name) in guilds {
-                        let sel = app.view.guild == Some(id);
-                        let label = initials(&name, 3);
-                        if rail_item(ui, app, sel, &name, &label).clicked() {
-                            actions.push(Action::SelectGuild(id));
+                    let app: &NixApp = app;
+                    for guild in app.store.guilds() {
+                        if guild.unavailable {
+                            continue;
+                        }
+                        let sel = app.view.guild == Some(guild.id);
+                        let unread = !sel && app.guild_unread(guild.id);
+                        let label = initials(&guild.name, 3);
+                        let resp =
+                            rail_item(ui, app, sel, unread, &guild.name, &label, Some(guild));
+                        if resp.clicked() {
+                            actions.push(Action::SelectGuild(guild.id));
                         }
                         ui.add_space(8.0);
                     }
@@ -79,45 +79,56 @@ pub fn rail(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
     });
 }
 
-/// One 48px rail icon (initials on a circle that rounds into a squircle when active)
-/// with the left-edge selection pill. Guild icon images slot in here later.
+/// One 48px rail icon (server icon, or initials on a circle) that rounds into a squircle
+/// when active, with the left-edge pill (selected / hovered / unread).
+#[allow(clippy::too_many_arguments)]
 fn rail_item(
     ui: &mut Ui,
     app: &NixApp,
     selected: bool,
+    unread: bool,
     tooltip: &str,
     text: &str,
+    guild: Option<&Guild>,
 ) -> egui::Response {
     let t = app.theme;
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(48.0), Sense::click());
     let hovered = resp.hovered();
     let active = selected || hovered;
-    let (fill, fg) = if selected {
-        (t.accent, t.on_accent)
-    } else if hovered {
-        (t.accent.gamma_multiply(0.85), t.on_accent)
-    } else {
-        (t.elevated, t.text)
-    };
     // Circle -> squircle morph, animated (egui only repaints while it runs).
     let k = ui
         .ctx()
         .animate_bool_with_time(resp.id.with("morph"), active, 0.12);
-    let radius = (24.0 - 8.0 * k).round() as u8;
-    ui.painter()
-        .rect_filled(rect, CornerRadius::same(radius), fill);
-    let size = match text.chars().count() {
-        0 | 1 => 20.0,
-        2 => 17.0,
-        _ => 14.0,
-    };
-    ui.painter()
-        .text(rect.center(), Align2::CENTER_CENTER, text, bold(size), fg);
+    let rounding = CornerRadius::same((24.0 - 8.0 * k).round() as u8);
+    let has_icon = guild.is_some_and(|g| {
+        app.media
+            .borrow_mut()
+            .paint_guild_icon(ui, rect, g, rounding)
+    });
+    if !has_icon {
+        let (fill, fg) = if selected {
+            (t.accent, t.on_accent)
+        } else if hovered {
+            (t.accent.gamma_multiply(0.85), t.on_accent)
+        } else {
+            (t.elevated, t.text)
+        };
+        ui.painter().rect_filled(rect, rounding, fill);
+        let size = match text.chars().count() {
+            0 | 1 => 20.0,
+            2 => 17.0,
+            _ => 14.0,
+        };
+        ui.painter()
+            .text(rect.center(), Align2::CENTER_CENTER, text, bold(size), fg);
+    }
     // Pill on the panel's left edge.
     let pill_h = if selected {
         40.0
     } else if hovered {
         20.0
+    } else if unread {
+        8.0
     } else {
         0.0
     };
@@ -187,7 +198,7 @@ pub fn column(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
             let field = header_rect.shrink2(Vec2::new(10.0, 10.0));
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(field));
             Frame::new()
-                .fill(Color32::from_black_alpha(70))
+                .fill(t.elevated)
                 .corner_radius(CornerRadius::same(4))
                 .inner_margin(Margin::symmetric(8, 3))
                 .show(&mut child, |ui| {
@@ -267,7 +278,6 @@ fn guild_channels(ui: &mut Ui, app: &NixApp, gid: Snowflake, actions: &mut Vec<A
         }
         channel_row(ui, app, ch, actions);
     }
-    let _ = t;
 }
 
 fn channel_row(ui: &mut Ui, app: &NixApp, ch: &Channel, actions: &mut Vec<Action>) {
@@ -292,13 +302,24 @@ fn channel_row(ui: &mut Ui, app: &NixApp, ch: &Channel, actions: &mut Vec<Action
         ui.painter()
             .rect_filled(rect, CornerRadius::same(4), t.hover);
     }
+    let unread = textual && !selected && app.is_unread(ch);
+    if unread {
+        // Small white pill on the column's left edge.
+        let dot = Rect::from_center_size(
+            Pos2::new(outer.left(), rect.center().y),
+            Vec2::new(8.0, 8.0),
+        );
+        ui.painter()
+            .rect_filled(dot, CornerRadius::same(4), t.strong);
+    }
     let color = if !textual {
         t.muted.gamma_multiply(0.55)
-    } else if selected || hovered {
+    } else if selected || hovered || unread {
         t.strong
     } else {
         t.muted
     };
+    let name_font = if unread { bold(15.5) } else { prop(15.5) };
     let glyph = channel_glyph(ch.kind);
     let glyph_font = if glyph == "#" { prop(21.0) } else { prop(15.0) };
     ui.painter().text(
@@ -312,7 +333,7 @@ fn channel_row(ui: &mut Ui, app: &NixApp, ch: &Channel, actions: &mut Vec<Action
         Pos2::new(rect.left() + 34.0, rect.top()),
         Pos2::new(rect.right() - 8.0, rect.bottom()),
     );
-    let galley = ui.painter().layout_no_wrap(ch.label(), prop(15.5), color);
+    let galley = ui.painter().layout_no_wrap(ch.label(), name_font, color);
     ui.painter()
         .with_clip_rect(text_rect.intersect(ui.clip_rect()))
         .galley(
@@ -368,7 +389,10 @@ fn dm_list(ui: &mut Ui, app: &NixApp, actions: &mut Vec<Action>) {
             .find(|u| Some(u.id) != me)
             .or(ch.recipients.first());
         match (ch.kind, other) {
-            (ChannelKind::Dm, Some(u)) => paint_avatar(ui, center, 32.0, u),
+            (ChannelKind::Dm, Some(u)) => app
+                .media
+                .borrow_mut()
+                .paint_avatar(ui, center, 32.0, u, None),
             _ => {
                 ui.painter()
                     .circle_filled(center, 16.0, super::id_color(ch.id));
@@ -381,7 +405,8 @@ fn dm_list(ui: &mut Ui, app: &NixApp, actions: &mut Vec<Action>) {
                 );
             }
         }
-        let color = if selected || hovered {
+        let unread = !selected && app.is_unread(ch);
+        let color = if selected || hovered || unread {
             t.strong
         } else {
             t.muted
@@ -392,7 +417,8 @@ fn dm_list(ui: &mut Ui, app: &NixApp, actions: &mut Vec<Action>) {
             Pos2::new(rect.right() - 6.0, rect.bottom()),
         )
         .intersect(ui.clip_rect());
-        let name = ui.painter().layout_no_wrap(label, prop(15.5), color);
+        let name_font = if unread { bold(15.5) } else { prop(15.5) };
+        let name = ui.painter().layout_no_wrap(label, name_font, color);
         if ch.kind == ChannelKind::GroupDm {
             let sub = ui.painter().layout_no_wrap(
                 format!("{} Members", ch.recipients.len() + 1),
@@ -476,8 +502,7 @@ fn user_panel(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
 
         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
             ui.add_space(4.0);
-            let (r, _) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::hover());
-            paint_avatar(ui, r.center(), 32.0, &me);
+            let r = app.media.borrow_mut().avatar(ui, &me, None, 32.0).rect;
             paint_status_dot(
                 ui,
                 r.center(),

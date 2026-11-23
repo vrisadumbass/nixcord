@@ -8,7 +8,7 @@
 
 use eframe::egui;
 use nixcord_http::{Http, HttpError};
-use nixcord_model::{GatewayEvent, Message, MessageUpdate, Snowflake, User};
+use nixcord_model::{Emoji, GatewayEvent, Message, MessageUpdate, Snowflake, User};
 use std::sync::mpsc as std_mpsc;
 use tokio::sync::{mpsc, watch};
 
@@ -19,9 +19,17 @@ pub const HISTORY_PAGE: u8 = 50;
 #[derive(Debug)]
 pub enum AppEvent {
     Gateway(GatewayEvent),
+    /// A history page. `before` echoes the request: `None` is the newest page
+    /// (`Store::insert_history`), `Some` an older page (`Store::insert_older_history`).
     History {
         channel: Snowflake,
+        before: Option<Snowflake>,
         messages: Vec<Message>,
+    },
+    /// Loading history for this channel failed (only this channel should offer Retry).
+    HistoryFailed {
+        channel: Snowflake,
+        error: String,
     },
     /// Our own message was accepted by the server.
     Sent(Box<Message>),
@@ -49,6 +57,20 @@ pub enum Command {
     Send {
         channel: Snowflake,
         content: String,
+        /// Send as a reply to this message (pings its author).
+        reply_to: Option<Snowflake>,
+    },
+    /// Add my reaction. The store update arrives as a gateway MESSAGE_REACTION_ADD.
+    React {
+        channel: Snowflake,
+        message: Snowflake,
+        emoji: Emoji,
+    },
+    /// Remove my reaction. The store update arrives as MESSAGE_REACTION_REMOVE.
+    Unreact {
+        channel: Snowflake,
+        message: Snowflake,
+        emoji: Emoji,
     },
     Edit {
         channel: Snowflake,
@@ -158,7 +180,13 @@ async fn worker(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx)
             }
             cmd => {
                 let Some(s) = &session else {
-                    events.send(AppEvent::Error("not logged in".into()));
+                    let error = "not logged in".to_string();
+                    match cmd {
+                        Command::LoadHistory { channel, .. } => {
+                            events.send(AppEvent::HistoryFailed { channel, error })
+                        }
+                        _ => events.send(AppEvent::Error(error)),
+                    }
                     continue;
                 };
                 tokio::spawn(rest(s.http.clone(), cmd, events.clone()));
@@ -206,15 +234,44 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
     match cmd {
         Command::LoadHistory { channel, before } => {
             match http.messages(channel, before, HISTORY_PAGE).await {
-                Ok(messages) => events.send(AppEvent::History { channel, messages }),
-                Err(e) => events.send(AppEvent::Error(format!("Couldn't load messages: {e}"))),
+                Ok(messages) => events.send(AppEvent::History {
+                    channel,
+                    before,
+                    messages,
+                }),
+                Err(e) => events.send(AppEvent::HistoryFailed {
+                    channel,
+                    error: format!("Couldn't load messages: {e}"),
+                }),
             }
         }
-        Command::Send { channel, content } => match http.send_message(channel, &content).await {
+        Command::Send {
+            channel,
+            content,
+            reply_to,
+        } => match http.send_message(channel, &content, reply_to).await {
             Ok(m) => events.send(AppEvent::Sent(Box::new(m))),
             Err(HttpError::Forbidden) => events.send(AppEvent::Forbidden { channel }),
             Err(e) => events.send(AppEvent::Error(format!("Couldn't send: {e}"))),
         },
+        Command::React {
+            channel,
+            message,
+            emoji,
+        } => {
+            if let Err(e) = http.add_reaction(channel, message, &emoji).await {
+                events.send(AppEvent::Error(format!("Couldn't add reaction: {e}")));
+            }
+        }
+        Command::Unreact {
+            channel,
+            message,
+            emoji,
+        } => {
+            if let Err(e) = http.remove_own_reaction(channel, message, &emoji).await {
+                events.send(AppEvent::Error(format!("Couldn't remove reaction: {e}")));
+            }
+        }
         Command::Edit {
             channel,
             message,

@@ -7,6 +7,7 @@
 pub mod chat;
 pub mod composer;
 pub mod login;
+pub mod markdown;
 pub mod settings;
 pub mod sidebar;
 
@@ -39,7 +40,20 @@ pub enum Action {
     Send {
         channel: Snowflake,
         content: String,
+        reply_to: Option<Snowflake>,
     },
+    React {
+        channel: Snowflake,
+        message: Snowflake,
+        emoji: nixcord_model::Emoji,
+    },
+    Unreact {
+        channel: Snowflake,
+        message: Snowflake,
+        emoji: nixcord_model::Emoji,
+    },
+    /// Leave a scrolled-back (detached) window and reload the newest messages.
+    JumpToPresent(Snowflake),
     Edit {
         channel: Snowflake,
         message: Snowflake,
@@ -85,12 +99,38 @@ pub fn id_color(id: Snowflake) -> Color32 {
     Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
 }
 
-/// Color of the member's highest colored role in `guild`.
-///
-/// Returns `None` until the model carries guild member roles on messages (planned); callers
-/// then fall back to the theme's default name color.
-pub fn role_color(_store: &Store, _guild: Option<Snowflake>, _user: Snowflake) -> Option<Color32> {
-    None
+/// Color of the member's highest colored role in `guild` (`None`: use the default color).
+pub fn role_color(store: &Store, guild: Option<Snowflake>, user: Snowflake) -> Option<Color32> {
+    let c = store.member_color(guild?, user)?;
+    Some(Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8))
+}
+
+/// Name to show for `user` in `guild`: the guild nickname if known, else the display name.
+pub fn member_name<'a>(store: &'a Store, guild: Option<Snowflake>, user: &'a User) -> &'a str {
+    guild
+        .and_then(|g| store.member_nick(g, user.id))
+        .unwrap_or_else(|| user.display_name())
+}
+
+/// Blurple "APP" badge after bot names. Returns the badge width.
+pub fn paint_app_badge(ui: &Ui, left_center: Pos2) -> f32 {
+    let rect = Rect::from_min_size(
+        Pos2::new(left_center.x, left_center.y - 8.0),
+        Vec2::new(30.0, 16.0),
+    );
+    ui.painter().rect_filled(
+        rect,
+        CornerRadius::same(4),
+        Color32::from_rgb(0x58, 0x65, 0xf2),
+    );
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        "APP",
+        bold(10.0),
+        Color32::WHITE,
+    );
+    rect.width()
 }
 
 // ---- painting helpers ---------------------------------------------------------------
@@ -197,6 +237,8 @@ pub enum Icon {
     Gear,
     Members,
     Copy,
+    Smile,
+    File,
     Glyph(&'static str),
 }
 
@@ -248,6 +290,37 @@ pub fn paint_icon(ui: &Ui, icon: Icon, rect: Rect, color: Color32) {
                 );
             }
             p.circle_stroke(c, s * 0.27, Stroke::new(s * 0.2, color));
+        }
+        Icon::Smile => {
+            p.circle_stroke(c, s * 0.45, Stroke::new(1.6, color));
+            p.circle_filled(c + Vec2::new(-s * 0.16, -s * 0.12), s * 0.07, color);
+            p.circle_filled(c + Vec2::new(s * 0.16, -s * 0.12), s * 0.07, color);
+            let arc: Vec<Pos2> = (0..=8)
+                .map(|i| {
+                    let a = std::f32::consts::PI * (0.15 + 0.7 * i as f32 / 8.0);
+                    c + Vec2::new(-a.cos() * s * 0.25, a.sin() * s * 0.25 + s * 0.02)
+                })
+                .collect();
+            p.add(egui::Shape::line(arc, Stroke::new(1.6, color)));
+        }
+        Icon::File => {
+            let r = Rect::from_center_size(c, Vec2::new(s * 0.75, s * 0.95));
+            p.rect_stroke(
+                r,
+                CornerRadius::same(3),
+                Stroke::new(1.6, color),
+                egui::StrokeKind::Middle,
+            );
+            for k in 0..3 {
+                let y = r.top() + r.height() * (0.35 + 0.18 * k as f32);
+                p.line_segment(
+                    [
+                        Pos2::new(r.left() + s * 0.15, y),
+                        Pos2::new(r.right() - s * 0.15, y),
+                    ],
+                    Stroke::new(1.2, color),
+                );
+            }
         }
         Icon::Members => {
             for (dx, r, col) in [

@@ -3,7 +3,9 @@
 
 use std::collections::HashMap;
 
-use nixcord_model::{Channel, GatewayEvent, Guild, Message, MessageUpdate, Ready, Snowflake, User};
+use nixcord_model::{
+    Channel, Emoji, GatewayEvent, Guild, Message, MessageUpdate, Ready, Snowflake, User,
+};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -116,6 +118,14 @@ pub fn decode_dispatch(t: &str, d: &str) -> Result<Option<GatewayEvent>, JsonErr
         channel_id: Snowflake,
         user_id: Snowflake,
     }
+    /// MESSAGE_REACTION_ADD / MESSAGE_REACTION_REMOVE. `member`, `burst`, etc. are ignored.
+    #[derive(Deserialize)]
+    struct ReactionEv {
+        channel_id: Snowflake,
+        message_id: Snowflake,
+        user_id: Snowflake,
+        emoji: Emoji,
+    }
 
     let ev = match t {
         "READY" => GatewayEvent::Ready(Box::new(decode_ready(d)?)),
@@ -144,6 +154,8 @@ pub fn decode_dispatch(t: &str, d: &str) -> Result<Option<GatewayEvent>, JsonErr
         "CHANNEL_DELETE" => {
             GatewayEvent::ChannelDelete(Box::new(serde_json::from_str::<Channel>(d)?))
         }
+        // `member` (which has no `user` inside on the gateway) decodes straight into
+        // `PartialMember`, so it is passed through as-is.
         "MESSAGE_CREATE" => {
             GatewayEvent::MessageCreate(Box::new(serde_json::from_str::<Message>(d)?))
         }
@@ -155,6 +167,24 @@ pub fn decode_dispatch(t: &str, d: &str) -> Result<Option<GatewayEvent>, JsonErr
             GatewayEvent::MessageDelete {
                 id: m.id,
                 channel_id: m.channel_id,
+            }
+        }
+        "MESSAGE_REACTION_ADD" => {
+            let r: ReactionEv = serde_json::from_str(d)?;
+            GatewayEvent::ReactionAdd {
+                channel_id: r.channel_id,
+                message_id: r.message_id,
+                user_id: r.user_id,
+                emoji: r.emoji,
+            }
+        }
+        "MESSAGE_REACTION_REMOVE" => {
+            let r: ReactionEv = serde_json::from_str(d)?;
+            GatewayEvent::ReactionRemove {
+                channel_id: r.channel_id,
+                message_id: r.message_id,
+                user_id: r.user_id,
+                emoji: r.emoji,
             }
         }
         "TYPING_START" => {
@@ -365,6 +395,84 @@ mod tests {
             }
             e => panic!("{e:?}"),
         }
+    }
+
+    #[test]
+    fn decode_message_create_with_member_and_extras() {
+        let d = format!(
+            r#"{{"id":"100","channel_id":"200","guild_id":"300","author":{USER},"content":"<@10>",
+               "timestamp":"2024-01-01T00:00:00+00:00","nonce":12345,
+               "member":{{"roles":["7","8"],"nick":"Ally","avatar":null,"joined_at":"2020","deaf":false}},
+               "mentions":[{USER}],"mention_everyone":true,"mention_roles":["7"],
+               "message_reference":{{"message_id":"99","channel_id":"200"}},
+               "reactions":[{{"emoji":{{"id":null,"name":"❤"}},"count":2,"me":true}}],
+               "embeds":[{{"type":"rich","title":"T","color":255,"fields":[{{"name":"a","value":"b","inline":true}}]}}]}}"#
+        );
+        match decode_dispatch("MESSAGE_CREATE", &d).unwrap().unwrap() {
+            GatewayEvent::MessageCreate(m) => {
+                let member = m.member.as_ref().unwrap();
+                assert_eq!(member.roles, vec![Snowflake(7), Snowflake(8)]);
+                assert_eq!(member.nick.as_deref(), Some("Ally"));
+                assert_eq!(m.nonce.as_deref(), Some("12345"));
+                assert!(m.mention_everyone);
+                assert_eq!(m.mention_roles, vec![Snowflake(7)]);
+                assert_eq!(m.mentions[0].id, Snowflake(10));
+                assert_eq!(
+                    m.message_reference.as_ref().unwrap().message_id,
+                    Some(Snowflake(99))
+                );
+                assert_eq!(m.reactions[0].emoji.name.as_deref(), Some("\u{2764}"));
+                assert_eq!(m.reactions[0].count, 2);
+                assert!(m.reactions[0].me);
+                assert_eq!(m.embeds[0].color, Some(255));
+                assert!(m.embeds[0].fields[0].inline);
+            }
+            e => panic!("{e:?}"),
+        }
+        // DMs have no member.
+        let d = format!(
+            r#"{{"id":"1","channel_id":"2","author":{USER},"timestamp":"2024-01-01T00:00:00+00:00"}}"#
+        );
+        match decode_dispatch("MESSAGE_CREATE", &d).unwrap().unwrap() {
+            GatewayEvent::MessageCreate(m) => assert!(m.member.is_none()),
+            e => panic!("{e:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_reactions() {
+        let add = r#"{"user_id":"9","channel_id":"2","message_id":"3","guild_id":"4",
+            "member":{"roles":[]},"emoji":{"id":null,"name":"❤"},"burst":false,"type":0,
+            "message_author_id":"5"}"#;
+        assert_eq!(
+            decode_dispatch("MESSAGE_REACTION_ADD", add).unwrap(),
+            Some(GatewayEvent::ReactionAdd {
+                channel_id: Snowflake(2),
+                message_id: Snowflake(3),
+                user_id: Snowflake(9),
+                emoji: Emoji {
+                    id: None,
+                    name: Some("\u{2764}".into()),
+                    animated: false
+                },
+            })
+        );
+        let remove = r#"{"user_id":"9","channel_id":"2","message_id":"3",
+            "emoji":{"id":"77","name":"blob","animated":true}}"#;
+        assert_eq!(
+            decode_dispatch("MESSAGE_REACTION_REMOVE", remove).unwrap(),
+            Some(GatewayEvent::ReactionRemove {
+                channel_id: Snowflake(2),
+                message_id: Snowflake(3),
+                user_id: Snowflake(9),
+                emoji: Emoji {
+                    id: Some(Snowflake(77)),
+                    name: Some("blob".into()),
+                    animated: true
+                },
+            })
+        );
+        assert!(decode_dispatch("MESSAGE_REACTION_ADD", r#"{"user_id":"9"}"#).is_err());
     }
 
     #[test]

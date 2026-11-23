@@ -7,7 +7,7 @@
 //! which is pure data and can be unit-tested without a network. [`Http`] turns a `Route`
 //! into a reqwest request, sends it, and maps the response with [`map_error_status`].
 
-use nixcord_model::{Channel, Message, Snowflake, User};
+use nixcord_model::{Channel, Emoji, Message, Snowflake, User};
 use reqwest::header::{
     HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER, USER_AGENT,
 };
@@ -54,6 +54,7 @@ pub type Result<T> = std::result::Result<T, HttpError>;
 pub enum Method {
     Get,
     Post,
+    Put,
     Patch,
     Delete,
 }
@@ -63,6 +64,7 @@ impl Method {
         match self {
             Method::Get => reqwest::Method::GET,
             Method::Post => reqwest::Method::POST,
+            Method::Put => reqwest::Method::PUT,
             Method::Patch => reqwest::Method::PATCH,
             Method::Delete => reqwest::Method::DELETE,
         }
@@ -102,10 +104,46 @@ impl Route {
         r
     }
 
-    pub fn send_message(channel_id: Snowflake, content: &str, nonce: &str) -> Self {
+    /// `enforce_nonce` makes Discord dedupe retried sends with the same nonce. A reply
+    /// adds `message_reference` and pings the replied-to author (`replied_user: true`).
+    pub fn send_message(
+        channel_id: Snowflake,
+        content: &str,
+        nonce: &str,
+        reply_to: Option<Snowflake>,
+    ) -> Self {
         let mut r = Self::new(Method::Post, format!("/channels/{channel_id}/messages"));
-        r.body = Some(serde_json::json!({ "content": content, "nonce": nonce }));
+        let mut body = serde_json::json!({
+            "content": content,
+            "nonce": nonce,
+            "enforce_nonce": true,
+        });
+        if let Some(mid) = reply_to {
+            body["message_reference"] = serde_json::json!({ "message_id": mid });
+            body["allowed_mentions"] = serde_json::json!({ "replied_user": true });
+        }
+        r.body = Some(body);
         r
+    }
+
+    /// PUT /channels/{c}/messages/{m}/reactions/{emoji}/@me.
+    pub fn add_reaction(channel_id: Snowflake, message_id: Snowflake, emoji: &Emoji) -> Self {
+        Self::new(
+            Method::Put,
+            own_reaction_path(channel_id, message_id, emoji),
+        )
+    }
+
+    /// DELETE /channels/{c}/messages/{m}/reactions/{emoji}/@me.
+    pub fn remove_own_reaction(
+        channel_id: Snowflake,
+        message_id: Snowflake,
+        emoji: &Emoji,
+    ) -> Self {
+        Self::new(
+            Method::Delete,
+            own_reaction_path(channel_id, message_id, emoji),
+        )
     }
 
     pub fn edit_message(channel_id: Snowflake, message_id: Snowflake, content: &str) -> Self {
@@ -144,6 +182,40 @@ impl Route {
         }
         Ok(url)
     }
+}
+
+fn own_reaction_path(channel_id: Snowflake, message_id: Snowflake, emoji: &Emoji) -> String {
+    format!(
+        "/channels/{channel_id}/messages/{message_id}/reactions/{}/@me",
+        emoji_path_segment(emoji)
+    )
+}
+
+/// Emoji as a URL path segment: percent-encoded unicode `name`, or `name:id` for custom
+/// emoji (the name part encoded, the colon literal).
+pub fn emoji_path_segment(emoji: &Emoji) -> String {
+    let name = emoji.name.as_deref().unwrap_or("");
+    match emoji.id {
+        Some(id) => {
+            let name = if name.is_empty() { "_" } else { name };
+            format!("{}:{id}", percent_encode(name))
+        }
+        None => percent_encode(name),
+    }
+}
+
+/// Percent-encode everything except RFC 3986 unreserved characters.
+fn percent_encode(s: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
 }
 
 /// Value for the Authorization header. User tokens are sent raw; a token that already
@@ -337,9 +409,42 @@ impl Http {
         self.json(Route::messages(channel_id, before, limit)).await
     }
 
-    /// POST /channels/{id}/messages with `{"content": ..., "nonce": ...}`.
-    pub async fn send_message(&self, channel_id: Snowflake, content: &str) -> Result<Message> {
-        self.json(Route::send_message(channel_id, content, &generate_nonce()))
+    /// POST /channels/{id}/messages with `{"content", "nonce", "enforce_nonce": true}`.
+    /// With `reply_to`, the message is sent as a reply that pings the replied-to author.
+    pub async fn send_message(
+        &self,
+        channel_id: Snowflake,
+        content: &str,
+        reply_to: Option<Snowflake>,
+    ) -> Result<Message> {
+        self.json(Route::send_message(
+            channel_id,
+            content,
+            &generate_nonce(),
+            reply_to,
+        ))
+        .await
+    }
+
+    /// PUT /channels/{cid}/messages/{mid}/reactions/{emoji}/@me (204).
+    pub async fn add_reaction(
+        &self,
+        channel_id: Snowflake,
+        message_id: Snowflake,
+        emoji: &Emoji,
+    ) -> Result<()> {
+        self.empty(Route::add_reaction(channel_id, message_id, emoji))
+            .await
+    }
+
+    /// DELETE /channels/{cid}/messages/{mid}/reactions/{emoji}/@me (204).
+    pub async fn remove_own_reaction(
+        &self,
+        channel_id: Snowflake,
+        message_id: Snowflake,
+        emoji: &Emoji,
+    ) -> Result<()> {
+        self.empty(Route::remove_own_reaction(channel_id, message_id, emoji))
             .await
     }
 
@@ -442,15 +547,67 @@ mod tests {
 
     #[test]
     fn send_and_edit_bodies() {
-        let r = Route::send_message(C, "hi \"there\"", "123");
+        let r = Route::send_message(C, "hi \"there\"", "123", None);
         assert_eq!(r.method, Method::Post);
         assert_eq!(r.path, "/channels/111/messages");
         assert_eq!(
             r.body,
-            Some(serde_json::json!({"content": "hi \"there\"", "nonce": "123"}))
+            Some(serde_json::json!({
+                "content": "hi \"there\"",
+                "nonce": "123",
+                "enforce_nonce": true,
+            }))
+        );
+        let r = Route::send_message(C, "re", "5", Some(M));
+        assert_eq!(
+            r.body,
+            Some(serde_json::json!({
+                "content": "re",
+                "nonce": "5",
+                "enforce_nonce": true,
+                "message_reference": {"message_id": "222"},
+                "allowed_mentions": {"replied_user": true},
+            }))
         );
         let r = Route::edit_message(C, M, "new");
         assert_eq!(r.body, Some(serde_json::json!({"content": "new"})));
+    }
+
+    #[test]
+    fn reaction_routes() {
+        let unicode = Emoji {
+            id: None,
+            name: Some("\u{1F44D}".into()),
+            animated: false,
+        };
+        let custom = Emoji {
+            id: Some(Snowflake(77)),
+            name: Some("blob cat".into()),
+            animated: true,
+        };
+        assert_eq!(emoji_path_segment(&unicode), "%F0%9F%91%8D");
+        assert_eq!(emoji_path_segment(&custom), "blob%20cat:77");
+
+        let r = Route::add_reaction(C, M, &unicode);
+        assert_eq!(r.method, Method::Put);
+        assert!(r.body.is_none());
+        assert_eq!(
+            r.url(API_BASE).unwrap().as_str(),
+            "https://discord.com/api/v10/channels/111/messages/222/reactions/%F0%9F%91%8D/@me"
+        );
+        let r = Route::remove_own_reaction(C, M, &custom);
+        assert_eq!(r.method, Method::Delete);
+        assert_eq!(
+            r.url(API_BASE).unwrap().as_str(),
+            "https://discord.com/api/v10/channels/111/messages/222/reactions/blob%20cat:77/@me"
+        );
+        // Reserved characters in names are encoded, so a name cannot alter the path.
+        let weird = Emoji {
+            id: None,
+            name: Some("a/b?c#".into()),
+            animated: false,
+        };
+        assert_eq!(emoji_path_segment(&weird), "a%2Fb%3Fc%23");
     }
 
     #[test]
@@ -613,23 +770,46 @@ mod tests {
         let msg = r#"{"id":"9","channel_id":"111","author":{"id":"42","username":"nix"},"content":"hey","timestamp":"2024-01-01T00:00:00+00:00"}"#;
         let (base, h) = mock(vec![
             resp("200 OK", "", msg),
+            resp("200 OK", "", msg),
+            resp("204 No Content", "", ""),
+            resp("204 No Content", "", ""),
             resp("204 No Content", "", ""),
             resp("204 No Content", "", ""),
         ])
         .await;
         let http = Http::with_base_url("t".into(), base);
-        let m = http.send_message(C, "hey").await.unwrap();
+        let m = http.send_message(C, "hey", None).await.unwrap();
         assert_eq!(m.content, "hey");
+        http.send_message(C, "hey", Some(Snowflake(5)))
+            .await
+            .unwrap();
         http.delete_message(C, M).await.unwrap();
         http.trigger_typing(C).await.unwrap();
+        let thumbs = Emoji {
+            id: None,
+            name: Some("\u{1F44D}".into()),
+            animated: false,
+        };
+        http.add_reaction(C, M, &thumbs).await.unwrap();
+        http.remove_own_reaction(C, M, &thumbs).await.unwrap();
         let reqs = h.await.unwrap();
+        let body_of = |r: &str| -> serde_json::Value {
+            serde_json::from_str(r.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+        };
         assert!(reqs[0].starts_with("POST /channels/111/messages "));
-        let body = reqs[0].split("\r\n\r\n").nth(1).unwrap();
-        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        let v = body_of(&reqs[0]);
         assert_eq!(v["content"], "hey");
+        assert_eq!(v["enforce_nonce"], true);
         assert!(v["nonce"].as_str().unwrap().parse::<u64>().is_ok());
-        assert!(reqs[1].starts_with("DELETE /channels/111/messages/222 "));
-        assert!(reqs[2].starts_with("POST /channels/111/typing "));
+        assert!(v.get("message_reference").is_none());
+        let v = body_of(&reqs[1]);
+        assert_eq!(v["message_reference"]["message_id"], "5");
+        assert_eq!(v["allowed_mentions"]["replied_user"], true);
+        assert!(reqs[2].starts_with("DELETE /channels/111/messages/222 "));
+        assert!(reqs[3].starts_with("POST /channels/111/typing "));
+        let reaction_path = "/channels/111/messages/222/reactions/%F0%9F%91%8D/@me ";
+        assert!(reqs[4].starts_with(&format!("PUT {reaction_path}")));
+        assert!(reqs[5].starts_with(&format!("DELETE {reaction_path}")));
     }
 
     #[tokio::test]

@@ -1,0 +1,8 @@
+[package]
+name = "nixcord-markdown"
+description = "Discord-flavored markdown parser for nixcord (pure, no UI dependencies)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

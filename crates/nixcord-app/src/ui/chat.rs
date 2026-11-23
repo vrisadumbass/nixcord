@@ -2,21 +2,26 @@
 //!
 //! The message list is virtualized with `ScrollArea::show_viewport` and a per-row height
 //! cache: only rows intersecting the viewport are laid out, so a full channel (250
-//! messages) costs the same per frame as a handful.
+//! messages) costs the same per frame as a handful. Visible rows are re-measured every
+//! frame, so rows whose images finish loading (or whose markdown changes) settle on their
+//! real height on the next frame.
 
+use super::markdown::{self, MdClick, RenderCtx, StoreResolver};
 use super::{
-    bold, fmt_clock, fmt_day, fmt_size, fmt_stamp, hline, icon_button, id_color, paint_avatar,
-    paint_search, prop, role_color, Action, Icon,
+    bold, fmt_clock, fmt_day, fmt_size, fmt_stamp, hline, icon_button, id_color, member_name,
+    paint_app_badge, paint_icon, paint_search, prop, role_color, Action, Icon,
 };
 use crate::app::{NixApp, RowKey, ScrollAnchor};
+use crate::media::MediaEmoji;
 use eframe::egui::{
-    self, text::LayoutJob, Align, Align2, Color32, CornerRadius, CursorIcon, Frame, Id, Layout,
-    Margin, Pos2, Rect, RichText, Sense, Shape, Stroke, TextFormat, Ui, UiBuilder, Vec2,
+    self, text::LayoutJob, Align, Align2, Color32, CornerRadius, Frame, Id, Layout, Margin, Pos2,
+    Rect, RichText, Sense, Shape, Stroke, TextFormat, Ui, UiBuilder, Vec2,
 };
-use nixcord_model::{ChannelKind, Message, Snowflake, User};
+use nixcord_markdown::{Inline, Mention};
+use nixcord_model::{Attachment, ChannelKind, Embed, Emoji, Message, Reaction, Snowflake};
 use nixcord_store::MAX_MESSAGES_PER_CHANNEL;
+use std::borrow::Cow;
 use std::collections::HashSet;
-use std::ops::Range;
 
 /// Consecutive messages by the same author within this window are grouped.
 const GROUP_WINDOW_MS: u64 = 7 * 60 * 1000;
@@ -24,6 +29,24 @@ const GUTTER: f32 = 72.0;
 const RIGHT_PAD: f32 = 48.0;
 const DIVIDER_H: f32 = 32.0;
 const TOOLBAR_BTN: f32 = 30.0;
+/// Attachment previews and embed images fit in this box (Discord's size).
+const PREVIEW_MAX: Vec2 = Vec2::new(400.0, 300.0);
+const EMBED_MAX_W: f32 = 432.0;
+/// Quick reactions offered by the toolbar's react button.
+const QUICK_REACTIONS: [&str; 8] = [
+    "\u{1F44D}",
+    "\u{2764}\u{FE0F}",
+    "\u{1F602}",
+    "\u{1F62E}",
+    "\u{1F622}",
+    "\u{1F525}",
+    "\u{1F389}",
+    "\u{1F440}",
+];
+
+fn picker_id() -> Id {
+    Id::unique("nixcord-react-picker")
+}
 
 // ---- header -------------------------------------------------------------------------
 
@@ -37,15 +60,17 @@ pub fn header(ui: &mut Ui, app: &mut NixApp, ch: Snowflake) {
     let is_dm = matches!(channel.kind, ChannelKind::Dm | ChannelKind::GroupDm);
     let name = channel.label();
     let topic = channel.topic.clone().filter(|s| !s.trim().is_empty());
+    let me = app.store.me().map(|u| u.id);
+    let dm_user = (channel.kind == ChannelKind::Dm)
+        .then(|| channel.recipients.iter().find(|u| Some(u.id) != me))
+        .flatten()
+        .cloned();
 
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         // Search box (local filter over loaded messages).
         let (field, _) = ui.allocate_exact_size(Vec2::new(220.0, 28.0), Sense::hover());
-        ui.painter().rect_filled(
-            field,
-            CornerRadius::same(4),
-            Color32::from_black_alpha(if t.dark { 70 } else { 18 }),
-        );
+        ui.painter()
+            .rect_filled(field, CornerRadius::same(4), t.elevated);
         paint_search(
             ui,
             Pos2::new(field.right() - 14.0, field.center().y),
@@ -100,11 +125,18 @@ pub fn header(ui: &mut Ui, app: &mut NixApp, ch: Snowflake) {
 
         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            ui.label(
-                RichText::new(if is_dm { "@" } else { "#" })
-                    .font(prop(22.0))
-                    .color(t.muted),
-            );
+            match &dm_user {
+                Some(u) => {
+                    app.media.borrow_mut().avatar(ui, u, None, 24.0);
+                }
+                None => {
+                    ui.label(
+                        RichText::new(if is_dm { "@" } else { "#" })
+                            .font(prop(22.0))
+                            .color(t.muted),
+                    );
+                }
+            }
             ui.add(
                 egui::Label::new(RichText::new(name).font(bold(16.0)).color(t.strong)).truncate(),
             );
@@ -159,8 +191,13 @@ pub fn empty_state(ui: &mut Ui, app: &mut NixApp) {
 
 // ---- member panel -------------------------------------------------------------------
 
-/// No member list in v0.1: show unique authors from the loaded messages, newest first.
+/// Group of the member panel: (role position, role id) for sorting, header, members.
+type MemberGroup<'a> = (Option<(i32, Snowflake)>, &'a str, Vec<&'a Message>);
+
+/// No member list in v0.1: unique authors of the loaded messages (newest first), grouped
+/// under their highest role like Discord's list.
 pub fn members(ui: &mut Ui, app: &mut NixApp, ch: Snowflake) {
+    let app: &NixApp = app;
     let t = app.theme;
     let outer = ui.max_rect().expand(8.0);
     ui.painter().vline(
@@ -170,79 +207,86 @@ pub fn members(ui: &mut Ui, app: &mut NixApp, ch: Snowflake) {
     );
     let guild = app.store.channel(ch).and_then(|c| c.guild_id);
     let mut seen = HashSet::new();
-    let authors: Vec<&User> = app
-        .store
-        .messages(ch)
-        .iter()
-        .rev()
-        .map(|m| &m.author)
-        .filter(|u| seen.insert(u.id))
-        .take(200)
-        .collect();
+    let mut groups: Vec<MemberGroup<'_>> = Vec::new();
+    for m in app.store.messages(ch).iter().rev() {
+        if seen.len() >= 200 {
+            break;
+        }
+        if !seen.insert(m.author.id) {
+            continue;
+        }
+        let role = guild
+            .and_then(|g| app.store.member_top_role(g, m.author.id))
+            .filter(|r| r.name != "@everyone");
+        let key = role.map(|r| (r.position, r.id));
+        let name = role.map_or("Members", |r| r.name.as_str());
+        match groups.iter_mut().find(|g| g.0 == key) {
+            Some(g) => g.2.push(m),
+            None => groups.push((key, name, vec![m])),
+        }
+    }
+    // Highest role first; plain "Members" (None) last.
+    groups.sort_by_key(|g| std::cmp::Reverse(g.0));
 
     egui::ScrollArea::vertical()
         .id_salt(("members", ch))
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new(format!("Recently active — {}", authors.len()))
-                        .font(bold(12.0))
-                        .color(t.muted),
-                );
-            });
-            ui.add_space(4.0);
-            for u in authors {
-                let (outer, resp) =
-                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 44.0), Sense::hover());
-                let rect = outer.shrink2(Vec2::new(0.0, 1.0));
-                if resp.hovered() {
-                    ui.painter()
-                        .rect_filled(rect, CornerRadius::same(4), t.hover);
-                }
-                let c = Pos2::new(rect.left() + 8.0 + 16.0, rect.center().y);
-                paint_avatar(ui, c, 32.0, u);
-                let color = role_color(&app.store, guild, u.id).unwrap_or(t.text);
-                let clip = Rect::from_min_max(
-                    Pos2::new(rect.left() + 52.0, rect.top()),
-                    rect.right_bottom(),
-                )
-                .intersect(ui.clip_rect());
-                let g =
-                    ui.painter()
-                        .layout_no_wrap(u.display_name().to_string(), prop(15.5), color);
-                ui.painter().with_clip_rect(clip).galley(
-                    Pos2::new(rect.left() + 52.0, rect.center().y - g.size().y / 2.0),
-                    g,
-                    color,
-                );
-                if u.bot {
-                    // Small BOT tag after the name.
-                    let w = ui
-                        .painter()
-                        .layout_no_wrap(u.display_name().to_string(), prop(15.5), color)
-                        .size()
-                        .x;
-                    let tag = Rect::from_min_size(
-                        Pos2::new(rect.left() + 56.0 + w, rect.center().y - 8.0),
-                        Vec2::new(30.0, 16.0),
+            for (_, name, list) in &groups {
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(format!("{name} — {}", list.len()))
+                            .font(prop(13.5))
+                            .color(t.muted),
                     );
-                    if tag.right() < rect.right() {
-                        ui.painter()
-                            .rect_filled(tag, CornerRadius::same(3), t.accent);
-                        ui.painter().text(
-                            tag.center(),
-                            Align2::CENTER_CENTER,
-                            "BOT",
-                            bold(10.0),
-                            t.on_accent,
-                        );
-                    }
+                });
+                ui.add_space(2.0);
+                for m in list {
+                    member_row(ui, app, m, guild);
                 }
             }
         });
+}
+
+fn member_row(ui: &mut Ui, app: &NixApp, m: &Message, guild: Option<Snowflake>) {
+    let t = app.theme;
+    let u = &m.author;
+    let (outer, resp) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 42.0), Sense::hover());
+    let rect = outer.shrink2(Vec2::new(0.0, 1.0));
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(4), t.hover);
+    }
+    let c = Pos2::new(rect.left() + 8.0 + 16.0, rect.center().y);
+    app.media
+        .borrow_mut()
+        .paint_avatar(ui, c, 32.0, u, member_avatar(m, guild));
+    let color = role_color(&app.store, guild, u.id).unwrap_or(t.text);
+    let left = rect.left() + 52.0;
+    let clip = Rect::from_min_max(Pos2::new(left, rect.top()), rect.right_bottom())
+        .intersect(ui.clip_rect());
+    let g = ui.painter().layout_no_wrap(
+        member_name(&app.store, guild, u).to_string(),
+        prop(15.5),
+        color,
+    );
+    let w = g.size().x;
+    ui.painter().with_clip_rect(clip).galley(
+        Pos2::new(left, rect.center().y - g.size().y / 2.0),
+        g,
+        color,
+    );
+    if u.bot && left + w + 40.0 < rect.right() {
+        paint_app_badge(ui, Pos2::new(left + w + 5.0, rect.center().y));
+    }
+}
+
+/// `(guild, member avatar hash)` for `Media::paint_avatar` (per-guild avatars win).
+fn member_avatar(m: &Message, guild: Option<Snowflake>) -> Option<(Snowflake, Option<&str>)> {
+    guild.map(|g| (g, m.member.as_ref().and_then(|mm| mm.avatar.as_deref())))
 }
 
 // ---- message list -------------------------------------------------------------------
@@ -308,7 +352,14 @@ fn estimate(row: Row, msgs: &[Message], width: f32) -> f32 {
             let w = (width - GUTTER - RIGHT_PAD).max(80.0);
             let chars = m.content.chars().count() as f32;
             let lines = (chars * 7.6 / w).ceil().max(1.0) + m.content.matches('\n').count() as f32;
-            let mut h = lines * 21.0 + 4.0 + m.attachments.len() as f32 * 22.0;
+            let mut h = lines * 21.0 + 4.0;
+            for a in &m.attachments {
+                h += if is_image(a) { 304.0 } else { 72.0 };
+            }
+            h += m.embeds.len() as f32 * 160.0;
+            if !m.reactions.is_empty() {
+                h += 32.0;
+            }
             if head {
                 h += 22.0 + 16.0;
             }
@@ -340,8 +391,8 @@ pub fn messages(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<
     }
 
     let msgs = app.store.messages(ch);
-    let filter = app.chat.filter.clone();
-    let rows = build_rows(msgs, &filter);
+    let rows = build_rows(msgs, &app.chat.filter);
+    let filtering = !app.chat.filter.trim().is_empty();
     let width = ui.available_width();
     if (width - app.chat.width).abs() > 0.5 {
         app.chat.heights.clear();
@@ -383,13 +434,21 @@ pub fn messages(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<
 
     let me = app.store.me().map(|u| u.id);
     let guild = app.store.channel(ch).and_then(|c| c.guild_id);
-    let pointer = ui.ctx().pointer_hover_pos();
-    // Keep the toolbar's owner while the pointer is on the toolbar itself.
-    let sticky_owner = app
-        .chat
-        .hover
-        .filter(|(_, r)| pointer.is_some_and(|p| r.contains(p)))
-        .map(|(id, _)| id);
+    // Ignore the pointer while it is over another layer (settings modal, popups).
+    let layer = ui.layer_id();
+    let pointer = ui
+        .ctx()
+        .pointer_hover_pos()
+        .filter(|p| ui.ctx().layer_id_at(*p).is_none_or(|l| l == layer));
+    // While the react picker is open its message keeps the toolbar; otherwise the toolbar
+    // stays with its owner while the pointer is on the toolbar itself.
+    let picker: Option<Snowflake> = ui.ctx().data(|d| d.get_temp(picker_id()));
+    let sticky_owner = picker.or_else(|| {
+        app.chat
+            .hover
+            .filter(|(_, r)| pointer.is_some_and(|p| r.contains(p)))
+            .map(|(id, _)| id)
+    });
 
     let mut measured: Vec<(RowKey, f32)> = Vec::new();
     let mut new_owner: Option<(Snowflake, Rect)> = None;
@@ -435,8 +494,14 @@ pub fn messages(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<
                 Row::Msg { idx, head } => {
                     let m = &msgs[idx];
                     let forced = sticky_owner.map(|id| id == m.id);
-                    let (h, rect, owner) =
-                        message_row(&mut child, app, m, head, forced, pointer, me, guild);
+                    let ctx = RowCtx {
+                        head,
+                        forced,
+                        pointer,
+                        me,
+                        guild,
+                    };
+                    let (h, rect, owner) = message_row(&mut child, app, m, &ctx, actions);
                     if owner {
                         new_owner = Some((m.id, rect));
                     }
@@ -467,7 +532,7 @@ pub fn messages(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<
 
     // Near the top: fetch older history (with a cooldown so failures don't spin).
     let offset = out.state.clamped_offset().y;
-    if filter.trim().is_empty()
+    if !filtering
         && offset < 48.0
         && !exhausted
         && !at_cap
@@ -578,26 +643,31 @@ fn day_divider(ui: &mut Ui, app: &NixApp, ms: u64) -> f32 {
     DIVIDER_H
 }
 
-/// Lay out one message. Returns (height, row rect, hovered).
-///
-/// `forced` overrides hover detection (used while the pointer is on the toolbar).
-#[allow(clippy::too_many_arguments)]
-fn message_row(
-    ui: &mut Ui,
-    app: &NixApp,
-    m: &Message,
+/// Per-row inputs of `message_row`.
+struct RowCtx {
     head: bool,
+    /// Overrides hover detection (used while the pointer is on the toolbar).
     forced: Option<bool>,
     pointer: Option<Pos2>,
     me: Option<Snowflake>,
     guild: Option<Snowflake>,
+}
+
+/// Lay out one message. Returns (height, row rect, hovered).
+fn message_row(
+    ui: &mut Ui,
+    app: &NixApp,
+    m: &Message,
+    rc: &RowCtx,
+    actions: &mut Vec<Action>,
 ) -> (f32, Rect, bool) {
     let t = app.theme;
     let h24 = app.prefs.clock_24h;
+    let guild = rc.guild;
     let outer = ui.max_rect();
     let left = outer.left();
     let bg = ui.painter().add(Shape::Noop);
-    let top_pad = if head { 16.0 } else { 1.0 };
+    let top_pad = if rc.head { 16.0 } else { 1.0 };
     let mut y = outer.top() + top_pad;
 
     // Reply preview above the header.
@@ -624,57 +694,56 @@ fn message_row(
             ))
             .layout(Layout::top_down(Align::Min)),
     );
-    child.spacing_mut().item_spacing.y = 2.0;
+    child.spacing_mut().item_spacing.y = 4.0;
 
-    if head {
+    if rc.head {
         let name_color = role_color(&app.store, guild, m.author.id).unwrap_or(t.strong);
         child.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.spacing_mut().item_spacing.x = 6.0;
             ui.label(
-                RichText::new(m.author.display_name())
+                RichText::new(member_name(&app.store, guild, &m.author))
                     .font(bold(15.5))
                     .color(name_color),
             );
             if m.author.bot {
                 let (r, _) = ui.allocate_exact_size(Vec2::new(30.0, 16.0), Sense::hover());
-                ui.painter().rect_filled(r, CornerRadius::same(3), t.accent);
-                ui.painter().text(
-                    r.center(),
-                    Align2::CENTER_CENTER,
-                    "BOT",
-                    bold(10.0),
-                    t.on_accent,
-                );
+                paint_app_badge(ui, r.left_center());
             }
+            ui.add_space(2.0);
             ui.label(
                 RichText::new(fmt_stamp(m.id.timestamp_ms(), h24))
                     .font(prop(12.0))
                     .color(t.muted),
             );
         });
+        child.add_space(-4.0);
     }
 
     let first_line_y = child.cursor().top();
-    content(&mut child, app, m, guild, content_w);
-    for a in &m.attachments {
-        child
-            .hyperlink_to(
-                RichText::new(format!("📎 {}  ({})", a.filename, fmt_size(a.size))).color(t.link),
-                &a.url,
-            )
-            .on_hover_text(&a.url);
+    let mut mentions_me = false;
+    if !m.content.is_empty() {
+        mentions_me = content(&mut child, app, m, actions);
     }
-    embeds_row(&mut child, app, m);
-    reactions_row(&mut child, app, m);
+    for a in &m.attachments {
+        attachment(&mut child, app, a);
+    }
+    for (i, e) in m.embeds.iter().enumerate() {
+        embed_card(&mut child, app, m, i, e, actions);
+    }
+    reactions_row(&mut child, app, m, actions);
 
     let bottom = child.min_rect().bottom().max(first_line_y + 20.0) + 3.0;
     let rect = Rect::from_min_max(outer.min, Pos2::new(outer.right(), bottom));
-    let hovered = forced
-        .unwrap_or_else(|| pointer.is_some_and(|p| rect.contains(p) && ui.clip_rect().contains(p)));
+    let hovered = rc.forced.unwrap_or_else(|| {
+        rc.pointer
+            .is_some_and(|p| rect.contains(p) && ui.clip_rect().contains(p))
+    });
 
-    if head {
+    if rc.head {
         let c = Pos2::new(left + 16.0 + 20.0, y + 20.0);
-        paint_avatar(ui, c, 40.0, &m.author);
+        app.media
+            .borrow_mut()
+            .paint_avatar(ui, c, 40.0, &m.author, member_avatar(m, guild));
     } else if hovered {
         ui.painter().text(
             Pos2::new(left + GUTTER / 2.0, first_line_y + 10.0),
@@ -685,7 +754,7 @@ fn message_row(
         );
     }
 
-    let mentioned = me.is_some_and(|me| m.mentions.iter().any(|u| u.id == me) && m.author.id != me);
+    let mentioned = rc.me != Some(m.author.id) && (app.store.is_mentioned(m) || mentions_me);
     let mut shapes = Vec::new();
     if mentioned {
         shapes.push(Shape::rect_filled(rect, 0.0, t.mention_bg));
@@ -706,6 +775,46 @@ fn message_row(
         ui.painter().set(bg, Shape::Vec(shapes));
     }
     (bottom - outer.top(), rect, hovered)
+}
+
+/// Mentions, emoji and timestamps of a document as plain text (reply previews).
+fn plain_inline(app: &NixApp, m: &Message, i: &Inline) -> String {
+    let guild = m
+        .guild_id
+        .or_else(|| app.store.channel(m.channel_id).and_then(|c| c.guild_id));
+    match i {
+        Inline::Mention(Mention::User(id)) => {
+            let id = Snowflake(*id);
+            let name = m
+                .mentions
+                .iter()
+                .find(|u| u.id == id)
+                .or_else(|| app.store.user(id))
+                .map_or("unknown-user", |u| member_name(&app.store, guild, u));
+            format!("@{name}")
+        }
+        Inline::Mention(Mention::Role(id)) => {
+            let name = guild
+                .and_then(|g| app.store.guild(g))
+                .and_then(|g| g.roles.iter().find(|r| r.id.0 == *id))
+                .map_or("role", |r| r.name.as_str());
+            format!("@{name}")
+        }
+        Inline::Mention(Mention::Channel(id)) => {
+            let name = app
+                .store
+                .channel(Snowflake(*id))
+                .map_or_else(|| "unknown".to_string(), |c| c.label());
+            format!("#{name}")
+        }
+        Inline::Mention(Mention::Everyone) => "@everyone".into(),
+        Inline::Mention(Mention::Here) => "@here".into(),
+        Inline::CustomEmoji { name, .. } => format!(":{name}:"),
+        Inline::Timestamp { unix, style } => {
+            markdown::format_timestamp(*unix, *style, app.prefs.clock_24h).0
+        }
+        _ => String::new(),
+    }
 }
 
 fn reply_preview(
@@ -731,11 +840,17 @@ fn reply_preview(
     ui.painter().add(Shape::line(pts.to_vec(), stroke));
 
     let mut x = at.x + GUTTER;
-    paint_avatar(ui, Pos2::new(x + 8.0, yl), 16.0, &r.author);
+    app.media.borrow_mut().paint_avatar(
+        ui,
+        Pos2::new(x + 8.0, yl),
+        16.0,
+        &r.author,
+        member_avatar(r, guild),
+    );
     x += 20.0;
     let name_color = role_color(&app.store, guild, r.author.id).unwrap_or(t.text);
     let name = ui.painter().layout_no_wrap(
-        format!("@{}", r.author.display_name()),
+        format!("@{}", member_name(&app.store, guild, &r.author)),
         bold(13.0),
         name_color,
     );
@@ -743,15 +858,21 @@ fn reply_preview(
     ui.painter()
         .galley(Pos2::new(x, yl - name.size().y / 2.0), name, name_color);
     x += nw + 6.0;
-    let mut preview: String = r.content.lines().next().unwrap_or_default().to_string();
-    if preview.is_empty() {
-        preview = if r.attachments.is_empty() {
-            "Click to see original message".into()
+    let preview = if r.content.is_empty() {
+        if r.attachments.is_empty() && r.embeds.is_empty() {
+            "Click to see original message".to_string()
         } else {
-            "Attachment".into()
-        };
-    }
-    let preview = render_mentions_plain(app, r, &preview);
+            "Click to see attachment".to_string()
+        }
+    } else {
+        let doc =
+            markdown::parse_cached(ui.ctx(), r.id.0, r.edited_timestamp.as_deref(), &r.content);
+        let text = doc.plain_text_with(&|i| plain_inline(app, r, i));
+        text.lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or_default()
+            .to_string()
+    };
     let max_w = (right - x).max(20.0);
     let mut job = LayoutJob::single_section(preview, TextFormat::simple(prop(13.0), t.muted));
     job.wrap.max_width = max_w;
@@ -763,192 +884,391 @@ fn reply_preview(
         .galley(Pos2::new(x, yl - g.size().y / 2.0), g, t.muted);
 }
 
-/// Reactions are not in the model yet; this is where they will render.
-fn reactions_row(_ui: &mut Ui, _app: &NixApp, _m: &Message) {}
-
-/// Embeds are not in the model yet; this is where they will render.
-fn embeds_row(_ui: &mut Ui, _app: &NixApp, _m: &Message) {}
-
 // ---- message content ----------------------------------------------------------------
 
-enum Seg {
-    Text(String),
-    Mention(String),
-    Link(String),
+/// Render markdown content; returns whether it mentions me (@me, @everyone, @here).
+fn content(ui: &mut Ui, app: &NixApp, m: &Message, actions: &mut Vec<Action>) -> bool {
+    let doc = markdown::parse_cached(ui.ctx(), m.id.0, m.edited_timestamp.as_deref(), &m.content);
+    let resolver = StoreResolver::new(&app.store, Some(m));
+    let emoji = MediaEmoji(&app.media);
+    let mut ctx = RenderCtx::new(app.theme, &resolver, Id::unique(("md", m.id.0)));
+    ctx.me = app.store.me().map(|u| u.id.0);
+    ctx.edited = m.edited_timestamp.is_some();
+    ctx.h24 = app.prefs.clock_24h;
+    ctx.emoji = Some(&emoji);
+    let out = markdown::render(ui, &*doc, &ctx);
+    if let Some(MdClick::Channel(id)) = out.clicked {
+        actions.push(Action::SelectChannel(Snowflake(id)));
+    }
+    out.mentions_me
 }
 
-fn mention_name(app: &NixApp, m: &Message, id: Snowflake) -> String {
-    m.mentions
+fn is_image(a: &Attachment) -> bool {
+    if let Some(ct) = &a.content_type {
+        return ct.starts_with("image/");
+    }
+    let name = a.filename.to_ascii_lowercase();
+    [".png", ".jpg", ".jpeg", ".gif", ".webp"]
         .iter()
-        .find(|u| u.id == id)
-        .or_else(|| app.store.user(id))
-        .map_or_else(
-            || "unknown-user".to_string(),
-            |u| u.display_name().to_string(),
-        )
+        .any(|ext| name.ends_with(ext))
 }
 
-/// Split Discord message markup into plain text, mentions and links.
-fn segments(app: &NixApp, m: &Message, text: &str) -> Vec<Seg> {
-    let mut out = Vec::new();
-    let mut plain = String::new();
-    let mut rest = text;
-    let flush = |plain: &mut String, out: &mut Vec<Seg>| {
-        if !plain.is_empty() {
-            out.push(Seg::Text(std::mem::take(plain)));
-        }
-    };
-    while let Some(c) = rest.chars().next() {
-        if rest.starts_with("https://") || rest.starts_with("http://") {
-            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-            flush(&mut plain, &mut out);
-            out.push(Seg::Link(rest[..end].to_string()));
-            rest = &rest[end..];
-            continue;
-        }
-        if c == '<' {
-            if let Some(close) = rest[1..].find('>').filter(|&i| i < 80) {
-                let inner = &rest[1..1 + close];
-                if let Some(seg) = markup(app, m, inner) {
-                    flush(&mut plain, &mut out);
-                    out.push(seg);
-                    rest = &rest[close + 2..];
-                    continue;
-                }
-            }
-        }
-        plain.push(c);
-        rest = &rest[c.len_utf8()..];
-    }
-    flush(&mut plain, &mut out);
-    out
-}
-
-fn markup(app: &NixApp, m: &Message, inner: &str) -> Option<Seg> {
-    let id = |s: &str| s.parse::<u64>().ok().map(Snowflake);
-    if let Some(rest) = inner.strip_prefix("@&") {
-        let rid = id(rest)?;
-        let name = m
-            .guild_id
-            .or_else(|| app.store.channel(m.channel_id).and_then(|c| c.guild_id))
-            .and_then(|g| app.store.guild(g))
-            .and_then(|g| g.roles.iter().find(|r| r.id == rid))
-            .map_or_else(|| "role".to_string(), |r| r.name.clone());
-        return Some(Seg::Mention(format!("@{name}")));
-    }
-    if let Some(rest) = inner.strip_prefix('@') {
-        let uid = id(rest.trim_start_matches('!'))?;
-        return Some(Seg::Mention(format!("@{}", mention_name(app, m, uid))));
-    }
-    if let Some(rest) = inner.strip_prefix('#') {
-        let cid = id(rest)?;
-        let name = app
-            .store
-            .channel(cid)
-            .map_or_else(|| "unknown".to_string(), |c| c.label());
-        return Some(Seg::Mention(format!("#{name}")));
-    }
-    let emoji = inner
-        .strip_prefix("a:")
-        .or_else(|| inner.strip_prefix(':'))?;
-    let (name, eid) = emoji.split_once(':')?;
-    id(eid)?;
-    Some(Seg::Text(format!(":{name}:")))
-}
-
-fn render_mentions_plain(app: &NixApp, m: &Message, text: &str) -> String {
-    segments(app, m, text)
-        .into_iter()
-        .map(|s| match s {
-            Seg::Text(s) | Seg::Mention(s) | Seg::Link(s) => s,
-        })
-        .collect()
-}
-
-fn content(ui: &mut Ui, app: &NixApp, m: &Message, _guild: Option<Snowflake>, width: f32) {
+fn attachment(ui: &mut Ui, app: &NixApp, a: &Attachment) {
     let t = app.theme;
-    if m.content.is_empty() && m.edited_timestamp.is_none() {
+    if is_image(a) {
+        ui.add_space(2.0);
+        app.media
+            .borrow_mut()
+            .image(ui, &a.url, PREVIEW_MAX, a.width.zip(a.height))
+            .on_hover_text(&a.filename);
         return;
     }
-    let base = TextFormat {
-        font_id: prop(15.5),
-        color: t.text,
-        line_height: Some(21.0),
-        ..Default::default()
+    // File card.
+    let w = ui.available_width().min(432.0);
+    let resp = Frame::new()
+        .fill(t.elevated)
+        .stroke(Stroke::new(1.0, t.divider))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::same(12))
+        .show(ui, |ui| {
+            ui.set_width(w - 24.0);
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(Vec2::new(30.0, 40.0), Sense::hover());
+                paint_icon(ui, Icon::File, r, t.accent);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    ui.hyperlink_to(
+                        RichText::new(&a.filename).font(prop(15.5)).color(t.link),
+                        &a.url,
+                    );
+                    ui.label(
+                        RichText::new(fmt_size(a.size))
+                            .font(prop(12.0))
+                            .color(t.muted),
+                    );
+                });
+            });
+        });
+    resp.response.on_hover_text(&a.url);
+}
+
+// ---- embeds -------------------------------------------------------------------------
+
+fn embed_media_url(m: &nixcord_model::EmbedMedia) -> &str {
+    m.proxy_url.as_deref().unwrap_or(&m.url)
+}
+
+/// Discord-style embed card: colored left bar, provider, author, title, description,
+/// fields (inline ones up to three per row), thumbnail on the right, large image, footer.
+fn embed_card(
+    ui: &mut Ui,
+    app: &NixApp,
+    m: &Message,
+    index: usize,
+    e: &Embed,
+    actions: &mut Vec<Action>,
+) {
+    let t = app.theme;
+    // Bare image / gif links show just the media, like Discord.
+    let bare = matches!(e.kind.as_deref(), Some("image" | "gifv"))
+        && e.title.is_none()
+        && e.description.is_none();
+    if bare {
+        if let Some(img) = e.thumbnail.as_ref().or(e.image.as_ref()) {
+            ui.add_space(2.0);
+            app.media.borrow_mut().image(
+                ui,
+                embed_media_url(img),
+                PREVIEW_MAX,
+                img.width.zip(img.height),
+            );
+        }
+        return;
+    }
+
+    let card_w = ui.available_width().min(EMBED_MAX_W + 32.0);
+    let bar = e.color.map_or(t.divider.to_opaque(), |c| {
+        Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
+    });
+    let fill = if t.dark {
+        Color32::from_white_alpha(8)
+    } else {
+        Color32::from_black_alpha(10)
     };
-    let mut job = LayoutJob::default();
-    job.wrap.max_width = width;
-    let mut links: Vec<(Range<usize>, String)> = Vec::new();
-    let mut chars = 0usize;
-    for seg in segments(app, m, &m.content) {
-        match seg {
-            Seg::Text(s) => {
-                chars += s.chars().count();
-                job.append(&s, 0.0, base.clone());
-            }
-            Seg::Mention(s) => {
-                chars += s.chars().count();
-                job.append(
-                    &s,
-                    0.0,
-                    TextFormat {
-                        color: t.strong,
-                        background: t.accent.gamma_multiply(0.35),
-                        expand_bg: 1.0,
-                        ..base.clone()
-                    },
+    ui.add_space(2.0);
+    let resp = Frame::new()
+        .fill(fill)
+        .stroke(Stroke::new(1.0, t.divider))
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(Margin {
+            left: 16,
+            right: 16,
+            top: 10,
+            bottom: 14,
+        })
+        .show(ui, |ui| {
+            ui.set_max_width(card_w - 32.0);
+            ui.spacing_mut().item_spacing.y = 6.0;
+            let thumb = e.thumbnail.as_ref().filter(|_| e.image.is_none());
+            let text_w = if thumb.is_some() {
+                card_w - 32.0 - 96.0
+            } else {
+                card_w - 32.0
+            };
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_max_width(text_w);
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    embed_text(ui, app, m, index, e, actions);
+                });
+                if let Some(th) = thumb {
+                    ui.add_space(12.0);
+                    app.media.borrow_mut().image(
+                        ui,
+                        embed_media_url(th),
+                        Vec2::splat(80.0),
+                        th.width.zip(th.height),
+                    );
+                }
+            });
+            if let Some(img) = &e.image {
+                ui.add_space(4.0);
+                let max = Vec2::new(PREVIEW_MAX.x.min(card_w - 32.0), PREVIEW_MAX.y);
+                app.media.borrow_mut().image(
+                    ui,
+                    embed_media_url(img),
+                    max,
+                    img.width.zip(img.height),
                 );
             }
-            Seg::Link(url) => {
-                let n = url.chars().count();
-                links.push((chars..chars + n, url.clone()));
-                chars += n;
-                job.append(
-                    &url,
-                    0.0,
-                    TextFormat {
-                        color: t.link,
-                        ..base.clone()
-                    },
-                );
+            if let Some(f) = &e.footer {
+                ui.label(RichText::new(&f.text).font(prop(12.0)).color(t.muted));
             }
+        });
+    let r = resp.response.rect;
+    ui.painter().rect_filled(
+        Rect::from_min_size(r.min, Vec2::new(4.0, r.height())),
+        CornerRadius {
+            nw: 6,
+            sw: 6,
+            ne: 0,
+            se: 0,
+        },
+        bar,
+    );
+}
+
+fn link_label(ui: &mut Ui, text: RichText, url: Option<&str>) {
+    match url {
+        Some(u) => {
+            let resp = ui.add(egui::Label::new(text).sense(Sense::click()).wrap());
+            if resp.clicked() {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(u));
+            }
+            resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(u);
+        }
+        None => {
+            ui.add(egui::Label::new(text).wrap());
         }
     }
-    if m.edited_timestamp.is_some() {
-        job.append(
-            "(edited)",
-            if m.content.is_empty() { 0.0 } else { 4.0 },
-            TextFormat {
-                font_id: prop(11.0),
-                color: t.muted,
-                valign: Align::Center,
-                ..base.clone()
-            },
+}
+
+fn embed_text(
+    ui: &mut Ui,
+    app: &NixApp,
+    m: &Message,
+    index: usize,
+    e: &Embed,
+    actions: &mut Vec<Action>,
+) {
+    let t = app.theme;
+    if let Some(p) = &e.provider {
+        ui.label(RichText::new(&p.name).font(prop(12.0)).color(t.muted));
+    }
+    if let Some(a) = &e.author {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            if let Some(icon) = &a.icon_url {
+                app.media
+                    .borrow_mut()
+                    .image(ui, icon, Vec2::splat(24.0), Some((24, 24)));
+            }
+            link_label(
+                ui,
+                RichText::new(&a.name).font(bold(14.0)).color(t.strong),
+                a.url.as_deref(),
+            );
+        });
+    }
+    if let Some(title) = &e.title {
+        let color = if e.url.is_some() { t.link } else { t.strong };
+        link_label(
+            ui,
+            RichText::new(title).font(bold(16.0)).color(color),
+            e.url.as_deref(),
         );
     }
-    let galley = ui.painter().layout_job(job);
-    let sense = if links.is_empty() {
-        Sense::hover()
-    } else {
-        Sense::click()
-    };
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, galley.size().y), sense);
-    ui.painter().galley(rect.min, galley.clone(), t.text);
-    if links.is_empty() {
-        return;
+    let salt = |k: u64| m.id.0 ^ (((index as u64) << 8 | k) << 52);
+    if let Some(d) = &e.description {
+        embed_markdown(ui, app, m, salt(1), d, actions);
     }
-    if let Some(p) = resp.hover_pos() {
-        let idx = galley.cursor_from_pos(p - rect.min).index.0;
-        if let Some((_, url)) = links.iter().find(|(r, _)| r.contains(&idx)) {
-            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-            if resp.clicked() {
-                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+    if !e.fields.is_empty() {
+        let mut i = 0;
+        while i < e.fields.len() {
+            // Up to three consecutive inline fields share a row.
+            let mut n = 1;
+            if e.fields[i].inline {
+                while n < 3 && i + n < e.fields.len() && e.fields[i + n].inline {
+                    n += 1;
+                }
             }
+            let row = &e.fields[i..i + n];
+            ui.columns(n, |cols| {
+                for (k, (col, f)) in cols.iter_mut().zip(row).enumerate() {
+                    col.spacing_mut().item_spacing.y = 2.0;
+                    col.label(RichText::new(&f.name).font(bold(14.0)).color(t.strong));
+                    embed_markdown(col, app, m, salt(2 + (i + k) as u64), &f.value, actions);
+                }
+            });
+            i += n;
         }
     }
+}
+
+fn embed_markdown(
+    ui: &mut Ui,
+    app: &NixApp,
+    m: &Message,
+    key: u64,
+    text: &str,
+    actions: &mut Vec<Action>,
+) {
+    let doc = markdown::parse_cached(ui.ctx(), key, None, text);
+    let resolver = StoreResolver::new(&app.store, Some(m));
+    let emoji = MediaEmoji(&app.media);
+    let mut ctx = RenderCtx::new(app.theme, &resolver, Id::unique(("md-embed", key)));
+    ctx.me = app.store.me().map(|u| u.id.0);
+    ctx.h24 = app.prefs.clock_24h;
+    ctx.emoji = Some(&emoji);
+    ctx.font_size = 14.0;
+    ctx.line_height = 18.0;
+    let out = markdown::render(ui, &*doc, &ctx);
+    if let Some(MdClick::Channel(id)) = out.clicked {
+        actions.push(Action::SelectChannel(Snowflake(id)));
+    }
+}
+
+// ---- reactions ----------------------------------------------------------------------
+
+/// Unicode emoji without the VS16 selector (the monochrome emoji font has no glyph for it).
+fn emoji_text(s: &str) -> Cow<'_, str> {
+    if s.contains('\u{FE0F}') {
+        Cow::Owned(s.replace('\u{FE0F}', ""))
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+
+fn reactions_row(ui: &mut Ui, app: &NixApp, m: &Message, actions: &mut Vec<Action>) {
+    if m.reactions.is_empty() {
+        return;
+    }
+    ui.add_space(2.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
+        for r in &m.reactions {
+            if reaction_pill(ui, app, r).clicked() {
+                let (channel, message, emoji) = (m.channel_id, m.id, r.emoji.clone());
+                actions.push(if r.me {
+                    Action::Unreact {
+                        channel,
+                        message,
+                        emoji,
+                    }
+                } else {
+                    Action::React {
+                        channel,
+                        message,
+                        emoji,
+                    }
+                });
+            }
+        }
+    });
+}
+
+/// One reaction pill: emoji + count, rounded; tinted with a blurple border when mine.
+fn reaction_pill(ui: &mut Ui, app: &NixApp, r: &Reaction) -> egui::Response {
+    let t = app.theme;
+    let count = r.count.to_string();
+    let count_g =
+        ui.painter()
+            .layout_no_wrap(count, bold(14.0), if r.me { t.strong } else { t.text });
+    let size = Vec2::new(8.0 + 18.0 + 6.0 + count_g.size().x + 8.0, 26.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let (fill, stroke) = if r.me {
+        (t.accent.gamma_multiply(0.18), Stroke::new(1.0, t.accent))
+    } else if resp.hovered() {
+        (t.selected, Stroke::new(1.0, t.muted.gamma_multiply(0.5)))
+    } else {
+        (t.hover, Stroke::new(1.0, Color32::TRANSPARENT))
+    };
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(8),
+        fill,
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    let emoji_rect = Rect::from_center_size(
+        Pos2::new(rect.left() + 8.0 + 9.0, rect.center().y),
+        Vec2::splat(18.0),
+    );
+    match (r.emoji.id, r.emoji.name.as_deref()) {
+        (Some(id), _) => {
+            let mut child = ui.new_child(UiBuilder::new().max_rect(emoji_rect));
+            app.media
+                .borrow_mut()
+                .emoji(&mut child, id, r.emoji.animated, 18.0);
+        }
+        (None, Some(name)) => {
+            ui.painter().text(
+                emoji_rect.center(),
+                Align2::CENTER_CENTER,
+                emoji_text(name),
+                prop(16.0),
+                t.strong,
+            );
+        }
+        (None, None) => {}
+    }
+    ui.painter().galley(
+        Pos2::new(
+            emoji_rect.right() + 6.0,
+            rect.center().y - count_g.size().y / 2.0,
+        ),
+        count_g,
+        t.text,
+    );
+    let tip = match &r.emoji.name {
+        Some(n) if r.emoji.id.is_some() => format!(":{n}:"),
+        Some(n) => n.clone(),
+        None => String::new(),
+    };
+    resp.on_hover_text(tip)
 }
 
 // ---- hover toolbar ------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq)]
+enum Tool {
+    React,
+    Edit,
+    Reply,
+    Copy,
+    Delete,
+}
 
 fn toolbar(
     ui: &mut Ui,
@@ -961,17 +1281,17 @@ fn toolbar(
 ) -> Rect {
     let t = app.theme;
     let mine = me == Some(m.author.id);
-    let mut buttons: Vec<(Icon, &str, u8)> = Vec::new();
+    let mut buttons: Vec<(Icon, &str, Tool)> = vec![(Icon::Smile, "Add Reaction", Tool::React)];
     if mine {
-        buttons.push((Icon::Glyph("✏"), "Edit", 0));
+        buttons.push((Icon::Glyph("✏"), "Edit", Tool::Edit));
     }
-    buttons.push((Icon::Glyph("↩"), "Reply", 1));
-    buttons.push((Icon::Copy, "Copy Text", 2));
+    buttons.push((Icon::Glyph("↩"), "Reply", Tool::Reply));
+    buttons.push((Icon::Copy, "Copy Text", Tool::Copy));
     if mine {
         buttons.push((
             Icon::Glyph("🗑"),
             "Delete (Shift+click to skip confirmation)",
-            3,
+            Tool::Delete,
         ));
     }
     let w = buttons.len() as f32 * TOOLBAR_BTN + 8.0;
@@ -994,34 +1314,141 @@ fn toolbar(
     child.add_space(4.0);
     child.spacing_mut().item_spacing.x = 0.0;
     let shift = child.input(|i| i.modifiers.shift);
-    for (glyph, tip, what) in buttons {
-        let resp = icon_button(&mut child, t, glyph, TOOLBAR_BTN, tip);
-        if what == 3 {
-            // Red tint on hover for delete.
-            if resp.hovered() {
-                super::paint_icon(&child, glyph, resp.rect, t.danger);
-            }
+    let mut react_btn = None;
+    for (icon, tip, what) in buttons {
+        let resp = icon_button(&mut child, t, icon, TOOLBAR_BTN, tip);
+        if what == Tool::Delete && resp.hovered() {
+            paint_icon(&child, icon, resp.rect, t.danger);
+        }
+        if what == Tool::React {
+            react_btn = Some(resp.rect);
         }
         if resp.clicked() {
             match what {
-                0 => actions.push(Action::StartEdit {
+                Tool::React => {
+                    let open: Option<Snowflake> = ui.ctx().data(|d| d.get_temp(picker_id()));
+                    ui.ctx().data_mut(|d| {
+                        if open == Some(m.id) {
+                            d.remove::<Snowflake>(picker_id());
+                        } else {
+                            d.insert_temp(picker_id(), m.id);
+                        }
+                    });
+                }
+                Tool::Edit => actions.push(Action::StartEdit {
                     message: m.id,
                     content: m.content.clone(),
                 }),
-                1 => actions.push(Action::StartReply(m.id)),
-                2 => actions.push(Action::Copy(m.content.clone())),
-                _ if shift => actions.push(Action::Delete {
+                Tool::Reply => actions.push(Action::StartReply(m.id)),
+                Tool::Copy => actions.push(Action::Copy(m.content.clone())),
+                Tool::Delete if shift => actions.push(Action::Delete {
                     channel: m.channel_id,
                     message: m.id,
                 }),
-                _ => actions.push(Action::AskDelete {
+                Tool::Delete => actions.push(Action::AskDelete {
                     channel: m.channel_id,
                     message: m.id,
                 }),
             }
         }
     }
-    rect.union(row)
+    let mut covered = rect.union(row);
+    let open: Option<Snowflake> = ui.ctx().data(|d| d.get_temp(picker_id()));
+    if open == Some(m.id) {
+        if let Some(anchor) = react_btn {
+            covered = covered.union(react_picker(ui, app, m, anchor, actions));
+        }
+    }
+    covered
+}
+
+/// Small popup of common emoji under the toolbar's react button.
+fn react_picker(
+    ui: &mut Ui,
+    app: &NixApp,
+    m: &Message,
+    anchor: Rect,
+    actions: &mut Vec<Action>,
+) -> Rect {
+    let t = app.theme;
+    let ctx = ui.ctx().clone();
+    let area = egui::Area::new(Id::unique(("react-picker", m.id.0)))
+        .order(egui::Order::Foreground)
+        .fixed_pos(Pos2::new(
+            anchor.right() - 8.0 * 36.0 - 12.0,
+            anchor.bottom() + 6.0,
+        ))
+        .show(&ctx, |ui| {
+            Frame::new()
+                .fill(t.elevated.to_opaque())
+                .stroke(Stroke::new(1.0, t.divider))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::same(6))
+                .shadow(egui::Shadow {
+                    offset: [0, 4],
+                    blur: 12,
+                    spread: 0,
+                    color: Color32::from_black_alpha(90),
+                })
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        for e in QUICK_REACTIONS {
+                            let (r, resp) =
+                                ui.allocate_exact_size(Vec2::splat(36.0), Sense::click());
+                            if resp.hovered() {
+                                ui.painter().rect_filled(r, CornerRadius::same(6), t.hover);
+                            }
+                            ui.painter().text(
+                                r.center(),
+                                Align2::CENTER_CENTER,
+                                emoji_text(e),
+                                prop(22.0),
+                                t.strong,
+                            );
+                            if resp.clicked() {
+                                let mine = m.reactions.iter().any(|x| {
+                                    x.me && x.emoji.id.is_none()
+                                        && x.emoji.name.as_deref() == Some(e)
+                                });
+                                let emoji = Emoji {
+                                    id: None,
+                                    name: Some(e.to_string()),
+                                    animated: false,
+                                };
+                                let (channel, message) = (m.channel_id, m.id);
+                                actions.push(if mine {
+                                    Action::Unreact {
+                                        channel,
+                                        message,
+                                        emoji,
+                                    }
+                                } else {
+                                    Action::React {
+                                        channel,
+                                        message,
+                                        emoji,
+                                    }
+                                });
+                                ui.ctx().data_mut(|d| d.remove::<Snowflake>(picker_id()));
+                            }
+                        }
+                    });
+                });
+        });
+    let rect = area.response.rect;
+    // Click anywhere else (or Escape) closes it.
+    let close = ctx.input(|i| {
+        i.key_pressed(egui::Key::Escape)
+            || (i.pointer.any_pressed()
+                && i.pointer
+                    .interact_pos()
+                    .is_some_and(|p| !rect.contains(p) && !anchor.contains(p)))
+    });
+    if close {
+        ctx.data_mut(|d| d.remove::<Snowflake>(picker_id()));
+    }
+    rect
 }
 
 // ---- delete confirmation ------------------------------------------------------------

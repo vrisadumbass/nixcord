@@ -2,13 +2,15 @@
 //! applies the `Action`s they emit.
 
 use crate::backend::{self, AppEvent, Backend, Command, HISTORY_PAGE};
+use crate::media::Media;
 use crate::theme::{self, Theme};
 use crate::token;
 use crate::ui::{self, Action};
 use eframe::egui::{self, Color32, CornerRadius, Frame, Id, Margin, Rect};
-use nixcord_model::{GatewayEvent, Snowflake};
+use nixcord_model::{Channel, GatewayEvent, Snowflake};
 use nixcord_store::{ConnectionState, Store};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -130,6 +132,12 @@ pub struct NixApp {
     pub composer: ComposerState,
     pub chat: ChatState,
     pub settings_open: bool,
+    /// Images (avatars, icons, emoji, previews). A `RefCell` because the screens draw from
+    /// `&NixApp` while the cache mutates.
+    pub media: RefCell<Media>,
+    /// Newest message id the user has seen per channel (unread indicators; not persisted).
+    pub seen: HashMap<Snowflake, Snowflake>,
+    seen_dirty: bool,
     toast: Option<(String, Instant)>,
     /// Token + remember flag of the login in flight. Dropped once it resolves.
     pending_login: Option<(String, bool)>,
@@ -163,6 +171,9 @@ impl NixApp {
             composer: ComposerState::default(),
             chat: ChatState::default(),
             settings_open: false,
+            media: RefCell::new(Media::new(&cc.egui_ctx, demo)),
+            seen: HashMap::new(),
+            seen_dirty: false,
             toast: None,
             pending_login: None,
             token_source: None,
@@ -208,12 +219,31 @@ impl NixApp {
                 self.reset_session();
                 self.login.error = Some("Your session expired or the token was revoked.".into());
             }
-            AppEvent::Gateway(ev) => self.store.apply(&ev),
-            AppEvent::History { channel, messages } => {
+            AppEvent::Gateway(ev) => {
+                if matches!(
+                    ev,
+                    GatewayEvent::Ready(_)
+                        | GatewayEvent::GuildCreate(_)
+                        | GatewayEvent::ChannelCreate(_)
+                ) {
+                    self.seen_dirty = true;
+                }
+                self.store.apply(&ev);
+            }
+            AppEvent::History {
+                channel,
+                before,
+                messages,
+            } => {
                 let n = messages.len();
                 let was_older = self.view.older_pending.remove(&channel).is_some();
                 self.view.history_failed.remove(&channel);
-                self.store.insert_history(channel, messages);
+                if before.is_some() {
+                    // Scrolling back: slide the window (may detach from live).
+                    self.store.insert_older_history(channel, messages);
+                } else {
+                    self.store.insert_history(channel, messages);
+                }
                 if n < HISTORY_PAGE as usize {
                     self.view.exhausted.insert(channel);
                 }
@@ -226,20 +256,18 @@ impl NixApp {
                 self.view.forbidden.insert(channel);
                 self.toast("You don't have permission to send messages in this channel.");
             }
-            AppEvent::Error(e) => {
-                // Unblock anything that was waiting so the user can retry.
-                self.view.older_pending.clear();
-                self.chat.anchor = None;
-                let stuck: Vec<Snowflake> = self
-                    .view
-                    .history_requested
-                    .iter()
-                    .copied()
-                    .filter(|c| !self.store.history_loaded(*c))
-                    .collect();
-                self.view.history_failed.extend(stuck);
-                self.toast(e);
+            AppEvent::HistoryFailed { channel, error } => {
+                // Unblock this channel only, so the user can retry it.
+                self.view.older_pending.remove(&channel);
+                if self.chat.anchor.is_some_and(|a| a.channel == channel) {
+                    self.chat.anchor = None;
+                }
+                if !self.store.history_loaded(channel) {
+                    self.view.history_failed.insert(channel);
+                }
+                self.toast(error);
             }
+            AppEvent::Error(e) => self.toast(e),
             AppEvent::LoginOk(_user) => {
                 if let Some((tok, remember)) = self.pending_login.take() {
                     if remember && !tok.is_empty() {
@@ -265,6 +293,8 @@ impl NixApp {
 
     fn reset_session(&mut self) {
         self.store = Store::new();
+        self.media.borrow_mut().clear();
+        self.seen.clear();
         self.view = ViewState::default();
         self.composer = ComposerState::default();
         self.chat.reset();
@@ -335,9 +365,40 @@ impl NixApp {
                 self.view.history_failed.remove(&c);
                 self.view.history_requested.remove(&c);
             }
-            Action::Send { channel, content } => {
-                self.send(Command::Send { channel, content });
+            Action::Send {
+                channel,
+                content,
+                reply_to,
+            } => {
+                // Sending while scrolled back: return to the live end so the message shows.
+                if self.store.is_detached(channel) {
+                    self.jump_to_present(channel);
+                }
+                self.send(Command::Send {
+                    channel,
+                    content,
+                    reply_to,
+                });
             }
+            Action::React {
+                channel,
+                message,
+                emoji,
+            } => self.send(Command::React {
+                channel,
+                message,
+                emoji,
+            }),
+            Action::Unreact {
+                channel,
+                message,
+                emoji,
+            } => self.send(Command::Unreact {
+                channel,
+                message,
+                emoji,
+            }),
+            Action::JumpToPresent(channel) => self.jump_to_present(channel),
             Action::Edit {
                 channel,
                 message,
@@ -399,6 +460,19 @@ impl NixApp {
         self.chat.reset();
     }
 
+    /// Drop a detached (scrolled-back) window; `ensure_history` then refetches the newest
+    /// page for the open channel.
+    fn jump_to_present(&mut self, channel: Snowflake) {
+        self.store.jump_to_present(channel);
+        self.view.history_requested.remove(&channel);
+        self.view.history_failed.remove(&channel);
+        self.view.older_pending.remove(&channel);
+        self.view.exhausted.remove(&channel);
+        if self.chat.anchor.is_some_and(|a| a.channel == channel) {
+            self.chat.anchor = None;
+        }
+    }
+
     /// Request the first page of history for the open channel if we don't have it.
     fn ensure_history(&mut self) {
         let Some(ch) = self.view.channel else { return };
@@ -414,6 +488,51 @@ impl NixApp {
             channel: ch,
             before: None,
         });
+    }
+
+    /// New messages since the user last looked at this channel.
+    pub fn is_unread(&self, ch: &Channel) -> bool {
+        match (ch.last_message_id, self.seen.get(&ch.id)) {
+            (Some(last), Some(seen)) => last > *seen,
+            _ => false,
+        }
+    }
+
+    /// Does this server have an unread text channel?
+    pub fn guild_unread(&self, guild: Snowflake) -> bool {
+        self.store
+            .guild_channels(guild)
+            .into_iter()
+            .any(|c| c.kind.is_textual() && self.is_unread(c))
+    }
+
+    /// Channels we have no read state for start out read (we don't sync Discord's read
+    /// states yet); the open channel is always read up to its newest message.
+    fn update_seen(&mut self) {
+        if std::mem::take(&mut self.seen_dirty) {
+            let store = &self.store;
+            let seen = &mut self.seen;
+            let mut baseline = |c: &Channel| {
+                if let Some(last) = c.last_message_id {
+                    seen.entry(c.id).or_insert(last);
+                } else {
+                    seen.entry(c.id).or_insert(Snowflake(0));
+                }
+            };
+            for g in store.guilds() {
+                for c in store.guild_channels(g.id) {
+                    baseline(c);
+                }
+            }
+            for c in store.private_channels() {
+                baseline(c);
+            }
+        }
+        if let Some(c) = self.view.channel.and_then(|c| self.store.channel(c)) {
+            if let Some(last) = c.last_message_id {
+                self.seen.insert(c.id, last);
+            }
+        }
     }
 
     pub fn members_visible(&self, ctx: &egui::Context) -> bool {
@@ -569,6 +688,7 @@ impl eframe::App for NixApp {
             }
             Screen::Main => {
                 self.ensure_history();
+                self.update_seen();
                 self.main_ui(ui, &mut actions);
                 ui::settings::window(&ctx, self, &mut actions);
                 ui::chat::delete_modal(&ctx, self, &mut actions);

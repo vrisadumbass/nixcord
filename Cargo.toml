@@ -13,6 +13,8 @@ nixcord-model = { path = "crates/nixcord-model" }
 nixcord-gateway = { path = "crates/nixcord-gateway" }
 nixcord-http = { path = "crates/nixcord-http" }
 nixcord-store = { path = "crates/nixcord-store" }
+nixcord-markdown = { path = "crates/nixcord-markdown" }
+nixcord-media = { path = "crates/nixcord-media" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

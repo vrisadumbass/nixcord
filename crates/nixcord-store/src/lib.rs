@@ -4,13 +4,20 @@
 //! - `apply` folds a gateway event into state.
 //! - Messages per channel are kept oldest-first and capped at `MAX_MESSAGES_PER_CHANNEL`
 //!   (oldest evicted) — this cap is the main reason the client stays small in RAM.
+//! - Scrolling back with [`Store::insert_older_history`] slides the window instead: the
+//!   newest messages are evicted and the channel becomes "detached" from live. While
+//!   detached, live MESSAGE_CREATEs are not appended; [`Store::jump_to_present`] drops
+//!   the window so the UI refetches the newest page.
 //!
 //! Layout: guilds, channels and users live in flat `HashMap`s keyed by id. Channels are
 //! stored once, in `channels`; a guild keeps only the list of its channel ids, so the
 //! `Guild` values returned by [`Store::guild`] have an empty `channels` field — use
 //! [`Store::guild_channels`] instead.
 
-use nixcord_model::{Channel, GatewayEvent, Guild, Message, Snowflake, User};
+use nixcord_model::{
+    Channel, Emoji, GatewayEvent, Guild, Message, MessageUpdate, PartialMember, Reaction, Role,
+    Snowflake, User,
+};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -45,6 +52,10 @@ pub struct Store {
     /// Per channel, sorted by id ascending (oldest first), no duplicates, capped.
     messages: HashMap<Snowflake, Vec<Message>>,
     history_loaded: HashSet<Snowflake>,
+    /// Channels whose window was slid back by `insert_older_history` (newest evicted).
+    detached: HashSet<Snowflake>,
+    /// (guild, user) -> roles / nick, learned from `message.member`.
+    members: HashMap<(Snowflake, Snowflake), PartialMember>,
     /// channel -> (user, when TYPING_START was received).
     typing: HashMap<Snowflake, Vec<(Snowflake, Instant)>>,
     users: HashMap<Snowflake, User>,
@@ -84,30 +95,34 @@ impl Store {
                 let replace = !g.channels.is_empty() || !self.guilds.contains_key(&g.id);
                 self.upsert_guild(g, replace);
             }
-            GatewayEvent::GuildDelete { id, .. } => self.remove_guild(*id),
-            // TODO(data agent): apply reactions.
-            GatewayEvent::ReactionAdd { .. } | GatewayEvent::ReactionRemove { .. } => {}
+            GatewayEvent::GuildDelete { id, unavailable } => {
+                if *unavailable {
+                    // Outage: keep everything, grey it out until GUILD_CREATE restores it.
+                    if let Some(g) = self.guilds.get_mut(id) {
+                        g.unavailable = true;
+                    }
+                } else {
+                    self.remove_guild(*id);
+                }
+            }
+            GatewayEvent::ReactionAdd {
+                channel_id,
+                message_id,
+                user_id,
+                emoji,
+            } => self.reaction_add(*channel_id, *message_id, *user_id, emoji),
+            GatewayEvent::ReactionRemove {
+                channel_id,
+                message_id,
+                user_id,
+                emoji,
+            } => self.reaction_remove(*channel_id, *message_id, *user_id, emoji),
             GatewayEvent::ChannelCreate(ch) | GatewayEvent::ChannelUpdate(ch) => {
                 self.upsert_channel(ch)
             }
             GatewayEvent::ChannelDelete(ch) => self.remove_channel(ch.id),
             GatewayEvent::MessageCreate(m) => self.message_create(m),
-            GatewayEvent::MessageUpdate(u) => {
-                if let Some(msgs) = self.messages.get_mut(&u.channel_id) {
-                    if let Ok(i) = msgs.binary_search_by_key(&u.id, |m| m.id) {
-                        let m = &mut msgs[i];
-                        if let Some(c) = &u.content {
-                            m.content.clone_from(c);
-                        }
-                        if u.edited_timestamp.is_some() {
-                            m.edited_timestamp.clone_from(&u.edited_timestamp);
-                        }
-                        if let Some(a) = &u.attachments {
-                            m.attachments.clone_from(a);
-                        }
-                    }
-                }
-            }
+            GatewayEvent::MessageUpdate(u) => self.message_update(u),
             GatewayEvent::MessageDelete { id, channel_id } => {
                 if let Some(msgs) = self.messages.get_mut(channel_id) {
                     if let Ok(i) = msgs.binary_search_by_key(id, |m| m.id) {
@@ -217,10 +232,17 @@ impl Store {
     /// Merge history from REST (any order, may overlap existing) — dedupe by id, keep sorted,
     /// respect the cap (keep the newest). On overlap the already-stored copy wins, since it
     /// may carry gateway edits newer than the REST snapshot.
+    ///
+    /// This is the newest page (or a refresh of it): if the channel was detached, the old
+    /// window is dropped first and the channel re-attaches to live.
     pub fn insert_history(&mut self, channel_id: Snowflake, messages: Vec<Message>) {
+        if self.detached.remove(&channel_id) {
+            self.messages.remove(&channel_id);
+        }
         self.history_loaded.insert(channel_id);
         for m in &messages {
             self.cache_message_users(m);
+            self.cache_member(m);
         }
         if let Some(newest) = messages.iter().map(|m| m.id).max() {
             self.bump_last_message(channel_id, newest);
@@ -234,9 +256,94 @@ impl Store {
         cap(list);
     }
 
+    /// Merge an *older* page (fetched with `before`) after the user scrolled up. Same
+    /// dedupe/ordering as [`Store::insert_history`], but when the cap is exceeded the
+    /// NEWEST messages are evicted and the channel becomes detached from live.
+    pub fn insert_older_history(&mut self, channel_id: Snowflake, messages: Vec<Message>) {
+        self.history_loaded.insert(channel_id);
+        for m in &messages {
+            self.cache_message_users(m);
+            self.cache_member(m);
+        }
+        let list = self.messages.entry(channel_id).or_default();
+        list.extend(messages);
+        list.sort_by_key(|m| m.id);
+        list.dedup_by_key(|m| m.id);
+        if list.len() > MAX_MESSAGES_PER_CHANNEL {
+            list.truncate(MAX_MESSAGES_PER_CHANNEL);
+            self.detached.insert(channel_id);
+        }
+    }
+
+    /// True when the channel's window no longer reaches the newest message (older pages
+    /// pushed the newest out). Live messages are not appended while detached.
+    pub fn is_detached(&self, channel_id: Snowflake) -> bool {
+        self.detached.contains(&channel_id)
+    }
+
+    /// Drop the channel's message window and mark its history unloaded, so the UI fetches
+    /// the newest page again (and re-attaches to live).
+    pub fn jump_to_present(&mut self, channel_id: Snowflake) {
+        self.messages.remove(&channel_id);
+        self.history_loaded.remove(&channel_id);
+        self.detached.remove(&channel_id);
+    }
+
     /// Have we fetched initial history for this channel?
     pub fn history_loaded(&self, channel_id: Snowflake) -> bool {
         self.history_loaded.contains(&channel_id)
+    }
+
+    /// Display color (0xRRGGBB) of a member: the color of their highest-position role that
+    /// has a nonzero color. `None` if unknown or uncolored.
+    pub fn member_color(&self, guild_id: Snowflake, user_id: Snowflake) -> Option<u32> {
+        let member = self.members.get(&(guild_id, user_id))?;
+        let guild = self.guilds.get(&guild_id)?;
+        guild
+            .roles
+            .iter()
+            .filter(|r| r.color != 0 && member.roles.contains(&r.id))
+            // Higher position wins; on a tie Discord ranks the lower (older) id higher.
+            .max_by(|a, b| a.position.cmp(&b.position).then(b.id.cmp(&a.id)))
+            .map(|r| r.color)
+    }
+
+    /// Highest-position role of a member (any color), for grouping a member list.
+    /// `None` if the member or their roles are unknown.
+    pub fn member_top_role(&self, guild_id: Snowflake, user_id: Snowflake) -> Option<&Role> {
+        let member = self.members.get(&(guild_id, user_id))?;
+        self.guilds
+            .get(&guild_id)?
+            .roles
+            .iter()
+            .filter(|r| member.roles.contains(&r.id))
+            .max_by(|a, b| a.position.cmp(&b.position).then(b.id.cmp(&a.id)))
+    }
+
+    /// Guild nickname of a member, if known and set.
+    pub fn member_nick(&self, guild_id: Snowflake, user_id: Snowflake) -> Option<&str> {
+        self.members
+            .get(&(guild_id, user_id))?
+            .nick
+            .as_deref()
+            .filter(|n| !n.is_empty())
+    }
+
+    /// Does this message ping the current user: a direct mention, @everyone/@here, or a
+    /// mention of one of my roles (my roles are known once I have posted in the guild).
+    pub fn is_mentioned(&self, msg: &Message) -> bool {
+        let Some(me) = self.me.as_ref().map(|u| u.id) else {
+            return false;
+        };
+        if msg.mention_everyone || msg.mentions.iter().any(|u| u.id == me) {
+            return true;
+        }
+        if msg.mention_roles.is_empty() {
+            return false;
+        }
+        self.message_guild(msg)
+            .and_then(|g| self.members.get(&(g, me)))
+            .is_some_and(|m| m.roles.iter().any(|r| msg.mention_roles.contains(r)))
     }
 
     /// Users typing in a channel within the last 10 seconds (relative to `now`).
@@ -276,6 +383,112 @@ impl Store {
         self.cache_user(&m.author);
         for u in &m.mentions {
             self.cache_user(u);
+        }
+    }
+
+    /// Guild of a message: its own `guild_id` (gateway), else its channel's (REST history
+    /// omits `guild_id`).
+    fn message_guild(&self, m: &Message) -> Option<Snowflake> {
+        m.guild_id
+            .or_else(|| self.channels.get(&m.channel_id).and_then(|c| c.guild_id))
+    }
+
+    fn cache_member(&mut self, m: &Message) {
+        let Some(member) = &m.member else { return };
+        let Some(guild) = self.message_guild(m) else {
+            return;
+        };
+        match self.members.get_mut(&(guild, m.author.id)) {
+            Some(existing) if existing == member => {}
+            Some(existing) => existing.clone_from(member),
+            None => {
+                self.members.insert((guild, m.author.id), member.clone());
+            }
+        }
+    }
+
+    fn message_mut(&mut self, channel_id: Snowflake, id: Snowflake) -> Option<&mut Message> {
+        let msgs = self.messages.get_mut(&channel_id)?;
+        let i = msgs.binary_search_by_key(&id, |m| m.id).ok()?;
+        Some(&mut msgs[i])
+    }
+
+    fn message_update(&mut self, u: &MessageUpdate) {
+        if let Some(mentions) = &u.mentions {
+            for user in mentions {
+                self.cache_user(user);
+            }
+        }
+        let Some(m) = self.message_mut(u.channel_id, u.id) else {
+            return;
+        };
+        if let Some(c) = &u.content {
+            m.content.clone_from(c);
+        }
+        if u.edited_timestamp.is_some() {
+            m.edited_timestamp.clone_from(&u.edited_timestamp);
+        }
+        if let Some(a) = &u.attachments {
+            m.attachments.clone_from(a);
+        }
+        if let Some(e) = &u.embeds {
+            m.embeds.clone_from(e);
+        }
+        if let Some(mentions) = &u.mentions {
+            m.mentions.clone_from(mentions);
+        }
+    }
+
+    fn reaction_add(
+        &mut self,
+        channel_id: Snowflake,
+        message_id: Snowflake,
+        user_id: Snowflake,
+        emoji: &Emoji,
+    ) {
+        let is_me = self.me.as_ref().is_some_and(|u| u.id == user_id);
+        let Some(m) = self.message_mut(channel_id, message_id) else {
+            return;
+        };
+        match m.reactions.iter_mut().find(|r| same_emoji(&r.emoji, emoji)) {
+            // Our own add already counted (e.g. optimistic update, then the gateway echo).
+            Some(r) if is_me && r.me => {}
+            Some(r) => {
+                r.count += 1;
+                r.me |= is_me;
+            }
+            None => m.reactions.push(Reaction {
+                emoji: emoji.clone(),
+                count: 1,
+                me: is_me,
+            }),
+        }
+    }
+
+    fn reaction_remove(
+        &mut self,
+        channel_id: Snowflake,
+        message_id: Snowflake,
+        user_id: Snowflake,
+        emoji: &Emoji,
+    ) {
+        let is_me = self.me.as_ref().is_some_and(|u| u.id == user_id);
+        let Some(m) = self.message_mut(channel_id, message_id) else {
+            return;
+        };
+        let Some(i) = m.reactions.iter().position(|r| same_emoji(&r.emoji, emoji)) else {
+            return;
+        };
+        let r = &mut m.reactions[i];
+        if is_me && !r.me {
+            return; // our removal already applied
+        }
+        r.count = r.count.saturating_sub(1);
+        if is_me {
+            r.me = false;
+        }
+        if r.count == 0 {
+            m.reactions.remove(i);
         }
     }
 
@@ -319,6 +532,7 @@ impl Store {
     fn remove_guild(&mut self, id: Snowflake) {
         self.guilds.remove(&id);
         self.guild_order.retain(|g| *g != id);
+        self.members.retain(|&(g, _), _| g != id);
         for ch in self.guild_channel_ids.remove(&id).unwrap_or_default() {
             self.drop_channel_data(ch);
         }
@@ -369,14 +583,20 @@ impl Store {
         self.channels.remove(&id);
         self.messages.remove(&id);
         self.history_loaded.remove(&id);
+        self.detached.remove(&id);
         self.typing.remove(&id);
     }
 
     fn message_create(&mut self, m: &Message) {
         self.cache_message_users(m);
+        self.cache_member(m);
         self.bump_last_message(m.channel_id, m.id);
         if let Some(list) = self.typing.get_mut(&m.channel_id) {
             list.retain(|&(u, _)| u != m.author.id);
+        }
+        if self.detached.contains(&m.channel_id) {
+            // The window shows older history; the new message is fetched on jump_to_present.
+            return;
         }
         let loaded = self.history_loaded.contains(&m.channel_id);
         let Some(list) = self
@@ -397,6 +617,15 @@ impl Store {
             },
         }
         cap(list);
+    }
+}
+
+/// Unicode emoji compare by name, custom emoji by id (names can change).
+fn same_emoji(a: &Emoji, b: &Emoji) -> bool {
+    match (a.id, b.id) {
+        (Some(x), Some(y)) => x == y,
+        (None, None) => a.name == b.name,
+        _ => false,
     }
 }
 

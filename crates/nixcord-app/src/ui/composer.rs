@@ -42,6 +42,42 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
     };
     let mut cancel = false;
 
+    if app.store.is_detached(ch) {
+        // Scrolled back past the live window: offer the way back.
+        Frame::new()
+            .fill(t.accent.gamma_multiply(0.9))
+            .corner_radius(CornerRadius {
+                nw: 8,
+                ne: 8,
+                sw: 0,
+                se: 0,
+            })
+            .inner_margin(Margin::symmetric(14, 5))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("You're viewing older messages")
+                            .font(bold(13.5))
+                            .color(t.on_accent),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let jump = ui.add(
+                            egui::Button::new(
+                                RichText::new("Jump to present")
+                                    .font(bold(13.5))
+                                    .color(t.on_accent),
+                            )
+                            .frame(false),
+                        );
+                        if jump.clicked() {
+                            actions.push(Action::JumpToPresent(ch));
+                        }
+                    });
+                });
+            });
+    }
+
     if app.view.forbidden.contains(&ch) {
         ui.add_space(2.0);
         Frame::new()
@@ -222,14 +258,13 @@ fn submit(app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Action>) {
     if content.is_empty() {
         return;
     }
-    // NOTE: the REST API in nixcord-http has no message_reference yet, so replies are
-    // sent as plain messages for now.
-    app.composer.reply_to = None;
+    let reply_to = app.composer.reply_to.take();
     app.composer.text.clear();
     app.composer.last_typing = None;
     actions.push(Action::Send {
         channel: ch,
         content,
+        reply_to,
     });
 }
 
