@@ -216,4 +216,69 @@ mod tests {
         o.on_session_start(true);
         assert!(!o.is_empty(), "fresh session re-sends the last status");
     }
+
+    #[test]
+    fn presence_carries_normalizes_and_resends_custom_status() {
+        let t0 = Instant::now();
+        let mut o = Outbox::new();
+        o.push(GatewayCommand::SetPresence {
+            status: Status::Online,
+            custom_status: Some(CustomStatus {
+                text: Some("  hacking on nixcord  ".into()),
+                emoji: Some(nixcord_model::Emoji {
+                    id: None,
+                    name: Some("🦀".into()),
+                    animated: false,
+                }),
+            }),
+        });
+        let sent = o.take_due(t0);
+        assert_eq!(sent.len(), 1);
+        let p = v(&sent[0]);
+        assert_eq!(p["op"], 3);
+        assert_eq!(p["d"]["status"], "online");
+        assert_eq!(
+            p["d"]["activities"],
+            v(
+                r#"[{"type":4,"name":"Custom Status","state":"hacking on nixcord","emoji":{"name":"🦀"}}]"#
+            )
+        );
+
+        // Coalescing within the throttle window: clearing custom status with whitespace-only
+        // text drops the activity and sends `activities: []`.
+        o.push(GatewayCommand::SetPresence {
+            status: Status::Idle,
+            custom_status: Some(CustomStatus {
+                text: Some("   ".into()),
+                emoji: None,
+            }),
+        });
+        assert!(o.take_due(t0 + Duration::from_secs(1)).is_empty());
+        let sent = o.take_due(t0 + PRESENCE_INTERVAL);
+        let p = v(&sent[0]);
+        assert_eq!(p["d"]["status"], "idle");
+        assert_eq!(p["d"]["activities"], v("[]"));
+
+        // Re-set a custom status and verify fresh session (READY) re-queues both status & custom status.
+        let t2 = t0 + PRESENCE_INTERVAL * 2;
+        o.push(GatewayCommand::SetPresence {
+            status: Status::Dnd,
+            custom_status: Some(CustomStatus {
+                text: Some("deep work".into()),
+                emoji: None,
+            }),
+        });
+        assert_eq!(o.take_due(t2).len(), 1);
+        assert!(o.is_empty());
+
+        o.on_session_start(true);
+        assert!(!o.is_empty());
+        let resent = o.take_due(t2 + PRESENCE_INTERVAL);
+        let p = v(&resent[0]);
+        assert_eq!(p["d"]["status"], "dnd");
+        assert_eq!(
+            p["d"]["activities"],
+            v(r#"[{"type":4,"name":"Custom Status","state":"deep work"}]"#)
+        );
+    }
 }
