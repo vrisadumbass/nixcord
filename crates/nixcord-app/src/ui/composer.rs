@@ -172,15 +172,30 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
 
     let id = Id::unique(("composer", ch));
     let focused = ui.memory(|m| m.has_focus(id));
+    let can_accept_paste =
+        app.composer.editing.is_none() && (focused || ui.memory(|m| m.focused().is_none()));
 
-    // Clipboard image paste (Ctrl+V / Cmd+V): if no non-empty text Event::Paste is present,
-    // check the OS clipboard on a background thread and stage any image as `pasted-image.png`.
-    if focused && app.composer.editing.is_none() && ui.input(should_paste_clipboard_image) {
-        ui.input_mut(|i| {
-            i.consume_key(Modifiers::COMMAND, Key::V);
-            i.consume_key(Modifiers::CTRL, Key::V);
-        });
-        spawn_clipboard_paste(ui.ctx().clone(), &mut app.composer);
+    // Clipboard image / file paste (Ctrl+V / Cmd+V):
+    // 1. egui-winit 0.37 intercepts Ctrl+V on key-press and emits `egui::Event::PasteImage`
+    //    when the OS clipboard holds an image bitmap (Snipping Tool, PrtScn, browser Copy Image).
+    // 2. When the user copies file(s) in File Explorer (`CF_HDROP`) or in headless/fallback
+    //    contexts, no `Paste` or `PasteImage` is emitted on press; we catch `Ctrl+V` and query
+    //    `arboard` for either an image bitmap or a copied `file_list()`.
+    if can_accept_paste {
+        let pasted_images = take_pasted_color_images(ui);
+        if !pasted_images.is_empty() {
+            app.composer.want_focus = true;
+            for img in pasted_images {
+                spawn_color_image_paste(ui.ctx().clone(), &mut app.composer, img);
+            }
+        } else if ui.input(should_paste_clipboard_image) {
+            ui.input_mut(|i| {
+                i.consume_key(Modifiers::COMMAND, Key::V);
+                i.consume_key(Modifiers::CTRL, Key::V);
+            });
+            let slots = MAX_ATTACHMENTS.saturating_sub(app.composer.attachments.len());
+            spawn_clipboard_paste(ui.ctx().clone(), &mut app.composer, slots);
+        }
     }
 
     // Emoji autocomplete: its keys are taken before the text edit sees them.
@@ -539,36 +554,45 @@ fn spawn_file_picker(ctx: egui::Context, composer: &mut ComposerState, max_files
     }
 }
 
-/// Returns `true` when the input frame requests a paste (`Ctrl+V` / `Cmd+V` or an empty
-/// `Event::Paste`) without any non-empty text `Event::Paste`, indicating we should check
-/// the OS clipboard for an image while letting normal text pastes flow to `TextEdit`.
-fn should_paste_clipboard_image(input: &egui::InputState) -> bool {
-    let has_text_paste = input
-        .events
-        .iter()
-        .any(|e| matches!(e, egui::Event::Paste(text) if !text.is_empty()));
-    if has_text_paste {
-        return false;
-    }
-    let has_empty_paste = input
-        .events
-        .iter()
-        .any(|e| matches!(e, egui::Event::Paste(text) if text.is_empty()));
-    let has_ctrl_v = input.key_pressed(Key::V) && (input.modifiers.command || input.modifiers.ctrl);
-    has_empty_paste || has_ctrl_v
+/// Extract and consume any `egui::Event::PasteImage` events emitted by `egui-winit` on `Ctrl+V`.
+fn take_pasted_color_images(ui: &mut Ui) -> Vec<std::sync::Arc<egui::ColorImage>> {
+    ui.input_mut(|i| {
+        let mut out = Vec::new();
+        i.events.retain(|ev| match ev {
+            egui::Event::PasteImage(img) => {
+                out.push(img.clone());
+                false
+            }
+            _ => true,
+        });
+        out
+    })
 }
 
-/// Spawn a non-blocking background thread to check the OS clipboard for an image,
-/// encode it to PNG in memory, and stage it as `"pasted-image.png"`.
-fn spawn_clipboard_paste(ctx: egui::Context, composer: &mut ComposerState) {
+/// Convert a premultiplied [`egui::ColorImage`] (from `egui::Event::PasteImage`) back to
+/// straight (unmultiplied) RGBA8 bytes suitable for PNG encoding.
+fn color_image_to_rgba8(img: &egui::ColorImage) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity(img.pixels.len().saturating_mul(4));
+    for c in &img.pixels {
+        rgba.extend_from_slice(&c.to_srgba_unmultiplied());
+    }
+    rgba
+}
+
+/// Encode an [`egui::ColorImage`] from `Event::PasteImage` to `"pasted-image.png"` on a
+/// background thread and stage it into the composer attachment tray.
+fn spawn_color_image_paste(
+    ctx: egui::Context,
+    composer: &mut ComposerState,
+    img: std::sync::Arc<egui::ColorImage>,
+) {
     let (tx, rx) = mpsc::channel();
     let spawned = std::thread::Builder::new()
-        .name("nixcord-paste".into())
+        .name("nixcord-paste-img".into())
         .spawn(move || {
-            let Ok(img) = arboard::Clipboard::new().and_then(|mut cb| cb.get_image()) else {
-                return;
-            };
-            let batch = match encode_rgba_png(img.width, img.height, img.bytes.as_ref()) {
+            let [w, h] = img.size;
+            let rgba = color_image_to_rgba8(&img);
+            let batch = match encode_rgba_png(w, h, &rgba) {
                 Ok(png_bytes) => (
                     vec![UploadFile::from_bytes("pasted-image.png", png_bytes)],
                     Vec::new(),
@@ -577,6 +601,74 @@ fn spawn_clipboard_paste(ctx: egui::Context, composer: &mut ComposerState) {
             };
             let _ = tx.send(batch);
             ctx.request_repaint();
+        });
+    if spawned.is_ok() {
+        composer.attach_rxs.push(rx);
+    }
+}
+
+/// Returns `true` when the input frame requests a fallback clipboard check (`Ctrl+V` / `Cmd+V`
+/// press or release, or an empty `Event::Paste`) without any non-empty text `Event::Paste` or
+/// `Event::PasteImage`. Notably, when files are copied in Windows Explorer (`CF_HDROP`),
+/// `egui-winit` swallows `Key::V` on press (because neither text nor bitmap is present) and
+/// only forwards `Key::V` with `pressed: false` on key release.
+fn should_paste_clipboard_image(input: &egui::InputState) -> bool {
+    let has_text_or_img_paste = input.events.iter().any(|e| {
+        matches!(e, egui::Event::Paste(text) if !text.is_empty())
+            || matches!(e, egui::Event::PasteImage(_))
+    });
+    if has_text_or_img_paste {
+        return false;
+    }
+    let has_empty_paste = input
+        .events
+        .iter()
+        .any(|e| matches!(e, egui::Event::Paste(text) if text.is_empty()));
+    let cmd_held = input.modifiers.command || input.modifiers.ctrl;
+    let has_ctrl_v_press = input.key_pressed(Key::V) && cmd_held;
+    let has_ctrl_v_event = input.events.iter().any(|e| {
+        matches!(
+            e,
+            egui::Event::Key {
+                key: Key::V,
+                modifiers,
+                ..
+            } if modifiers.command || modifiers.ctrl || cmd_held
+        )
+    });
+    has_empty_paste || has_ctrl_v_press || has_ctrl_v_event
+}
+
+/// Spawn a non-blocking background thread to check the OS clipboard via `arboard` for either:
+/// 1. an image bitmap (`get_image()`), encoded to `"pasted-image.png"`, or
+/// 2. a list of copied files from the OS file manager (`get().file_list()`).
+fn spawn_clipboard_paste(ctx: egui::Context, composer: &mut ComposerState, max_files: usize) {
+    let (tx, rx) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("nixcord-paste".into())
+        .spawn(move || {
+            let Ok(mut cb) = arboard::Clipboard::new() else {
+                return;
+            };
+            if let Ok(img) = cb.get_image() {
+                let batch = match encode_rgba_png(img.width, img.height, img.bytes.as_ref()) {
+                    Ok(png_bytes) => (
+                        vec![UploadFile::from_bytes("pasted-image.png", png_bytes)],
+                        Vec::new(),
+                    ),
+                    Err(err) => (Vec::new(), vec![err]),
+                };
+                let _ = tx.send(batch);
+                ctx.request_repaint();
+                return;
+            }
+            if let Ok(paths) = cb.get().file_list() {
+                if !paths.is_empty() && max_files > 0 {
+                    let batch = load_paths(&paths, max_files);
+                    let _ = tx.send(batch);
+                    ctx.request_repaint();
+                }
+            }
         });
     if spawned.is_ok() {
         composer.attach_rxs.push(rx);
@@ -1530,5 +1622,24 @@ mod tests {
         let mut input = egui::InputState::default();
         input.events.push(egui::Event::Paste(String::new()));
         assert!(should_paste_clipboard_image(&input));
+
+        // Key::V release with Ctrl held (emitted by egui-winit when CF_HDROP files are copied)
+        // triggers fallback clipboard check.
+        let mut input = egui::InputState::default();
+        input.events.push(egui::Event::Key {
+            key: Key::V,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: Modifiers::CTRL,
+        });
+        assert!(should_paste_clipboard_image(&input));
+
+        // PasteImage event is handled directly by take_pasted_color_images and unmultiplies RGBA.
+        let color_img =
+            egui::ColorImage::from_rgba_unmultiplied([2, 1], &[255, 0, 0, 255, 0, 255, 0, 128]);
+        let rgba = color_image_to_rgba8(&color_img);
+        let png = encode_rgba_png(2, 1, &rgba).unwrap();
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
     }
 }
