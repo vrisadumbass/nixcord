@@ -17,3 +17,5 @@ tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 aws-lc-rs = { version = "1.19", default-features = false, features = ["aws-lc-sys"] }
 cpal = "0.18.2"
+# Pure-Rust Opus codec (RFC 6716 / RFC 8251, BSD-3-Clause, zero C/CMake deps).
+rusty-opus = "1.1"

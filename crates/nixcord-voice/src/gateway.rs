@@ -200,6 +200,7 @@ impl AudioState {
             VoiceCommand::SetDeaf(d) => self.deafened = d,
             VoiceCommand::SetInputGain(_)
             | VoiceCommand::SetOutputVolume(_)
+            | VoiceCommand::SetVadThreshold(_)
             | VoiceCommand::SetInputDevice(_)
             | VoiceCommand::SetOutputDevice(_)
             | VoiceCommand::Disconnect => {}

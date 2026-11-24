@@ -11,6 +11,7 @@ pub mod codec;
 pub mod crypto;
 pub mod gateway;
 pub mod mixer;
+pub mod pipeline;
 pub mod protocol;
 pub mod rtp;
 pub mod session;
@@ -26,6 +27,7 @@ pub enum VoiceCommand {
     SetDeaf(bool),
     SetInputGain(f32),
     SetOutputVolume(f32),
+    SetVadThreshold(f32),
     SetInputDevice(Option<String>),
     SetOutputDevice(Option<String>),
     Disconnect,

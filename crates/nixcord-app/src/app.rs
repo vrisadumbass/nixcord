@@ -1202,6 +1202,7 @@ impl NixApp {
             output_device: self.view.voice.output_device.clone(),
             input_gain: self.view.voice.input_gain,
             output_volume: self.view.voice.output_volume,
+            vad_threshold_db: self.view.voice.vad_threshold_db,
         };
         self.send(Command::ConnectVoice(params));
     }

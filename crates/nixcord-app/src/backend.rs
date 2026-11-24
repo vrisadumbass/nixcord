@@ -75,6 +75,7 @@ pub struct VoiceConnectParams {
     pub output_device: Option<String>,
     pub input_gain: f32,
     pub output_volume: f32,
+    pub vad_threshold_db: f32,
 }
 
 impl std::fmt::Debug for VoiceConnectParams {
@@ -347,33 +348,31 @@ impl Session {
 
 #[cfg(feature = "voice")]
 struct VoiceHandle {
-    commands: mpsc::UnboundedSender<nixcord_voice::VoiceCommand>,
+    gw_commands: mpsc::UnboundedSender<nixcord_voice::VoiceCommand>,
+    audio_commands: mpsc::UnboundedSender<nixcord_voice::VoiceCommand>,
 }
 
 #[cfg(feature = "voice")]
 impl VoiceHandle {
     fn spawn(params: VoiceConnectParams, events: EventTx) -> Self {
-        let (vcmd_tx, vcmd_rx) = mpsc::unbounded_channel();
+        let (gw_cmd_tx, gw_cmd_rx) = mpsc::unbounded_channel();
+        let (audio_cmd_tx, audio_cmd_rx) = mpsc::unbounded_channel();
         let (vev_tx, mut vev_rx) = mpsc::unbounded_channel();
-        let (_out_tx, out_rx) = mpsc::unbounded_channel();
-        let (in_tx, mut in_rx) = mpsc::unbounded_channel();
+        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        let (in_tx, in_rx) = mpsc::unbounded_channel();
 
-        let _ = vcmd_tx.send(nixcord_voice::VoiceCommand::SetMute(params.self_mute));
-        let _ = vcmd_tx.send(nixcord_voice::VoiceCommand::SetDeaf(params.self_deaf));
-        let _ = vcmd_tx.send(nixcord_voice::VoiceCommand::SetInputGain(params.input_gain));
-        let _ = vcmd_tx.send(nixcord_voice::VoiceCommand::SetOutputVolume(
-            params.output_volume,
-        ));
-        if params.input_device.is_some() {
-            let _ = vcmd_tx.send(nixcord_voice::VoiceCommand::SetInputDevice(
-                params.input_device.clone(),
-            ));
-        }
-        if params.output_device.is_some() {
-            let _ = vcmd_tx.send(nixcord_voice::VoiceCommand::SetOutputDevice(
-                params.output_device.clone(),
-            ));
-        }
+        let _ = gw_cmd_tx.send(nixcord_voice::VoiceCommand::SetMute(params.self_mute));
+        let _ = gw_cmd_tx.send(nixcord_voice::VoiceCommand::SetDeaf(params.self_deaf));
+
+        let pipeline_cfg = nixcord_voice::pipeline::PipelineConfig {
+            muted: params.self_mute,
+            deafened: params.self_deaf,
+            input_gain: params.input_gain,
+            output_volume: params.output_volume,
+            vad_threshold_db: params.vad_threshold_db,
+            input_device: params.input_device.clone(),
+            output_device: params.output_device.clone(),
+        };
 
         let join = nixcord_voice::VoiceJoinInfo {
             guild_id: params.guild_id,
@@ -384,7 +383,7 @@ impl VoiceHandle {
             endpoint: params.endpoint,
         };
 
-        tokio::spawn(async move { while in_rx.recv().await.is_some() {} });
+        nixcord_voice::pipeline::spawn(pipeline_cfg, audio_cmd_rx, vev_tx.clone(), out_tx, in_rx);
 
         let ev_out = events.clone();
         tokio::spawn(async move {
@@ -394,23 +393,32 @@ impl VoiceHandle {
         });
 
         tokio::spawn(async move {
-            if let Err(e) = nixcord_voice::gateway::run(join, vcmd_rx, vev_tx, out_rx, in_tx).await
+            if let Err(e) =
+                nixcord_voice::gateway::run(join, gw_cmd_rx, vev_tx, out_rx, in_tx).await
             {
                 tracing::warn!("voice gateway stopped: {e}");
             }
         });
 
-        Self { commands: vcmd_tx }
-    }
-
-    fn send(&self, ctrl: VoiceControl) {
-        if let Some(cmd) = map_voice_control(ctrl) {
-            let _ = self.commands.send(cmd);
+        Self {
+            gw_commands: gw_cmd_tx,
+            audio_commands: audio_cmd_tx,
         }
     }
 
+    fn send(&self, ctrl: VoiceControl) {
+        let cmd = map_voice_control(ctrl);
+        let _ = self.gw_commands.send(cmd.clone());
+        let _ = self.audio_commands.send(cmd);
+    }
+
     fn stop(self) {
-        let _ = self.commands.send(nixcord_voice::VoiceCommand::Disconnect);
+        let _ = self
+            .gw_commands
+            .send(nixcord_voice::VoiceCommand::Disconnect);
+        let _ = self
+            .audio_commands
+            .send(nixcord_voice::VoiceCommand::Disconnect);
     }
 }
 
@@ -445,15 +453,15 @@ fn map_voice_event(ev: nixcord_voice::VoiceEvent) -> AppVoiceEvent {
 }
 
 #[cfg(feature = "voice")]
-fn map_voice_control(ctrl: VoiceControl) -> Option<nixcord_voice::VoiceCommand> {
+fn map_voice_control(ctrl: VoiceControl) -> nixcord_voice::VoiceCommand {
     match ctrl {
-        VoiceControl::SetMute(m) => Some(nixcord_voice::VoiceCommand::SetMute(m)),
-        VoiceControl::SetDeaf(d) => Some(nixcord_voice::VoiceCommand::SetDeaf(d)),
-        VoiceControl::SetInputGain(g) => Some(nixcord_voice::VoiceCommand::SetInputGain(g)),
-        VoiceControl::SetOutputVolume(v) => Some(nixcord_voice::VoiceCommand::SetOutputVolume(v)),
-        VoiceControl::SetInputDevice(d) => Some(nixcord_voice::VoiceCommand::SetInputDevice(d)),
-        VoiceControl::SetOutputDevice(d) => Some(nixcord_voice::VoiceCommand::SetOutputDevice(d)),
-        VoiceControl::SetVadThreshold(_) => None,
+        VoiceControl::SetMute(m) => nixcord_voice::VoiceCommand::SetMute(m),
+        VoiceControl::SetDeaf(d) => nixcord_voice::VoiceCommand::SetDeaf(d),
+        VoiceControl::SetInputGain(g) => nixcord_voice::VoiceCommand::SetInputGain(g),
+        VoiceControl::SetOutputVolume(v) => nixcord_voice::VoiceCommand::SetOutputVolume(v),
+        VoiceControl::SetInputDevice(d) => nixcord_voice::VoiceCommand::SetInputDevice(d),
+        VoiceControl::SetOutputDevice(d) => nixcord_voice::VoiceCommand::SetOutputDevice(d),
+        VoiceControl::SetVadThreshold(db) => nixcord_voice::VoiceCommand::SetVadThreshold(db),
     }
 }
 

@@ -162,9 +162,153 @@ impl VoiceDecoder for PassthroughPcmCodec {
     }
 }
 
+/// Pure-Rust Opus encoder backed by `rusty-opus` (48 kHz stereo VoIP).
+pub struct OpusEncoderBackend {
+    inner: rusty_opus::OpusEncoder,
+}
+
+impl OpusEncoderBackend {
+    /// Create a 48 kHz stereo VoIP Opus encoder at Discord's standard 64 kbps bitrate.
+    pub fn new() -> Result<Self, CodecError> {
+        let mut inner = rusty_opus::OpusEncoder::new(
+            SAMPLE_RATE as i32,
+            CHANNELS,
+            rusty_opus::Application::Voip,
+        )
+        .map_err(|e| CodecError::Backend(e.to_string()))?;
+        inner.bitrate_bps = 64_000;
+        Ok(Self { inner })
+    }
+}
+
+impl VoiceEncoder for OpusEncoderBackend {
+    fn encode(&mut self, pcm: &[f32], out: &mut [u8]) -> Result<usize, CodecError> {
+        if pcm.len() != FRAME_PCM_LEN {
+            return Err(CodecError::InvalidFrameSize {
+                expected: FRAME_PCM_LEN,
+                actual: pcm.len(),
+            });
+        }
+        self.inner
+            .encode(pcm, FRAME_SAMPLES, out)
+            .map_err(|e| CodecError::Backend(e.to_string()))
+    }
+
+    fn set_bitrate(&mut self, bps: u32) -> Result<(), CodecError> {
+        self.inner.bitrate_bps = bps.clamp(6_000, 510_000) as i32;
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        let bitrate = self.inner.bitrate_bps;
+        if let Ok(mut fresh) = rusty_opus::OpusEncoder::new(
+            SAMPLE_RATE as i32,
+            CHANNELS,
+            rusty_opus::Application::Voip,
+        ) {
+            fresh.bitrate_bps = bitrate;
+            self.inner = fresh;
+        }
+    }
+}
+
+/// Pure-Rust Opus decoder backed by `rusty-opus` (48 kHz stereo).
+pub struct OpusDecoderBackend {
+    inner: rusty_opus::OpusDecoder,
+}
+
+impl OpusDecoderBackend {
+    /// Create a 48 kHz stereo Opus decoder.
+    pub fn new() -> Result<Self, CodecError> {
+        let inner = rusty_opus::OpusDecoder::new(SAMPLE_RATE as i32, CHANNELS)
+            .map_err(|e| CodecError::Backend(e.to_string()))?;
+        Ok(Self { inner })
+    }
+}
+
+impl VoiceDecoder for OpusDecoderBackend {
+    fn decode(&mut self, packet: &[u8], out: &mut [f32]) -> Result<usize, CodecError> {
+        if out.len() < FRAME_PCM_LEN {
+            return Err(CodecError::BufferTooSmall {
+                needed: FRAME_PCM_LEN,
+                available: out.len(),
+            });
+        }
+        if packet == OPUS_SILENCE {
+            out[..FRAME_PCM_LEN].fill(0.0);
+            return Ok(FRAME_PCM_LEN);
+        }
+        let samples_per_ch = self
+            .inner
+            .decode(packet, FRAME_SAMPLES, out)
+            .map_err(|e| CodecError::InvalidPacket(e.to_string()))?;
+        Ok(samples_per_ch * CHANNELS)
+    }
+
+    fn decode_plc(&mut self, out: &mut [f32]) -> Result<usize, CodecError> {
+        if out.len() < FRAME_PCM_LEN {
+            return Err(CodecError::BufferTooSmall {
+                needed: FRAME_PCM_LEN,
+                available: out.len(),
+            });
+        }
+        match self.inner.decode(&[], FRAME_SAMPLES, out) {
+            Ok(samples_per_ch) => Ok(samples_per_ch * CHANNELS),
+            Err(_) => {
+                out[..FRAME_PCM_LEN].fill(0.0);
+                Ok(FRAME_PCM_LEN)
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        if let Ok(fresh) = rusty_opus::OpusDecoder::new(SAMPLE_RATE as i32, CHANNELS) {
+            self.inner = fresh;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opus_roundtrip_encodes_and_decodes_sine_wave() {
+        let mut enc = OpusEncoderBackend::new().expect("opus encoder");
+        let mut dec = OpusDecoderBackend::new().expect("opus decoder");
+        let mut pkt = [0u8; 1500];
+        let mut decoded = vec![0.0f32; FRAME_PCM_LEN];
+
+        // Feed a few 20 ms frames of 440 Hz stereo sine so Opus settles past lookahead.
+        let mut max_amp = 0.0f32;
+        for frame_idx in 0..5 {
+            let mut pcm = vec![0.0f32; FRAME_PCM_LEN];
+            for i in 0..FRAME_SAMPLES {
+                let t = (frame_idx * FRAME_SAMPLES + i) as f32 / SAMPLE_RATE as f32;
+                let s = 0.4 * (2.0 * std::f32::consts::PI * 440.0 * t).sin();
+                pcm[i * 2] = s;
+                pcm[i * 2 + 1] = s;
+            }
+            let n = enc.encode(&pcm, &mut pkt).expect("encode opus");
+            assert!(n > 0 && n < 500, "unexpected opus packet size: {n}");
+
+            let out_len = dec.decode(&pkt[..n], &mut decoded).expect("decode opus");
+            assert_eq!(out_len, FRAME_PCM_LEN);
+            for &s in &decoded {
+                max_amp = max_amp.max(s.abs());
+            }
+        }
+        assert!(
+            max_amp > 0.15,
+            "decoded Opus signal should preserve audio energy (max_amp={max_amp})"
+        );
+
+        // Silence packet decodes cleanly to zeros.
+        decoded.fill(1.0);
+        let n = dec.decode(&OPUS_SILENCE, &mut decoded).unwrap();
+        assert_eq!(n, FRAME_PCM_LEN);
+        assert!(decoded.iter().all(|&s| s == 0.0));
+    }
 
     #[test]
     fn constants_match_discord_voice_spec() {

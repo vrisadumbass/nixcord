@@ -94,6 +94,7 @@ crates/nixcord-gateway  websocket gateway (identify, heartbeat, resume)
 crates/nixcord-http     REST client
 crates/nixcord-store    in-memory state, capped per channel
 crates/nixcord-video    inline video: MP4/MOV demux, OpenH264, symphonia audio, cpal
+crates/nixcord-voice    voice calls: Voice Gateway, AEAD RTP, rusty-opus, cpal
 crates/nixcord-app      the egui app (binary: nixcord)
 ```
 
@@ -121,4 +122,7 @@ Video playback (the `video` feature) links these codec libraries:
   with `-p nixcord --no-default-features` to leave H.264 out.
 - [Symphonia](https://github.com/pdeljanov/Symphonia) AAC and MP3 decoders, MPL-2.0
   (used unmodified; source at the link).
+
+Voice calls (the `voice` feature) use [`rusty-opus`](https://crates.io/crates/rusty-opus)
+(pure-Rust Opus encoder/decoder, BSD-3-Clause).
 - [cpal](https://github.com/RustAudio/cpal) (audio output), Apache-2.0.
