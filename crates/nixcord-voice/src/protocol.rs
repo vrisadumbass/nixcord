@@ -20,7 +20,19 @@ pub const OP_HEARTBEAT_ACK: u8 = 6;
 pub const OP_RESUME: u8 = 7;
 pub const OP_HELLO: u8 = 8;
 pub const OP_RESUMED: u8 = 9;
+pub const OP_CLIENTS_CONNECT: u8 = 11;
 pub const OP_CLIENT_DISCONNECT: u8 = 13;
+pub const OP_DAVE_PREPARE_TRANSITION: u8 = 21;
+pub const OP_DAVE_EXECUTE_TRANSITION: u8 = 22;
+pub const OP_DAVE_READY_FOR_TRANSITION: u8 = 23;
+pub const OP_DAVE_PREPARE_EPOCH: u8 = 24;
+pub const OP_DAVE_MLS_EXTERNAL_SENDER: u8 = 25;
+pub const OP_DAVE_MLS_KEY_PACKAGE: u8 = 26;
+pub const OP_DAVE_MLS_PROPOSALS: u8 = 27;
+pub const OP_DAVE_MLS_COMMIT_WELCOME: u8 = 28;
+pub const OP_DAVE_MLS_ANNOUNCE_COMMIT_TRANSITION: u8 = 29;
+pub const OP_DAVE_MLS_WELCOME: u8 = 30;
+pub const OP_DAVE_MLS_INVALID_COMMIT_WELCOME: u8 = 31;
 
 /// Preferred Discord voice transport encryption mode.
 pub const ENCRYPTION_MODE_AES256_GCM_RTPSIZE: &str = "aead_aes256_gcm_rtpsize";
@@ -30,12 +42,24 @@ pub const SPEAKING_MICROPHONE: u32 = 1 << 0;
 pub const SPEAKING_SOUNDSHARE: u32 = 1 << 1;
 pub const SPEAKING_PRIORITY: u32 = 1 << 2;
 
-/// An incoming Voice Gateway frame.
+/// An incoming Voice Gateway JSON frame.
 #[derive(Debug, Deserialize)]
 pub struct VoiceFrame {
     pub op: u8,
     #[serde(default)]
     pub d: Value,
+    #[serde(default)]
+    pub seq: Option<u64>,
+}
+
+/// Parse an incoming Voice Gateway v8 binary frame (`[seq_be: u16][op: u8][payload...]`).
+pub fn parse_binary_frame(bytes: &[u8]) -> Option<(u16, u8, &[u8])> {
+    if bytes.len() < 3 {
+        return None;
+    }
+    let seq = u16::from_be_bytes([bytes[0], bytes[1]]);
+    let op = bytes[2];
+    Some((seq, op, &bytes[3..]))
 }
 
 impl VoiceFrame {
@@ -51,7 +75,7 @@ impl VoiceFrame {
 
 /// Normalize a Discord voice `endpoint` from `VOICE_SERVER_UPDATE` (e.g.
 /// `"us-west1234.discord.media"` or `"us-west1234.discord.media:443"`) into a
-/// connectable WebSocket URL (`wss://<endpoint>/?v=4`).
+/// connectable WebSocket URL (`wss://<endpoint>/?v=8`).
 pub fn voice_gateway_url(endpoint: &str) -> String {
     let trimmed = endpoint.trim();
     let with_scheme = if trimmed.starts_with("wss://") || trimmed.starts_with("ws://") {
@@ -62,17 +86,18 @@ pub fn voice_gateway_url(endpoint: &str) -> String {
     if with_scheme.contains('?') {
         with_scheme
     } else {
-        format!("{}/?v=4", with_scheme.trim_end_matches('/'))
+        format!("{}/?v=8", with_scheme.trim_end_matches('/'))
     }
 }
 
-/// Op 0: Identify.
+/// Op 0: Identify (v8 with DAVE support).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Identify {
     pub server_id: Snowflake,
     pub user_id: Snowflake,
     pub session_id: String,
     pub token: String,
+    pub max_dave_protocol_version: u16,
 }
 
 impl fmt::Debug for Identify {
@@ -82,6 +107,7 @@ impl fmt::Debug for Identify {
             .field("user_id", &self.user_id)
             .field("session_id", &self.session_id)
             .field("token", &"<redacted>")
+            .field("max_dave_protocol_version", &self.max_dave_protocol_version)
             .finish()
     }
 }
@@ -136,6 +162,8 @@ pub struct Heartbeat(pub u64);
 pub struct SessionDescription {
     pub mode: String,
     pub secret_key: [u8; 32],
+    #[serde(default)]
+    pub dave_protocol_version: u16,
 }
 
 impl fmt::Debug for SessionDescription {
@@ -143,6 +171,7 @@ impl fmt::Debug for SessionDescription {
         f.debug_struct("SessionDescription")
             .field("mode", &self.mode)
             .field("secret_key", &"<redacted>")
+            .field("dave_protocol_version", &self.dave_protocol_version)
             .finish()
     }
 }
@@ -223,12 +252,13 @@ impl<'de> Deserialize<'de> for HeartbeatAck {
     }
 }
 
-/// Op 7: Resume.
+/// Op 7: Resume (v8 with `seq_ack`).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resume {
     pub server_id: Snowflake,
     pub session_id: String,
     pub token: String,
+    pub seq_ack: i64,
 }
 
 impl fmt::Debug for Resume {
@@ -237,6 +267,7 @@ impl fmt::Debug for Resume {
             .field("server_id", &self.server_id)
             .field("session_id", &self.session_id)
             .field("token", &"<redacted>")
+            .field("seq_ack", &self.seq_ack)
             .finish()
     }
 }
@@ -262,10 +293,37 @@ impl Hello {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Resumed;
 
+/// Op 11: Clients Connect (v8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientsConnect {
+    #[serde(default)]
+    pub user_ids: Vec<Snowflake>,
+}
+
 /// Op 13: Client Disconnect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientDisconnect {
     pub user_id: Snowflake,
+}
+
+/// Op 21: DAVE Protocol Prepare Transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct DavePrepareTransition {
+    pub protocol_version: u16,
+    pub transition_id: u16,
+}
+
+/// Op 22: DAVE Protocol Execute Transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct DaveExecuteTransition {
+    pub transition_id: u16,
+}
+
+/// Op 24: DAVE Protocol Prepare Epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct DavePrepareEpoch {
+    pub protocol_version: u16,
+    pub epoch: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +350,38 @@ pub fn heartbeat_payload(nonce: u64) -> String {
     json!({
         "op": OP_HEARTBEAT,
         "d": Heartbeat(nonce),
+    })
+    .to_string()
+}
+
+/// Voice Gateway v8 Heartbeat (`{"op":3,"d":{"t":nonce,"seq_ack":seq_ack}}`).
+pub fn heartbeat_payload_v8(nonce: u64, seq_ack: i64) -> String {
+    json!({
+        "op": OP_HEARTBEAT,
+        "d": {
+            "t": nonce,
+            "seq_ack": seq_ack,
+        },
+    })
+    .to_string()
+}
+
+pub fn dave_ready_for_transition_payload(transition_id: u16) -> String {
+    json!({
+        "op": OP_DAVE_READY_FOR_TRANSITION,
+        "d": {
+            "transition_id": transition_id,
+        },
+    })
+    .to_string()
+}
+
+pub fn dave_invalid_commit_welcome_payload(transition_id: u16) -> String {
+    json!({
+        "op": OP_DAVE_MLS_INVALID_COMMIT_WELCOME,
+        "d": {
+            "transition_id": transition_id,
+        },
     })
     .to_string()
 }
@@ -328,6 +418,7 @@ mod tests {
             user_id: Snowflake(20),
             session_id: "sess_abc".into(),
             token: "super_secret_voice_token".into(),
+            max_dave_protocol_version: davey::DAVE_PROTOCOL_VERSION,
         };
         let dbg = format!("{id:?}");
         assert!(!dbg.contains("super_secret_voice_token"));
@@ -341,6 +432,7 @@ mod tests {
         assert_eq!(v["d"]["user_id"], "20");
         assert_eq!(v["d"]["session_id"], "sess_abc");
         assert_eq!(v["d"]["token"], "super_secret_voice_token");
+        assert_eq!(v["d"]["max_dave_protocol_version"], 1);
     }
 
     #[test]
@@ -349,6 +441,7 @@ mod tests {
             server_id: Snowflake(10),
             session_id: "sess_abc".into(),
             token: "another_secret_token".into(),
+            seq_ack: 12,
         };
         let dbg = format!("{r:?}");
         assert!(!dbg.contains("another_secret_token"));
@@ -360,6 +453,7 @@ mod tests {
         assert_eq!(v["d"]["server_id"], "10");
         assert_eq!(v["d"]["session_id"], "sess_abc");
         assert_eq!(v["d"]["token"], "another_secret_token");
+        assert_eq!(v["d"]["seq_ack"], 12);
     }
 
     #[test]
@@ -370,6 +464,7 @@ mod tests {
         let sd = SessionDescription {
             mode: ENCRYPTION_MODE_AES256_GCM_RTPSIZE.into(),
             secret_key: key,
+            dave_protocol_version: 1,
         };
         let dbg = format!("{sd:?}");
         assert!(!dbg.contains("171")); // 0xAB
@@ -454,11 +549,11 @@ mod tests {
     fn voice_gateway_url_normalizes_endpoint() {
         assert_eq!(
             voice_gateway_url("us-west1234.discord.media"),
-            "wss://us-west1234.discord.media/?v=4"
+            "wss://us-west1234.discord.media/?v=8"
         );
         assert_eq!(
             voice_gateway_url("us-west1234.discord.media:443/"),
-            "wss://us-west1234.discord.media:443/?v=4"
+            "wss://us-west1234.discord.media:443/?v=8"
         );
         assert_eq!(
             voice_gateway_url("wss://voice.example.test/?v=8"),

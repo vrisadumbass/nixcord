@@ -9,6 +9,7 @@
 pub mod audio;
 pub mod codec;
 pub mod crypto;
+pub mod dave;
 pub mod gateway;
 pub mod mixer;
 pub mod pipeline;

@@ -19,3 +19,5 @@ aws-lc-rs = { version = "1.19", default-features = false, features = ["aws-lc-sy
 cpal = "0.18.2"
 # Pure-Rust Opus codec (RFC 6716 / RFC 8251, BSD-3-Clause, zero C/CMake deps).
 rusty-opus = "1.1"
+# Discord Audio & Video End-to-End Encryption (DAVE) protocol (MLS + SFrame, MIT).
+davey = "0.2"

@@ -20,7 +20,8 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::crypto::{FrameCipher, PassthroughCipher, VoiceCipher};
-use crate::protocol::SPEAKING_MICROPHONE;
+use crate::dave::{DaveManager, DaveOutgoing};
+use crate::protocol::{self, SPEAKING_MICROPHONE};
 use crate::rtp::{self, RtpHeader, OPUS_SILENCE_FRAME};
 use crate::session::{Backoff, CloseAction, Outgoing, RetryDelay, VoiceAction, VoiceSession};
 use crate::udp;
@@ -94,6 +95,7 @@ pub async fn run_with_cipher(
     );
     let mut backoff = Backoff::default();
     let mut audio_state = AudioState::default();
+    let mut dave = DaveManager::new(join.user_id, join.channel_id);
 
     loop {
         emit(VoiceEvent::Connecting {
@@ -134,6 +136,7 @@ pub async fn run_with_cipher(
                     inbound_opus: &inbound_opus,
                     frame_cipher: frame_cipher.as_mut(),
                     audio_state: &mut audio_state,
+                    dave: &mut dave,
                 };
                 drive(ws, &join.token, &mut session, &mut backoff, &mut io).await?
             }
@@ -224,6 +227,7 @@ struct DriveIo<'a, E> {
     inbound_opus: &'a mpsc::UnboundedSender<(u32, Vec<u8>)>,
     frame_cipher: &'a mut dyn FrameCipher,
     audio_state: &'a mut AudioState,
+    dave: &'a mut DaveManager,
 }
 
 struct UdpTransport {
@@ -286,7 +290,7 @@ where
                             self_speaking = false;
                             speaking_idle_deadline = None;
                             if let Some(t) = udp_transport.as_mut() {
-                                send_silence_burst(t, io.audio_state, io.frame_cipher).await;
+                                send_silence_burst(t, io.audio_state, io.dave, io.frame_cipher).await;
                                 let payload = session.payload(
                                     Outgoing::Speaking {
                                         speaking: 0,
@@ -326,7 +330,7 @@ where
                                 (io.emit)(VoiceEvent::SelfSpeaking(true))?;
                             }
                             speaking_idle_deadline = Some(TokioInstant::now() + SPEAKING_IDLE_TIMEOUT);
-                            send_opus_packet(t, io.audio_state, io.frame_cipher, samples, &opus).await;
+                            send_opus_packet(t, io.audio_state, io.dave, io.frame_cipher, samples, &opus).await;
                         }
                     }
                 }
@@ -336,7 +340,7 @@ where
                 self_speaking = false;
                 speaking_idle_deadline = None;
                 if let Some(t) = udp_transport.as_mut() {
-                    send_silence_burst(t, io.audio_state, io.frame_cipher).await;
+                    send_silence_burst(t, io.audio_state, io.dave, io.frame_cipher).await;
                     let payload = session.payload(
                         Outgoing::Speaking {
                             speaking: 0,
@@ -366,7 +370,15 @@ where
                                         Ok((hdr, opus)) => {
                                             match io.frame_cipher.decrypt_frame(hdr.ssrc, &opus) {
                                                 Ok(plain) => {
-                                                    let _ = io.inbound_opus.send((hdr.ssrc, plain));
+                                                    let speaker = session.user_for_ssrc(hdr.ssrc);
+                                                    match io.dave.decrypt_opus(speaker, &plain) {
+                                                        Ok(clear) => {
+                                                            let _ = io.inbound_opus.send((hdr.ssrc, clear));
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::debug!(error = %e, ssrc = hdr.ssrc, "DAVE decrypt failed");
+                                                        }
+                                                    }
                                                 }
                                                 Err(e) => {
                                                     tracing::debug!(error = %e, ssrc = hdr.ssrc, "frame cipher decrypt failed");
@@ -386,6 +398,19 @@ where
             }
             msg = stream.next() => match msg {
                 Some(Ok(Message::Text(text))) => session.handle_text(text.as_str(), Instant::now()),
+                Some(Ok(Message::Binary(bin))) => {
+                    if let Some((seq, op, payload)) = protocol::parse_binary_frame(&bin) {
+                        session.record_seq(u64::from(seq));
+                        let out = io.dave.on_binary(op, payload);
+                        if let Err(e) = send_dave_outgoing(&mut sink, out).await {
+                            return Ok(ConnEnd::Retry {
+                                reason: format!("voice DAVE send failed: {e}"),
+                                delay: RetryDelay::Backoff,
+                            });
+                        }
+                    }
+                    Vec::new()
+                }
                 Some(Ok(Message::Close(frame))) => {
                     let code = frame.as_ref().map(|f| u16::from(f.code));
                     return Ok(match session.on_close(code) {
@@ -500,6 +525,50 @@ where
                             t.ssrc = ssrc;
                         }
                     }
+                    VoiceAction::DaveSessionDescription { protocol_version } => {
+                        let out = io.dave.on_session_description(protocol_version);
+                        if let Err(e) = send_dave_outgoing(&mut sink, out).await {
+                            return Ok(ConnEnd::Retry {
+                                reason: format!("voice DAVE send failed: {e}"),
+                                delay: RetryDelay::Backoff,
+                            });
+                        }
+                    }
+                    VoiceAction::DaveClientsConnect(ids) => {
+                        io.dave.on_clients_connect(&ids);
+                    }
+                    VoiceAction::DaveClientDisconnect(uid) => {
+                        io.dave.on_client_disconnect(uid);
+                    }
+                    VoiceAction::DavePrepareTransition {
+                        transition_id,
+                        protocol_version,
+                    } => {
+                        let out = io
+                            .dave
+                            .on_prepare_transition(transition_id, protocol_version);
+                        if let Err(e) = send_dave_outgoing(&mut sink, out).await {
+                            return Ok(ConnEnd::Retry {
+                                reason: format!("voice DAVE send failed: {e}"),
+                                delay: RetryDelay::Backoff,
+                            });
+                        }
+                    }
+                    VoiceAction::DaveExecuteTransition { transition_id } => {
+                        io.dave.on_execute_transition(transition_id);
+                    }
+                    VoiceAction::DavePrepareEpoch {
+                        epoch,
+                        protocol_version,
+                    } => {
+                        let out = io.dave.on_prepare_epoch(epoch, protocol_version);
+                        if let Err(e) = send_dave_outgoing(&mut sink, out).await {
+                            return Ok(ConnEnd::Retry {
+                                reason: format!("voice DAVE send failed: {e}"),
+                                delay: RetryDelay::Backoff,
+                            });
+                        }
+                    }
                     VoiceAction::Emit(ev) => {
                         if matches!(ev, VoiceEvent::Connected { .. }) {
                             backoff.reset();
@@ -520,9 +589,23 @@ where
     }
 }
 
+async fn send_dave_outgoing<S>(sink: &mut S, out: Vec<DaveOutgoing>) -> Result<(), S::Error>
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    for msg in out {
+        match msg {
+            DaveOutgoing::Json(text) => sink.send(Message::text(text)).await?,
+            DaveOutgoing::Binary(bytes) => sink.send(Message::Binary(bytes.into())).await?,
+        }
+    }
+    Ok(())
+}
+
 async fn send_opus_packet(
     transport: &mut UdpTransport,
     audio_state: &mut AudioState,
+    dave: &mut DaveManager,
     frame_cipher: &mut dyn FrameCipher,
     samples: u32,
     opus: &[u8],
@@ -530,7 +613,14 @@ async fn send_opus_packet(
     let Some(cipher) = transport.cipher.as_mut() else {
         return;
     };
-    let payload = match frame_cipher.encrypt_frame(transport.ssrc, opus) {
+    let dave_payload = match dave.encrypt_opus(opus) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(error = %e, "DAVE encrypt failed");
+            return;
+        }
+    };
+    let payload = match frame_cipher.encrypt_frame(transport.ssrc, &dave_payload) {
         Ok(p) => p,
         Err(e) => {
             tracing::debug!(error = %e, "frame cipher encrypt failed");
@@ -561,12 +651,14 @@ async fn send_opus_packet(
 async fn send_silence_burst(
     transport: &mut UdpTransport,
     audio_state: &mut AudioState,
+    dave: &mut DaveManager,
     frame_cipher: &mut dyn FrameCipher,
 ) {
     for _ in 0..rtp::OPUS_SILENCE_BURST_LEN {
         send_opus_packet(
             transport,
             audio_state,
+            dave,
             frame_cipher,
             DEFAULT_FRAME_SAMPLES,
             &OPUS_SILENCE_FRAME,

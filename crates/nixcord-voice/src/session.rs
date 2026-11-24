@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use nixcord_model::Snowflake;
 
 use crate::protocol::{
-    self, ClientDisconnect, HeartbeatAck, Hello, Identify, Ready, Resume, SelectProtocol,
+    self, ClientDisconnect, ClientsConnect, DaveExecuteTransition, DavePrepareEpoch,
+    DavePrepareTransition, HeartbeatAck, Hello, Identify, Ready, Resume, SelectProtocol,
     SessionDescription, Speaking, VoiceFrame, ENCRYPTION_MODE_AES256_GCM_RTPSIZE,
 };
 use crate::VoiceEvent;
@@ -69,6 +70,22 @@ pub enum VoiceAction {
         secret_key: [u8; 32],
         ssrc: u32,
     },
+    DaveSessionDescription {
+        protocol_version: u16,
+    },
+    DaveClientsConnect(Vec<Snowflake>),
+    DaveClientDisconnect(Snowflake),
+    DavePrepareTransition {
+        transition_id: u16,
+        protocol_version: u16,
+    },
+    DaveExecuteTransition {
+        transition_id: u16,
+    },
+    DavePrepareEpoch {
+        epoch: u64,
+        protocol_version: u16,
+    },
     Emit(VoiceEvent),
     Reconnect {
         reason: String,
@@ -101,6 +118,36 @@ impl std::fmt::Debug for VoiceAction {
                 .field("mode", mode)
                 .field("secret_key", &"<redacted>")
                 .field("ssrc", ssrc)
+                .finish(),
+            Self::DaveSessionDescription { protocol_version } => f
+                .debug_struct("DaveSessionDescription")
+                .field("protocol_version", protocol_version)
+                .finish(),
+            Self::DaveClientsConnect(ids) => {
+                f.debug_tuple("DaveClientsConnect").field(ids).finish()
+            }
+            Self::DaveClientDisconnect(id) => {
+                f.debug_tuple("DaveClientDisconnect").field(id).finish()
+            }
+            Self::DavePrepareTransition {
+                transition_id,
+                protocol_version,
+            } => f
+                .debug_struct("DavePrepareTransition")
+                .field("transition_id", transition_id)
+                .field("protocol_version", protocol_version)
+                .finish(),
+            Self::DaveExecuteTransition { transition_id } => f
+                .debug_struct("DaveExecuteTransition")
+                .field("transition_id", transition_id)
+                .finish(),
+            Self::DavePrepareEpoch {
+                epoch,
+                protocol_version,
+            } => f
+                .debug_struct("DavePrepareEpoch")
+                .field("epoch", epoch)
+                .field("protocol_version", protocol_version)
                 .finish(),
             Self::Emit(ev) => f.debug_tuple("Emit").field(ev).finish(),
             Self::Reconnect { reason, delay } => f
@@ -142,6 +189,7 @@ pub struct VoiceSession {
     /// True once we have completed a Ready/SessionDescription handshake so a
     /// subsequent disconnect can attempt Op 7 Resume.
     can_resume: bool,
+    last_seq: Option<u64>,
     awaiting_ack: bool,
     next_nonce: u64,
     pending_heartbeat: Option<(u64, Instant)>,
@@ -166,6 +214,7 @@ impl VoiceSession {
             ssrc: None,
             selected_mode: None,
             can_resume: false,
+            last_seq: None,
             awaiting_ack: false,
             next_nonce: 1,
             pending_heartbeat: None,
@@ -186,6 +235,14 @@ impl VoiceSession {
         self.ssrc_to_user.get(&ssrc).copied()
     }
 
+    pub fn record_seq(&mut self, seq: u64) {
+        self.last_seq = Some(seq);
+    }
+
+    fn seq_ack(&self) -> i64 {
+        self.last_seq.map_or(-1, |s| s as i64)
+    }
+
     pub fn connect_url(&self) -> String {
         protocol::voice_gateway_url(&self.endpoint)
     }
@@ -193,6 +250,7 @@ impl VoiceSession {
     /// Forget resumable state so the next Hello sends Op 0 Identify.
     pub fn invalidate(&mut self) {
         self.can_resume = false;
+        self.last_seq = None;
         self.ssrc = None;
         self.selected_mode = None;
     }
@@ -211,13 +269,15 @@ impl VoiceSession {
                 user_id: self.user_id,
                 session_id: self.session_id.clone(),
                 token: token.to_owned(),
+                max_dave_protocol_version: davey::DAVE_PROTOCOL_VERSION,
             }),
             Outgoing::Resume => protocol::resume_payload(&Resume {
                 server_id: self.guild_id,
                 session_id: self.session_id.clone(),
                 token: token.to_owned(),
+                seq_ack: self.seq_ack(),
             }),
-            Outgoing::Heartbeat { nonce } => protocol::heartbeat_payload(nonce),
+            Outgoing::Heartbeat { nonce } => protocol::heartbeat_payload_v8(nonce, self.seq_ack()),
             Outgoing::SelectProtocol {
                 address,
                 port,
@@ -273,6 +333,9 @@ impl VoiceSession {
     }
 
     pub fn handle_frame(&mut self, frame: &VoiceFrame, now: Instant) -> Vec<VoiceAction> {
+        if let Some(seq) = frame.seq {
+            self.last_seq = Some(seq);
+        }
         match frame.op {
             protocol::OP_HELLO => {
                 let ms = frame
@@ -348,6 +411,9 @@ impl VoiceSession {
                         secret_key: desc.secret_key,
                         ssrc,
                     },
+                    VoiceAction::DaveSessionDescription {
+                        protocol_version: desc.dave_protocol_version,
+                    },
                     VoiceAction::Emit(VoiceEvent::Connected {
                         guild_id: Some(self.guild_id),
                         channel_id: self.channel_id,
@@ -400,6 +466,16 @@ impl VoiceSession {
                     endpoint: self.endpoint.clone(),
                 })]
             }
+            protocol::OP_CLIENTS_CONNECT => {
+                let cc: ClientsConnect = match frame.decode_data() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "malformed voice ClientsConnect");
+                        return Vec::new();
+                    }
+                };
+                vec![VoiceAction::DaveClientsConnect(cc.user_ids)]
+            }
             protocol::OP_CLIENT_DISCONNECT => {
                 let dc: ClientDisconnect = match frame.decode_data() {
                     Ok(d) => d,
@@ -408,15 +484,54 @@ impl VoiceSession {
                         return Vec::new();
                     }
                 };
+                let mut actions = vec![VoiceAction::DaveClientDisconnect(dc.user_id)];
                 if let Some(ssrc) = self.user_to_ssrc.remove(&dc.user_id) {
                     self.ssrc_to_user.remove(&ssrc);
-                    return vec![VoiceAction::Emit(VoiceEvent::Speaking {
+                    actions.push(VoiceAction::Emit(VoiceEvent::Speaking {
                         user_id: dc.user_id,
                         ssrc,
                         speaking: false,
-                    })];
+                    }));
                 }
-                Vec::new()
+                actions
+            }
+            protocol::OP_DAVE_PREPARE_TRANSITION => {
+                let pt: DavePrepareTransition = match frame.decode_data() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "malformed DAVE PrepareTransition");
+                        return Vec::new();
+                    }
+                };
+                vec![VoiceAction::DavePrepareTransition {
+                    transition_id: pt.transition_id,
+                    protocol_version: pt.protocol_version,
+                }]
+            }
+            protocol::OP_DAVE_EXECUTE_TRANSITION => {
+                let et: DaveExecuteTransition = match frame.decode_data() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "malformed DAVE ExecuteTransition");
+                        return Vec::new();
+                    }
+                };
+                vec![VoiceAction::DaveExecuteTransition {
+                    transition_id: et.transition_id,
+                }]
+            }
+            protocol::OP_DAVE_PREPARE_EPOCH => {
+                let pe: DavePrepareEpoch = match frame.decode_data() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "malformed DAVE PrepareEpoch");
+                        return Vec::new();
+                    }
+                };
+                vec![VoiceAction::DavePrepareEpoch {
+                    epoch: pe.epoch,
+                    protocol_version: pe.protocol_version,
+                }]
             }
             op => {
                 tracing::debug!(op, "ignoring unhandled voice gateway opcode");
@@ -593,6 +708,9 @@ mod tests {
                     secret_key: key,
                     ssrc: 1234,
                 },
+                VoiceAction::DaveSessionDescription {
+                    protocol_version: 0,
+                },
                 VoiceAction::Emit(VoiceEvent::Connected {
                     guild_id: Some(Snowflake(100)),
                     channel_id: Snowflake(200),
@@ -680,11 +798,14 @@ mod tests {
         let a = s.handle_text(r#"{"op":13,"d":{"user_id":"444"}}"#, t0);
         assert_eq!(
             a,
-            vec![VoiceAction::Emit(VoiceEvent::Speaking {
-                user_id: Snowflake(444),
-                ssrc: 888,
-                speaking: false,
-            })]
+            vec![
+                VoiceAction::DaveClientDisconnect(Snowflake(444)),
+                VoiceAction::Emit(VoiceEvent::Speaking {
+                    user_id: Snowflake(444),
+                    ssrc: 888,
+                    speaking: false,
+                }),
+            ]
         );
         assert_eq!(s.user_for_ssrc(888), None);
     }

@@ -124,5 +124,6 @@ Video playback (the `video` feature) links these codec libraries:
   (used unmodified; source at the link).
 
 Voice calls (the `voice` feature) use [`rusty-opus`](https://crates.io/crates/rusty-opus)
-(pure-Rust Opus encoder/decoder, BSD-3-Clause).
+(pure-Rust Opus encoder/decoder, BSD-3-Clause) and [`davey`](https://crates.io/crates/davey)
+(Discord DAVE E2EE protocol via OpenMLS, MIT).
 - [cpal](https://github.com/RustAudio/cpal) (audio output), Apache-2.0.
