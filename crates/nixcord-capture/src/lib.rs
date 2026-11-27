@@ -12,25 +12,58 @@
 //!   still `"<str>"`;
 //! - every id is replaced by a salted hash that still looks like a snowflake: strings of
 //!   15-20 digits, integers of at least 10^15, and object keys that are ids (op 37-style
-//!   maps), except permission bitfields (`permissions`, `allow`, `deny`), which become
-//!   placeholders like any string. The same id maps to the same hash within one run, so references between
-//!   payloads stay intact; the salt is random per process, so hashes cannot be reversed
-//!   by hashing known ids, and differ between runs. Ordering between ids is not kept;
-//! - integers that look like epoch timestamps (seconds or milliseconds, 2001-2286) become
-//!   a fixed time; other numbers, booleans and nulls are kept (types, flags, counts);
-//! - object keys are kept only when they look like field names (`[A-Za-z0-9_.-]`, at most
-//!   64 chars), else replaced by `"<key:N>"`;
-//! - REST paths keep only lowercase route words (`channels`, `@me`, ...); ids are hashed,
-//!   anything else (emoji, names) becomes `<seg>`, and the query string is dropped.
+//!   maps), except string permission bitfields (`permissions`, `allow`, `deny`), which
+//!   become placeholders like any string. The same id maps to the same hash within one
+//!   run, so references between payloads stay intact; the salt is random per process, so
+//!   hashes cannot be reversed by hashing known ids, and differ between runs. Ordering
+//!   between ids is not kept;
+//! - numbers that look like epoch timestamps become a fixed time: integers in the
+//!   seconds range (10^9 up to 10^10, 2001-2286) become [`FIXED_SECS`], integers in the
+//!   milliseconds range (10^12 up to 10^13) become [`FIXED_MILLIS`], and integers of
+//!   -10^9 or below become [`FIXED_SECS`]. Floats never keep a magnitude of 10^9 or
+//!   more: in the seconds range they become `FIXED_SECS` as a float, above it
+//!   `FIXED_MILLIS` as a float, so no fractional epoch survives;
+//! - numbers under a closed list of keys ([`ZEROED_NUMBER_KEYS`]) become `0`, also when
+//!   they sit directly in an array under such a key. These are the keys whose numbers
+//!   describe one real server, user or message rather than the payload's shape: colors
+//!   (`color`, `accent_color`, `banner_color`, `primary_color`, `secondary_color`,
+//!   `tertiary_color`), ordering (`position`), `discriminator`, channel and server
+//!   settings (`bitrate`, `user_limit`, `rate_limit_per_user`,
+//!   `default_thread_rate_limit_per_user`, `afk_timeout`, `max_members`, `max_presences`,
+//!   `max_video_channel_users`, `max_stage_video_channel_users`), counts (`count`,
+//!   `burst`, `normal`, `member_count`, `approximate_member_count`,
+//!   `approximate_presence_count`, `presence_count`, `online_count`,
+//!   `premium_subscription_count`, `message_count`, `total_message_sent`,
+//!   `mention_count`, `total_results`, `uses`, `max_uses`, `max_age`) and media
+//!   measurements (`size`, `width`, `height`, `duration_secs`);
+//! - every other number is kept verbatim, with booleans and nulls: `type`, `flags`,
+//!   `op`, `version`, numeric permission bits, enum levels, list indexes and ranges, and
+//!   small floats such as `retry_after`. So an integer below 10^9, from 10^10 up to
+//!   10^12, or from 10^13 up to 10^15, and a float below 10^9 in magnitude, is written
+//!   as it was received unless its key is in the list above;
+//! - object keys are kept only when they look like field names: lowercase ASCII letters,
+//!   digits and `_`, starting with a letter or `_`, at most 48 chars. Id keys are hashed;
+//!   every other key becomes `"<key:N>"` (N is its position in the object). A map keyed
+//!   by user data that is itself a lowercase word of that form would keep that word;
+//! - REST paths keep only segments from a closed list of route words ([`ROUTE_WORDS`]:
+//!   `channels`, `@me`, ...); all-digit segments are hashed like ids; anything else
+//!   (emoji, names, codes, tokens) becomes `<seg>`. The segment after `invites` or
+//!   `reactions`, and the one after the id that follows `webhooks` or `interactions`,
+//!   is always `<seg>`, whatever it looks like. The query string and fragment are
+//!   dropped;
+//! - the HTTP method when it is 1-8 uppercase letters (else `<method>`), the status
+//!   code, and the gateway event name when it is uppercase letters and `_` (else
+//!   `<event>`). A body that is not JSON is written as `"<non-json>"`.
 //!
 //! Never written: outgoing payloads (identify carries the token), request bodies, any
 //! header. Volume is capped: [`MAX_PER_NAME`] records per event type / route and
-//! [`MAX_TOTAL_BYTES`] in total, after which capture stops.
+//! [`MAX_TOTAL_BYTES`] in total, after which capture stops. A record over a cap is
+//! dropped before its body is parsed or redacted.
 //!
 //! Dependency-free on purpose (serde_json and tracing only) so both nixcord-gateway and
 //! nixcord-http can call it without depending on each other.
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Map, Number, Value};
 use std::collections::hash_map::{DefaultHasher, RandomState};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -46,7 +79,6 @@ pub const MAX_PER_NAME: u32 = 20;
 /// Capture stops after this many bytes in total.
 pub const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Keys whose digit strings are bitfields, not ids: always a plain placeholder.
 /// Enum strings kept verbatim, by key. Closed lists of generic protocol words, so they
 /// can carry no personal data. Anything outside a list is still a placeholder.
 pub const ENUM_VALUES: &[(&str, &[&str])] = &[
@@ -70,6 +102,7 @@ fn allowed_enum(key: &str, value: &str) -> bool {
         .any(|(k, vs)| *k == key && vs.contains(&value))
 }
 
+/// Keys whose digit strings are bitfields, not ids: always a plain placeholder.
 const BITFIELD_KEYS: &[&str] = &[
     "permissions",
     "permissions_new",
@@ -79,16 +112,148 @@ const BITFIELD_KEYS: &[&str] = &[
     "deny_new",
 ];
 
+/// Keys whose numeric values become `0`. Closed list: numbers that describe one real
+/// server, user or message (colors, ordering, settings, counts, media measurements)
+/// rather than the shape of the payload. Structural numbers (`type`, `flags`, `op`,
+/// `version`, permission bits, enum levels, indexes) are deliberately not here.
+pub const ZEROED_NUMBER_KEYS: &[&str] = &[
+    // Colors.
+    "color",
+    "accent_color",
+    "banner_color",
+    "primary_color",
+    "secondary_color",
+    "tertiary_color",
+    // Ordering and identity.
+    "position",
+    "discriminator",
+    // Channel and server settings.
+    "bitrate",
+    "user_limit",
+    "rate_limit_per_user",
+    "default_thread_rate_limit_per_user",
+    "afk_timeout",
+    "max_members",
+    "max_presences",
+    "max_video_channel_users",
+    "max_stage_video_channel_users",
+    // Counts.
+    "count",
+    "burst",
+    "normal",
+    "member_count",
+    "approximate_member_count",
+    "approximate_presence_count",
+    "presence_count",
+    "online_count",
+    "premium_subscription_count",
+    "message_count",
+    "total_message_sent",
+    "mention_count",
+    "total_results",
+    "uses",
+    "max_uses",
+    "max_age",
+    // Media measurements.
+    "size",
+    "width",
+    "height",
+    "duration_secs",
+];
+
+/// REST path segments kept verbatim. Closed list of generic Discord route words;
+/// every other non-id segment becomes [`SEG`].
+pub const ROUTE_WORDS: &[&str] = &[
+    "@me",
+    "@original",
+    "ack",
+    "ack-bulk",
+    "active",
+    "answers",
+    "application-commands",
+    "applications",
+    "archived",
+    "attachments",
+    "audit-logs",
+    "bans",
+    "bulk-delete",
+    "callback",
+    "channels",
+    "commands",
+    "crosspost",
+    "emojis",
+    "expire",
+    "followers",
+    "gifs",
+    "guilds",
+    "integrations",
+    "interactions",
+    "invites",
+    "members",
+    "messages",
+    "notes",
+    "permissions",
+    "pins",
+    "polls",
+    "preview",
+    "private",
+    "profile",
+    "public",
+    "reactions",
+    "read-states",
+    "recipients",
+    "regions",
+    "relationships",
+    "roles",
+    "scheduled-events",
+    "search",
+    "settings",
+    "stage-instances",
+    "sticker-packs",
+    "stickers",
+    "suggest",
+    "thread-members",
+    "threads",
+    "trending",
+    "trending-gifs",
+    "typing",
+    "users",
+    "voice",
+    "voice-states",
+    "webhooks",
+];
+
+/// Route words whose next segment is free-form (an invite code, an emoji): always
+/// [`SEG`], even when it is all digits or happens to equal a route word.
+const OPAQUE_AFTER: &[&str] = &["invites", "reactions"];
+/// Route words followed by an id and then a token: the token is always [`SEG`].
+const TOKEN_AFTER_ID: &[&str] = &["webhooks", "interactions"];
+
+/// Replacement for a path segment that is neither an id nor a route word.
+pub const SEG: &str = "<seg>";
+/// Replacement for numbers under [`ZEROED_NUMBER_KEYS`].
+pub const ZERO: u64 = 0;
+
 pub const STR: &str = "<str>";
 pub const EMPTY: &str = "<empty>";
-/// Replacement for epoch-second-looking integers (2023-11-14).
+/// Replacement for epoch-second-looking numbers (2023-11-14).
 pub const FIXED_SECS: i64 = 1_700_000_000;
-/// Replacement for epoch-millisecond-looking integers.
+/// Replacement for epoch-millisecond-looking numbers.
 pub const FIXED_MILLIS: i64 = 1_700_000_000_000;
 
 /// Smallest and largest value of a hashed id (18-19 digits, like real snowflakes).
 const HASH_MIN: u64 = 100_000_000_000_000_000;
 const HASH_MAX: u64 = 9_000_000_000_000_000_000;
+/// Integers from here up are ids.
+const ID_MIN: u64 = 1_000_000_000_000_000;
+/// Longest object key kept as a field name.
+const MAX_KEY_LEN: usize = 48;
+
+// Bodies parsed for redaction on this thread (tests check the caps come first).
+#[cfg(test)]
+thread_local! {
+    static BODIES_PARSED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
 
 /// Replaces payload content with placeholders and salted id hashes. Pure.
 #[derive(Debug, Clone)]
@@ -128,23 +293,27 @@ impl Redactor {
                 None if s.is_empty() => json!(EMPTY),
                 None => json!(STR),
             },
-            Value::Number(n) => match n.as_u64() {
-                Some(id) if id >= 1_000_000_000_000_000 => json!(self.hash_id(id)),
-                Some(ms) if (1_000_000_000_000..10_000_000_000_000).contains(&ms) => {
-                    json!(FIXED_MILLIS)
-                }
-                Some(s) if (1_000_000_000..10_000_000_000).contains(&s) => json!(FIXED_SECS),
-                _ => v.clone(),
-            },
+            Value::Number(n) => self.redact_number(n),
             Value::Array(a) => Value::Array(a.iter().map(|x| self.redact(x)).collect()),
             Value::Object(m) => {
                 let mut out = Map::with_capacity(m.len());
                 for (i, (k, x)) in m.iter().enumerate() {
+                    let zeroed = ZEROED_NUMBER_KEYS.contains(&k.as_str());
                     let x = match x {
                         // Permission bitfields are decimal strings that can be as long as
                         // a snowflake; hashing them would invent random permissions.
                         Value::String(_) if BITFIELD_KEYS.contains(&k.as_str()) => json!(STR),
                         Value::String(e) if allowed_enum(k, e) => x.clone(),
+                        Value::Number(_) if zeroed => json!(ZERO),
+                        // `"size": [1, 4]`-style pairs under a zeroed key.
+                        Value::Array(a) if zeroed => Value::Array(
+                            a.iter()
+                                .map(|e| match e {
+                                    Value::Number(_) => json!(ZERO),
+                                    e => self.redact(e),
+                                })
+                                .collect(),
+                        ),
                         x => self.redact(x),
                     };
                     out.insert(self.redact_key(k, i), x);
@@ -155,39 +324,66 @@ impl Redactor {
         }
     }
 
+    /// Ids hashed, epoch-looking numbers fixed, everything else kept (see module doc).
+    fn redact_number(&self, n: &Number) -> Value {
+        if let Some(u) = n.as_u64() {
+            match u {
+                ID_MIN.. => json!(self.hash_id(u)),
+                1_000_000_000_000..=9_999_999_999_999 => json!(FIXED_MILLIS),
+                1_000_000_000..=9_999_999_999 => json!(FIXED_SECS),
+                _ => Value::Number(n.clone()),
+            }
+        } else if let Some(i) = n.as_i64() {
+            // Negative integers only (`as_u64` took the rest).
+            if i <= -1_000_000_000 {
+                json!(FIXED_SECS)
+            } else {
+                Value::Number(n.clone())
+            }
+        } else {
+            // A float: fractional epochs (`1700000000.123`) must not survive, and no
+            // large float is worth keeping. Small ones (`retry_after`) carry no identity.
+            let f = n.as_f64().map_or(f64::INFINITY, f64::abs);
+            if f < 1e9 {
+                Value::Number(n.clone())
+            } else if f < 1e10 {
+                json!(FIXED_SECS as f64)
+            } else {
+                json!(FIXED_MILLIS as f64)
+            }
+        }
+    }
+
     fn redact_key(&self, k: &str, index: usize) -> String {
         if let Some(id) = snowflake_str(k) {
             self.hash_id(id).to_string()
-        } else if !k.is_empty()
-            && k.len() <= 64
-            && k.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
-        {
+        } else if is_field_name(k) {
             k.to_owned()
         } else {
             format!("<key:{index}>")
         }
     }
 
-    /// A REST path with ids hashed, route words kept, everything else `<seg>`, no query.
+    /// A REST path with ids hashed, [`ROUTE_WORDS`] kept, everything else [`SEG`], no
+    /// query or fragment.
     pub fn redact_path(&self, path: &str) -> String {
         let mut out = String::new();
-        for seg in path.split('?').next().unwrap_or("").split('/') {
-            if seg.is_empty() {
-                continue;
-            }
+        let path = path.split(['?', '#']).next().unwrap_or("");
+        // The raw previous two segments, for the positional rules.
+        let (mut prev, mut prev2) = ("", "");
+        for seg in path.split('/').filter(|s| !s.is_empty()) {
             out.push('/');
-            if let Some(id) = seg.parse::<u64>().ok().filter(|_| is_digits(seg)) {
-                out.push_str(&self.hash_id(id).to_string());
-            } else if seg.len() <= 32
-                && seg
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || matches!(b, b'-' | b'_' | b'@'))
-            {
-                out.push_str(seg);
-            } else {
-                out.push_str("<seg>");
+            let opaque = OPAQUE_AFTER.contains(&prev)
+                || (TOKEN_AFTER_ID.contains(&prev2) && is_digits(prev));
+            let id = seg.parse::<u64>().ok().filter(|_| is_digits(seg));
+            match id {
+                _ if opaque => out.push_str(SEG),
+                Some(id) => out.push_str(&self.hash_id(id).to_string()),
+                None if ROUTE_WORDS.contains(&seg) => out.push_str(seg),
+                None => out.push_str(SEG),
             }
+            prev2 = prev;
+            prev = seg;
         }
         out
     }
@@ -203,25 +399,33 @@ impl Redactor {
 
     /// A REST response record.
     pub fn rest_record(&self, method: &str, path: &str, status: u16, body: &[u8]) -> Value {
+        self.rest_record_at(method_name(method), &self.redact_path(path), status, body)
+    }
+
+    /// A REST record from an already redacted method and path.
+    fn rest_record_at(&self, method: &str, path: &str, status: u16, body: &[u8]) -> Value {
         let body = if body.is_empty() {
             Value::Null
         } else {
-            match serde_json::from_slice::<Value>(body) {
-                Ok(v) => self.redact(&v),
-                Err(_) => json!("<non-json>"),
-            }
+            self.redact_body(body)
         };
         json!({
             "source": "rest",
-            "method": if method.bytes().all(|b| b.is_ascii_uppercase()) { method } else { "<method>" },
-            "path": self.redact_path(path),
+            "method": method,
+            "path": path,
             "status": status,
             "body": body,
         })
     }
 
     fn redact_text(&self, d: &str) -> Value {
-        match serde_json::from_str::<Value>(d) {
+        self.redact_body(d.as_bytes())
+    }
+
+    fn redact_body(&self, body: &[u8]) -> Value {
+        #[cfg(test)]
+        BODIES_PARSED.with(|c| c.set(c.get() + 1));
+        match serde_json::from_slice::<Value>(body) {
             Ok(v) => self.redact(&v),
             Err(_) => json!("<non-json>"),
         }
@@ -239,6 +443,24 @@ fn snowflake_str(s: &str) -> Option<u64> {
         .then_some(s)
         .filter(|s| is_digits(s))
         .and_then(|s| s.parse().ok())
+}
+
+/// Lowercase snake_case, starting with a letter or `_`, at most [`MAX_KEY_LEN`] chars.
+fn is_field_name(k: &str) -> bool {
+    let mut bytes = k.bytes();
+    k.len() <= MAX_KEY_LEN
+        && bytes
+            .next()
+            .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
+        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+fn method_name(method: &str) -> &str {
+    if (1..=8).contains(&method.len()) && method.bytes().all(|b| b.is_ascii_uppercase()) {
+        method
+    } else {
+        "<method>"
+    }
 }
 
 fn event_name(t: &str) -> &str {
@@ -290,20 +512,19 @@ impl CaptureWriter {
     }
 
     pub fn rest(&self, method: &str, path: &str, status: u16, body: &[u8]) {
-        let rec = self.redactor.rest_record(method, path, status, body);
+        // Only the path and method are redacted before the caps are checked; the body
+        // is not touched for a record that will be dropped.
+        let method = method_name(method);
+        let path = self.redactor.redact_path(path);
         // Per route *shape*: hashed ids would make every channel its own route.
-        let shape: String = rec["path"]
-            .as_str()
-            .unwrap_or("")
+        let shape: String = path
             .split('/')
             .map(|s| if is_digits(s) { ":id" } else { s })
             .collect::<Vec<_>>()
             .join("/");
-        let key = format!(
-            "rest {} {shape} {status}",
-            rec["method"].as_str().unwrap_or("")
-        );
+        let key = format!("rest {method} {shape} {status}");
         if self.admit(&key) {
+            let rec = self.redactor.rest_record_at(method, &path, status, body);
             self.write(false, &rec);
         }
     }

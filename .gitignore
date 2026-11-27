@@ -2,3 +2,7 @@
 *.log
 .env
 /target-*
+# NIXCORD_CAPTURE output: review before turning any of it into a fixture
+/captures/
+/capture/
+*.jsonl
