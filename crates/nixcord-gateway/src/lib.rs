@@ -21,6 +21,9 @@ pub mod inflate;
 pub mod protocol;
 pub mod session;
 
+#[cfg(test)]
+mod decode_fuzz;
+
 pub use commands::GatewayCommand;
 
 use std::future::pending;
