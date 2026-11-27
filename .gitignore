@@ -6,3 +6,5 @@
 /captures/
 /capture/
 *.jsonl
+# Agent worktrees
+/.claude/worktrees/

@@ -237,6 +237,11 @@ pub struct ViewState {
     /// Recent channels, last focus and the shortcuts sheet (`ui::shortcuts`).
     pub keys: ui::shortcuts::KeyState,
     pub quick_switcher: Option<ui::quick_switcher::QuickSwitcher>,
+    /// The open channel was marked unread from the message menu: `update_seen` leaves it
+    /// unread until the user leaves it or scrolls off the bottom and back.
+    pub manual_unread: Option<ui::message_menu::ManualUnread>,
+    /// The "who reacted" panel (at most one list in memory).
+    pub reactors: Option<ui::message_menu::ReactorsPanel>,
 }
 
 /// Tracks the two-part Discord voice handshake (`VOICE_STATE_UPDATE` + `VOICE_SERVER_UPDATE`).
@@ -615,6 +620,50 @@ impl NixApp {
                     self.view.pins = Some((channel, state));
                 }
             }
+            AppEvent::PinUpdated {
+                channel,
+                message,
+                pinned,
+                result,
+            } => match result {
+                Ok(()) => {
+                    self.store.apply(&GatewayEvent::MessageUpdate(Box::new(
+                        nixcord_model::MessageUpdate {
+                            id: message,
+                            channel_id: channel,
+                            pinned: Some(pinned),
+                            ..Default::default()
+                        },
+                    )));
+                    // Refresh an open Pins panel of that channel (its old list stays up
+                    // until the new one arrives).
+                    if self.view.pins.as_ref().is_some_and(|(c, _)| *c == channel) {
+                        self.send(Command::LoadPins { channel });
+                    }
+                }
+                Err(e) => self.toast_err(e),
+            },
+            AppEvent::Reactors {
+                channel,
+                message,
+                emoji,
+                result,
+            } => {
+                if let Some(p) = self
+                    .view
+                    .reactors
+                    .as_mut()
+                    .filter(|p| p.wants(channel, message, &emoji))
+                {
+                    p.state = match result {
+                        Ok(users) => {
+                            self.store.remember_users(&users);
+                            ui::message_menu::ReactorsState::Loaded(users)
+                        }
+                        Err(e) => ui::message_menu::ReactorsState::Failed(e),
+                    };
+                }
+            }
             AppEvent::HistoryAround {
                 channel,
                 around,
@@ -781,6 +830,13 @@ impl NixApp {
                 attachments,
                 ping_reply,
             } => {
+                if self
+                    .view
+                    .manual_unread
+                    .is_some_and(|g| g.channel == channel)
+                {
+                    self.view.manual_unread = None;
+                }
                 // Sending while scrolled back: return to the live end so the message shows.
                 if self.store.is_detached(channel) {
                     self.jump_to_present(channel);
@@ -1037,6 +1093,9 @@ impl NixApp {
                 });
             }
             Action::MarkChannelRead(cid) => {
+                if self.view.manual_unread.is_some_and(|g| g.channel == cid) {
+                    self.view.manual_unread = None;
+                }
                 let info = self.store.channel(cid).map(|c| {
                     let unread = self.is_unread(c) || self.store.channel_mention_count(c.id) > 0;
                     (c.last_message_id, unread)
@@ -1199,6 +1258,48 @@ impl NixApp {
                 message,
                 answer_ids,
             }),
+            Action::SetPinned {
+                channel,
+                message,
+                pinned,
+            } => self.send(Command::SetPinned {
+                channel,
+                message,
+                pinned,
+            }),
+            Action::MarkUnread { channel, message } => {
+                let (last_read, mention_count) = self.store.mark_unread_from(channel, message);
+                self.seen.insert(channel, last_read);
+                // So the next real read sends an ack again.
+                self.acked.insert(channel, last_read);
+                if self.view.channel == Some(channel) {
+                    self.view.manual_unread = Some(ui::message_menu::ManualUnread::new(channel));
+                }
+                self.send(Command::MarkUnread {
+                    channel,
+                    last_read,
+                    mention_count,
+                });
+            }
+            Action::OpenReactors {
+                channel,
+                message,
+                emoji,
+                anchor,
+            } => {
+                self.view.reactors = Some(ui::message_menu::ReactorsPanel::new(
+                    channel,
+                    message,
+                    emoji.clone(),
+                    anchor,
+                ));
+                self.send(Command::LoadReactors {
+                    channel,
+                    message,
+                    emoji,
+                });
+            }
+            Action::CloseReactors => self.view.reactors = None,
         }
     }
 
@@ -1464,7 +1565,20 @@ impl NixApp {
                 baseline(c);
             }
         }
-        if let Some(ch_id) = self.view.channel {
+        // "Mark Unread" in the open channel holds until the user leaves it (or scrolls
+        // away and back, see `message_menu::note_scroll`).
+        if self
+            .view
+            .manual_unread
+            .is_some_and(|g| Some(g.channel) != self.view.channel)
+        {
+            self.view.manual_unread = None;
+        }
+        if let Some(ch_id) = self
+            .view
+            .channel
+            .filter(|c| self.view.manual_unread.is_none_or(|g| g.channel != *c))
+        {
             let info = self.store.channel(ch_id).map(|c| {
                 let unread = self.is_unread(c) || self.store.channel_mention_count(c.id) > 0;
                 (c.id, c.last_message_id, unread)
@@ -1774,6 +1888,7 @@ impl eframe::App for NixApp {
                 self.expire_pending_interactions(&ctx);
                 self.update_window_title(&ctx);
                 self.main_ui(ui, &mut actions);
+                ui::message_menu::show(&ctx, self, &mut actions);
                 ui::profile::show(&ctx, self, &mut actions);
                 ui::forum::create_modal(&ctx, self, &mut actions);
                 ui::presence::custom_status_modal(&ctx, self, &mut actions);

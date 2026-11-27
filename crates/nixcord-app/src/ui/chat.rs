@@ -922,6 +922,10 @@ pub fn messages(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<
         ui.ctx().request_repaint();
     }
     app.chat.hover = new_owner;
+    // Feeds the "Mark Unread" guard: it ends once the list is back at the bottom.
+    let at_bottom =
+        out.state.clamped_offset().y + out.inner_rect.height() >= out.content_size.y - 4.0;
+    super::message_menu::note_scroll(&mut app.view.manual_unread, ch, at_bottom);
 
     // Reaction picker (from the toolbar's react button or a "+" pill).
     if let Some(p) = react_picker_open(ui.ctx()) {
@@ -1181,6 +1185,11 @@ fn message_row(
     let guild = rc.guild;
     let outer = ui.max_rect();
     let left = outer.left();
+    // Right-click menu: register the row's widget before its children (hover-only, no
+    // rect yet) so names, links and pills on top keep their own clicks; it gets its real
+    // rect and click sense at the end of the row (see `message_menu::attach`).
+    let menu_id = ui.scope_id().with(("message-menu", m.id));
+    ui.interact(Rect::NOTHING, menu_id, Sense::hover());
     let bg = ui.painter().add(Shape::Noop);
     let top_pad = if rc.head { 16.0 } else { 1.0 };
     let mut y = outer.top() + top_pad;
@@ -1282,6 +1291,8 @@ fn message_row(
         rc.pointer
             .is_some_and(|p| rect.contains(p) && ui.clip_rect().contains(p))
     });
+    let menu_resp = ui.interact(rect, menu_id, Sense::click());
+    super::message_menu::attach(&menu_resp, app, m, actions);
 
     if rc.head {
         let c = Pos2::new(left + 16.0 + 20.0, y + 20.0);
@@ -1856,7 +1867,17 @@ fn reactions_row(ui: &mut Ui, app: &NixApp, m: &Message, actions: &mut Vec<Actio
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
         for r in &m.reactions {
-            if reaction_pill(ui, app, r).clicked() {
+            let pill = reaction_pill(ui, app, r);
+            if pill.secondary_clicked() {
+                // "Who reacted" for this emoji.
+                actions.push(Action::OpenReactors {
+                    channel: m.channel_id,
+                    message: m.id,
+                    emoji: r.emoji.clone(),
+                    anchor: pill.rect,
+                });
+            }
+            if pill.clicked() {
                 let (channel, message, emoji) = (m.channel_id, m.id, r.emoji.clone());
                 actions.push(if r.me {
                     Action::Unreact {

@@ -863,6 +863,11 @@ fn history_for(channel: Snowflake, people: &[User]) -> Vec<Message> {
         }
         out.push(m);
     }
+    // Invented pins: every fifth message from the newest, four of them. `SetPinned`
+    // toggles the flag and `LoadPins` lists whatever is flagged.
+    for m in out.iter_mut().rev().step_by(5).take(4) {
+        m.pinned = true;
+    }
     if showcase {
         out.extend(showcase_messages(channel, people, &out, now));
     }
@@ -1989,7 +1994,8 @@ pub async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx
                 let all = histories
                     .entry(channel)
                     .or_insert_with(|| history_for(channel, &people));
-                let mut pins: Vec<Message> = all.iter().rev().step_by(5).take(4).cloned().collect();
+                let mut pins: Vec<Message> =
+                    all.iter().rev().filter(|m| m.pinned).cloned().collect();
                 for m in &mut pins {
                     m.channel_id = channel;
                 }
@@ -2243,6 +2249,55 @@ pub async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx
                     }
                 });
             }
+            Command::SetPinned {
+                channel,
+                message,
+                pinned,
+            } => {
+                if let Some(m) = histories
+                    .get_mut(&channel)
+                    .and_then(|h| h.iter_mut().find(|m| m.id == message))
+                {
+                    m.pinned = pinned;
+                }
+                // Discord answers 204 and sends MESSAGE_UPDATE (+ CHANNEL_PINS_UPDATE).
+                events.send(AppEvent::Gateway(GatewayEvent::MessageUpdate(Box::new(
+                    MessageUpdate {
+                        id: message,
+                        channel_id: channel,
+                        pinned: Some(pinned),
+                        ..Default::default()
+                    },
+                ))));
+                events.send(AppEvent::PinUpdated {
+                    channel,
+                    message,
+                    pinned,
+                    result: Ok(()),
+                });
+            }
+            Command::MarkUnread { .. } => {}
+            Command::LoadReactors {
+                channel,
+                message,
+                emoji,
+            } => {
+                let reaction = histories
+                    .get(&channel)
+                    .and_then(|h| h.iter().find(|m| m.id == message))
+                    .and_then(|m| m.reactions.iter().find(|r| r.emoji == emoji));
+                let users = demo_reactors(&people, message, reaction);
+                let events = events.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    events.send(AppEvent::Reactors {
+                        channel,
+                        message,
+                        emoji,
+                        result: Ok(users),
+                    });
+                });
+            }
         }
     }
 }
@@ -2291,6 +2346,25 @@ fn poll_vote_events(
             }
             _ => {}
         }
+    }
+    out
+}
+
+/// Invented reactors from the demo cast: me when the reaction is mine, then others
+/// picked deterministically from the message id, `count` users in all (capped by the cast).
+fn demo_reactors(people: &[User], message: Snowflake, reaction: Option<&Reaction>) -> Vec<User> {
+    let (count, me) = reaction.map_or((1, false), |r| (r.count as usize, r.me));
+    let mut out: Vec<User> = Vec::new();
+    if me {
+        out.push(people[0].clone());
+    }
+    let others = &people[1..];
+    let start = (message.0 % others.len() as u64) as usize;
+    for k in 0..others.len() {
+        if out.len() >= count.max(1) {
+            break;
+        }
+        out.push(others[(start + k) % others.len()].clone());
     }
     out
 }
@@ -2459,6 +2533,35 @@ mod tests {
             store.status_text(Snowflake(1002)).as_deref(),
             Some("\u{2615} rewriting it in Rust")
         );
+    }
+
+    #[test]
+    fn demo_pins_and_reactors() {
+        let people = people();
+        let h = history_for(Snowflake(102), &people);
+        assert_eq!(h.iter().filter(|m| m.pinned).count(), 4);
+        let mine = Reaction {
+            emoji: unicode("\u{1F44D}"),
+            count: 3,
+            me: true,
+        };
+        let users = demo_reactors(&people, Snowflake(7), Some(&mine));
+        assert_eq!(users.len(), 3);
+        assert_eq!(users[0].id, Snowflake(ME));
+        let ids: HashSet<Snowflake> = users.iter().map(|u| u.id).collect();
+        assert_eq!(ids.len(), 3, "no duplicates");
+        let theirs = Reaction {
+            count: 50,
+            me: false,
+            ..mine
+        };
+        let users = demo_reactors(&people, Snowflake(7), Some(&theirs));
+        assert_eq!(
+            users.len(),
+            people.len() - 1,
+            "capped by the cast, without me"
+        );
+        assert!(users.iter().all(|u| u.id != Snowflake(ME)));
     }
 
     #[test]

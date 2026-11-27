@@ -226,6 +226,9 @@ pub mod permissions {
     pub const MANAGE_THREADS: u64 = 1 << 34;
     pub const CREATE_PUBLIC_THREADS: u64 = 1 << 35;
     pub const SEND_MESSAGES_IN_THREADS: u64 = 1 << 38;
+    pub const MANAGE_MESSAGES: u64 = 1 << 13;
+    /// Pin and unpin messages; split from MANAGE_MESSAGES by Discord in 2025.
+    pub const PIN_MESSAGES: u64 = 1 << 51;
     pub const ALL: u64 = u64::MAX;
 }
 
@@ -813,6 +816,9 @@ pub struct Message {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub message_snapshots: Vec<MessageSnapshot>,
+    /// Pinned in its channel (official docs, Message object `pinned`).
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 /// Nonce may come back as a string or a number.
@@ -849,6 +855,10 @@ pub struct MessageUpdate {
         skip_serializing_if = "Option::is_none"
     )]
     pub poll: Option<Box<Poll>>,
+    /// Sent when the message is pinned or unpinned (MESSAGE_UPDATE carries the full
+    /// message then); absent: unchanged.
+    #[serde(default)]
+    pub pinned: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2335,5 +2345,29 @@ mod poll_forward_tests {
         );
         assert!(!odd.is_forward());
         assert!(odd.message_snapshots.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod pinned_tests {
+    use super::*;
+
+    #[test]
+    fn pinned_decodes_with_a_default() {
+        let m: Message = serde_json::from_str(
+            r#"{"id":"1","channel_id":"2","author":{"id":"3","username":"u"},"timestamp":"t","pinned":true}"#,
+        )
+        .unwrap();
+        assert!(m.pinned);
+        let m: Message = serde_json::from_str(
+            r#"{"id":"1","channel_id":"2","author":{"id":"3","username":"u"},"timestamp":"t"}"#,
+        )
+        .unwrap();
+        assert!(!m.pinned);
+        let u: MessageUpdate =
+            serde_json::from_str(r#"{"id":"1","channel_id":"2","pinned":false}"#).unwrap();
+        assert_eq!(u.pinned, Some(false));
+        let u: MessageUpdate = serde_json::from_str(r#"{"id":"1","channel_id":"2"}"#).unwrap();
+        assert_eq!(u.pinned, None);
     }
 }

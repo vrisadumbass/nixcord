@@ -173,6 +173,20 @@ pub enum AppEvent {
         /// The token itself was rejected (as opposed to e.g. a network failure).
         bad_token: bool,
     },
+    /// A pin or unpin finished (`Ok`: the message is now `pinned`).
+    PinUpdated {
+        channel: Snowflake,
+        message: Snowflake,
+        pinned: bool,
+        result: Result<(), String>,
+    },
+    /// Users who reacted to `message` with `emoji`, or why loading them failed.
+    Reactors {
+        channel: Snowflake,
+        message: Snowflake,
+        emoji: Emoji,
+        result: Result<Vec<User>, String>,
+    },
 }
 
 /// UI -> backend.
@@ -299,6 +313,25 @@ pub enum Command {
         channel: Snowflake,
         message: Snowflake,
         answer_ids: Vec<u32>,
+    },
+    /// Pin (`true`) or unpin a message; answered with `AppEvent::PinUpdated`.
+    SetPinned {
+        channel: Snowflake,
+        message: Snowflake,
+        pinned: bool,
+    },
+    /// "Mark Unread": a manual ack at `last_read` (the last message that stays read) with
+    /// the recounted `mention_count`. Failures are toasted.
+    MarkUnread {
+        channel: Snowflake,
+        last_read: Snowflake,
+        mention_count: u32,
+    },
+    /// Load the users who reacted with `emoji` (answered with `AppEvent::Reactors`).
+    LoadReactors {
+        channel: Snowflake,
+        message: Snowflake,
+        emoji: Emoji,
     },
 }
 
@@ -915,6 +948,53 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
                     e.user_message()
                 )));
             }
+        }
+        Command::SetPinned {
+            channel,
+            message,
+            pinned,
+        } => {
+            let result = http
+                .set_pinned(channel, message, pinned)
+                .await
+                .map_err(|e| {
+                    let what = if pinned { "pin" } else { "unpin" };
+                    format!("Couldn't {what} message: {}", e.user_message())
+                });
+            events.send(AppEvent::PinUpdated {
+                channel,
+                message,
+                pinned,
+                result,
+            });
+        }
+        Command::MarkUnread {
+            channel,
+            last_read,
+            mention_count,
+        } => {
+            if let Err(e) = http.ack_manual(channel, last_read, mention_count).await {
+                events.send(AppEvent::Error(format!(
+                    "Couldn't mark as unread: {}",
+                    e.user_message()
+                )));
+            }
+        }
+        Command::LoadReactors {
+            channel,
+            message,
+            emoji,
+        } => {
+            let result = http
+                .reactions(channel, message, &emoji, 100)
+                .await
+                .map_err(|e| format!("Couldn't load reactions: {}", e.user_message()));
+            events.send(AppEvent::Reactors {
+                channel,
+                message,
+                emoji,
+                result,
+            });
         }
         Command::Login(_)
         | Command::Logout

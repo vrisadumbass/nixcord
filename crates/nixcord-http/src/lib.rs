@@ -693,6 +693,65 @@ impl Route {
         }
         Ok(url)
     }
+
+    /// PUT /channels/{c}/messages/pins/{m} (204): pin a message.
+    ///
+    /// Discord moved pins under `/messages/pins` in 2025 (alongside the PIN_MESSAGES
+    /// permission); `PUT /channels/{c}/pins/{m}` still works but is the deprecated form.
+    /// We use the new path. Source: Userdoccers (docs.discord.food, resources/message,
+    /// "Pin Message"), checked 2026-11; untested against live Discord.
+    pub fn pin_message(channel_id: Snowflake, message_id: Snowflake) -> Self {
+        Self::new(
+            Method::Put,
+            format!("/channels/{channel_id}/messages/pins/{message_id}"),
+        )
+    }
+
+    /// DELETE /channels/{c}/messages/pins/{m} (204): unpin a message. Same source and
+    /// path choice as [`Route::pin_message`].
+    pub fn unpin_message(channel_id: Snowflake, message_id: Snowflake) -> Self {
+        Self::new(
+            Method::Delete,
+            format!("/channels/{channel_id}/messages/pins/{message_id}"),
+        )
+    }
+
+    /// GET /channels/{c}/messages/{m}/reactions/{emoji}?limit=N: users who reacted with
+    /// `emoji` (normal reactions, the default `type`). Answers an array of users.
+    /// Source: Userdoccers / official docs ("Get Reactions"), limit 1-100.
+    pub fn reactions(
+        channel_id: Snowflake,
+        message_id: Snowflake,
+        emoji: &Emoji,
+        limit: u8,
+    ) -> Self {
+        let mut r = Self::new(
+            Method::Get,
+            format!(
+                "/channels/{channel_id}/messages/{message_id}/reactions/{}",
+                emoji_path_segment(emoji)
+            ),
+        );
+        r.query.push(("limit", limit.clamp(1, 100).to_string()));
+        r
+    }
+
+    /// POST /channels/{c}/messages/{m}/ack with `{"manual": true, "mention_count": n}`:
+    /// move the read marker back to `message_id` (the last message that stays read),
+    /// as the official client's "Mark Unread" does. Userdoccers (topics/read-state):
+    /// an ack before the latest one must set `manual`, and `mention_count` is not
+    /// recomputed by Discord, so the client sends it. Untested against live Discord.
+    pub fn ack_manual(channel_id: Snowflake, message_id: Snowflake, mention_count: u32) -> Self {
+        let mut r = Self::new(
+            Method::Post,
+            format!("/channels/{channel_id}/messages/{message_id}/ack"),
+        );
+        r.body = Some(serde_json::json!({
+            "manual": true,
+            "mention_count": mention_count,
+        }));
+        r
+    }
 }
 
 fn own_reaction_path(channel_id: Snowflake, message_id: Snowflake, emoji: &Emoji) -> String {
@@ -1239,6 +1298,44 @@ impl Http {
                 .body(body.clone())
         })
         .await
+    }
+
+    /// Pin (`true`) or unpin a message (204 either way).
+    pub async fn set_pinned(
+        &self,
+        channel_id: Snowflake,
+        message_id: Snowflake,
+        pinned: bool,
+    ) -> Result<()> {
+        let route = if pinned {
+            Route::pin_message(channel_id, message_id)
+        } else {
+            Route::unpin_message(channel_id, message_id)
+        };
+        self.empty(route).await
+    }
+
+    /// Up to `limit` users who reacted to a message with `emoji`.
+    pub async fn reactions(
+        &self,
+        channel_id: Snowflake,
+        message_id: Snowflake,
+        emoji: &Emoji,
+        limit: u8,
+    ) -> Result<Vec<User>> {
+        self.json(Route::reactions(channel_id, message_id, emoji, limit))
+            .await
+    }
+
+    /// Manual ack: the channel is read up to `message_id` and unread after it.
+    pub async fn ack_manual(
+        &self,
+        channel_id: Snowflake,
+        message_id: Snowflake,
+        mention_count: u32,
+    ) -> Result<()> {
+        self.empty(Route::ack_manual(channel_id, message_id, mention_count))
+            .await
     }
 }
 
@@ -2334,5 +2431,54 @@ mod tests {
         .unwrap();
         assert_eq!(gifs[0].width, 498);
         assert_eq!(gifs[0].url, "https://tenor.com/view/cat-gif-1");
+    }
+
+    #[test]
+    fn pin_unpin_routes() {
+        let p = Route::pin_message(C, M);
+        assert_eq!(p.method, Method::Put);
+        assert_eq!(p.path, "/channels/111/messages/pins/222");
+        assert_eq!(p.body, None);
+        let u = Route::unpin_message(C, M);
+        assert_eq!(u.method, Method::Delete);
+        assert_eq!(u.path, "/channels/111/messages/pins/222");
+        assert_eq!(u.body, None);
+    }
+
+    #[test]
+    fn reactions_route_encodes_emoji_and_limit() {
+        let unicode = Emoji {
+            id: None,
+            name: Some("\u{1F44D}".into()),
+            animated: false,
+        };
+        let r = Route::reactions(C, M, &unicode, 100);
+        assert_eq!(r.method, Method::Get);
+        assert_eq!(r.body, None);
+        assert_eq!(
+            r.url(API_BASE).unwrap().as_str(),
+            "https://discord.com/api/v10/channels/111/messages/222/reactions/%F0%9F%91%8D?limit=100"
+        );
+        let custom = Emoji {
+            id: Some(Snowflake(77)),
+            name: Some("blob cat".into()),
+            animated: false,
+        };
+        let r = Route::reactions(C, M, &custom, 250);
+        assert_eq!(
+            r.url(API_BASE).unwrap().as_str(),
+            "https://discord.com/api/v10/channels/111/messages/222/reactions/blob%20cat:77?limit=100"
+        );
+    }
+
+    #[test]
+    fn manual_ack_route() {
+        let a = Route::ack_manual(C, M, 3);
+        assert_eq!(a.method, Method::Post);
+        assert_eq!(a.path, "/channels/111/messages/222/ack");
+        assert_eq!(
+            a.body,
+            Some(serde_json::json!({ "manual": true, "mention_count": 3 }))
+        );
     }
 }

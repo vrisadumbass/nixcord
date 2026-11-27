@@ -17,6 +17,7 @@ pub mod header_menus;
 pub mod login;
 pub mod markdown;
 pub mod mention_complete;
+pub mod message_menu;
 pub mod poll;
 pub mod presence;
 pub mod profile;
@@ -189,6 +190,25 @@ pub enum Action {
         message: Snowflake,
         answer_ids: Vec<u32>,
     },
+    /// Pin (`true`) or unpin a message (message context menu).
+    SetPinned {
+        channel: Snowflake,
+        message: Snowflake,
+        pinned: bool,
+    },
+    /// "Mark Unread": everything from `message` on becomes unread again.
+    MarkUnread {
+        channel: Snowflake,
+        message: Snowflake,
+    },
+    /// Open the "who reacted" panel for one emoji of a message, anchored at `anchor`.
+    OpenReactors {
+        channel: Snowflake,
+        message: Snowflake,
+        emoji: nixcord_model::Emoji,
+        anchor: Rect,
+    },
+    CloseReactors,
 }
 
 /// Bold-ish family (Segoe UI Semibold on Windows when available, else the default font).
