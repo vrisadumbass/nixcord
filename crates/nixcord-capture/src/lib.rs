@@ -4,7 +4,10 @@
 //!
 //! What is written (see [`Redactor`]):
 //! - every string value becomes `"<str>"` (or `"<empty>"`), so no token, name, message
-//!   text, URL, emoji or timestamp string survives;
+//!   text, URL, emoji or timestamp string survives. The one exception is a closed list
+//!   of enum values under two keys ([`ENUM_VALUES`]): `status` (`online`, `idle`, ...)
+//!   and `op` (member list `SYNC`, `INSERT`, ...). Only those exact values under those
+//!   exact keys are kept; anything else there is still `"<str>"`;
 //! - every id is replaced by a salted hash that still looks like a snowflake: strings of
 //!   15-20 digits, integers of at least 10^15, and object keys that are ids (op 37-style
 //!   maps), except permission bitfields (`permissions`, `allow`, `deny`), which become
@@ -42,6 +45,20 @@ pub const MAX_PER_NAME: u32 = 20;
 pub const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Keys whose digit strings are bitfields, not ids: always a plain placeholder.
+/// Enum strings kept verbatim, by key. Closed lists of generic protocol words, so they
+/// can carry no personal data. Anything outside a list is still a placeholder.
+pub const ENUM_VALUES: &[(&str, &[&str])] = &[
+    ("status", &["online", "idle", "dnd", "offline", "invisible"]),
+    ("op", &["SYNC", "INSERT", "UPDATE", "DELETE", "INVALIDATE"]),
+];
+
+/// Is `value` an allowlisted enum value for `key`?
+fn allowed_enum(key: &str, value: &str) -> bool {
+    ENUM_VALUES
+        .iter()
+        .any(|(k, vs)| *k == key && vs.contains(&value))
+}
+
 const BITFIELD_KEYS: &[&str] = &[
     "permissions",
     "permissions_new",
@@ -116,6 +133,7 @@ impl Redactor {
                         // Permission bitfields are decimal strings that can be as long as
                         // a snowflake; hashing them would invent random permissions.
                         Value::String(_) if BITFIELD_KEYS.contains(&k.as_str()) => json!(STR),
+                        Value::String(e) if allowed_enum(k, e) => x.clone(),
                         x => self.redact(x),
                     };
                     out.insert(self.redact_key(k, i), x);

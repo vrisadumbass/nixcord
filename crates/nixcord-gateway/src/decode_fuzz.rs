@@ -4,6 +4,7 @@
 //! All payloads are invented.
 
 use crate::protocol::{decode_dispatch, dispatch_presences, Frame};
+use nixcord_model::{GatewayEvent, MemberListOp, Status};
 use serde_json::{json, Map, Value};
 
 /// xorshift64*: deterministic, so a failure reproduces from the seed alone.
@@ -431,7 +432,22 @@ fn redacted_samples_still_decode() {
         let rec = r.gateway_record(t, &v.to_string());
         let redacted = rec["d"].to_string();
         match decode_dispatch(t, &redacted) {
-            Ok(Some(_)) => {}
+            Ok(Some(ev)) => {
+                // Allowlisted enums keep their meaning: the presence status and the
+                // member list SYNC op survive redaction.
+                match &ev {
+                    GatewayEvent::PresenceUpdate { presence, .. } => {
+                        assert_eq!(presence.status, Status::Idle, "{redacted}")
+                    }
+                    GatewayEvent::MemberListUpdate(u) => {
+                        assert!(
+                            matches!(u.ops.first(), Some(MemberListOp::Sync { .. })),
+                            "{redacted}"
+                        )
+                    }
+                    _ => {}
+                }
+            }
             other => failed.push(format!("{t}: {other:?}")),
         }
         feed(t, &redacted);

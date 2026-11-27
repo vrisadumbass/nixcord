@@ -275,3 +275,36 @@ fn fuzzed_strings_never_survive() {
         assert!(!out.contains(&text), "{text:?} survived: {out}");
     }
 }
+
+#[test]
+fn allowlisted_enums_survive_only_under_their_key() {
+    let r = Redactor::with_salt(13);
+    let v = json!({
+        "status": "dnd",
+        "client_status": {"desktop": "online"},
+        "ops": [
+            {"op": "SYNC", "range": [0, 99]},
+            {"op": "INVALIDATE"},
+            {"op": "sync"},
+            {"op": "FUTURE_OP"},
+        ],
+        "presences": [{"status": "idle"}, {"status": "at the lighthouse"}],
+        "content": "online",
+        "name": "SYNC",
+        "op_note": "DELETE",
+    });
+    let out = r.redact(&v);
+    assert_eq!(out["status"], "dnd");
+    assert_eq!(out["presences"][0]["status"], "idle");
+    assert_eq!(out["ops"][0]["op"], "SYNC");
+    assert_eq!(out["ops"][1]["op"], "INVALIDATE");
+    // Exact matches only: other casing, unknown values, free text are placeholders.
+    assert_eq!(out["ops"][2]["op"], STR);
+    assert_eq!(out["ops"][3]["op"], STR);
+    assert_eq!(out["presences"][1]["status"], STR);
+    // The same words under any other key are placeholders.
+    assert_eq!(out["content"], STR);
+    assert_eq!(out["name"], STR);
+    assert_eq!(out["op_note"], STR);
+    assert_eq!(out["client_status"]["desktop"], STR);
+}
