@@ -383,6 +383,123 @@ impl Store {
             }
             GatewayEvent::VoiceStateUpdate(vs) => self.voice_state_update(vs),
             GatewayEvent::VoiceServerUpdate(_) => {}
+            // Permissions and role colors are computed from `guild.roles` on every call
+            // (`channel_permissions`, `member_color`), so updating the list recomputes them.
+            GatewayEvent::GuildRoleUpsert { guild_id, role } => {
+                if let Some(g) = self.guilds.get_mut(guild_id) {
+                    match g.roles.iter_mut().find(|r| r.id == role.id) {
+                        Some(r) => r.clone_from(role),
+                        None => g.roles.push(role.clone()),
+                    }
+                }
+            }
+            GatewayEvent::GuildRoleDelete { guild_id, role_id } => {
+                if let Some(g) = self.guilds.get_mut(guild_id) {
+                    g.roles.retain(|r| r.id != *role_id);
+                }
+                for ((g, _), m) in self.members.iter_mut() {
+                    if g == guild_id {
+                        m.roles.retain(|r| r != role_id);
+                    }
+                }
+            }
+            GatewayEvent::GuildMemberAdd { guild_id, member } => {
+                self.cache_guild_member(*guild_id, member);
+            }
+            GatewayEvent::GuildMemberRemove {
+                guild_id, user_id, ..
+            } => self.guild_member_remove(*guild_id, *user_id),
+            GatewayEvent::GuildBanRemove { .. } => {}
+            GatewayEvent::UserUpdate(u) => {
+                self.cache_user(u);
+                if let Some(me) = self.me.as_mut().filter(|m| m.id == u.id) {
+                    me.clone_from(u);
+                }
+            }
+            GatewayEvent::MessageDeleteBulk { ids, channel_id } => {
+                if let Some(msgs) = self.messages.get_mut(channel_id) {
+                    msgs.retain(|m| !ids.contains(&m.id));
+                }
+            }
+            GatewayEvent::ReactionRemoveAll {
+                channel_id,
+                message_id,
+            } => {
+                if let Some(m) = self.message_mut(*channel_id, *message_id) {
+                    m.reactions.clear();
+                }
+            }
+            GatewayEvent::ReactionRemoveEmoji {
+                channel_id,
+                message_id,
+                emoji,
+            } => {
+                if let Some(m) = self.message_mut(*channel_id, *message_id) {
+                    m.reactions.retain(|r| !same_emoji(&r.emoji, emoji));
+                }
+            }
+            GatewayEvent::ChannelPinsUpdate {
+                channel_id,
+                last_pin_timestamp,
+            } => {
+                if let Some(ch) = self.channels.get_mut(channel_id) {
+                    ch.last_pin_timestamp.clone_from(last_pin_timestamp);
+                }
+            }
+            GatewayEvent::ChannelRecipientAdd { channel_id, user } => {
+                self.cache_user(user);
+                if let Some(ch) = self.channels.get_mut(channel_id) {
+                    match ch.recipients.iter_mut().find(|r| r.id == user.id) {
+                        Some(r) => r.clone_from(user),
+                        None => ch.recipients.push((**user).clone()),
+                    }
+                }
+            }
+            GatewayEvent::ChannelRecipientRemove {
+                channel_id,
+                user_id,
+            } => {
+                if let Some(ch) = self.channels.get_mut(channel_id) {
+                    ch.recipients.retain(|r| r.id != *user_id);
+                }
+            }
+            GatewayEvent::RelationshipUpdate {
+                user_id,
+                kind,
+                nickname,
+            } => {
+                // An update for an unknown relationship needs a type to be useful.
+                if kind.is_none() && !self.relationships.contains_key(user_id) {
+                    return;
+                }
+                let r = self
+                    .relationships
+                    .entry(*user_id)
+                    .or_insert_with(|| Relationship {
+                        id: *user_id,
+                        ..Default::default()
+                    });
+                if let Some(k) = kind {
+                    r.kind = *k;
+                }
+                if let Some(n) = nickname {
+                    r.nickname.clone_from(n);
+                }
+            }
+        }
+    }
+
+    /// A member left, was kicked or was banned: forget their member data and this guild's
+    /// presence copy. Our own removal is followed by GUILD_DELETE, which drops the rest.
+    fn guild_member_remove(&mut self, guild_id: Snowflake, user_id: Snowflake) {
+        self.members.remove(&(guild_id, user_id));
+        if !self.presence_pinned(user_id) {
+            if let Some(e) = self.presences.get_mut(&user_id) {
+                e.guilds.retain(|(g, _)| *g != guild_id);
+                if e.is_empty() {
+                    self.presences.remove(&user_id);
+                }
+            }
         }
     }
 
@@ -2074,6 +2191,9 @@ mod tests;
 
 #[cfg(test)]
 mod presence_tests;
+
+#[cfg(test)]
+mod event_tests;
 
 #[cfg(test)]
 mod voice_tests {

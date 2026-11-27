@@ -287,6 +287,10 @@ pub struct Channel {
     /// Threads: present when the current user has joined the thread.
     #[serde(default)]
     pub member: Option<ThreadSelfMember>,
+    /// When the newest pin was made (ISO 8601), from the channel object or
+    /// CHANNEL_PINS_UPDATE. `None` when nothing is pinned or unknown.
+    #[serde(default)]
+    pub last_pin_timestamp: Option<String>,
 }
 
 /// The current user's thread member object (`member` on a thread). Only its presence
@@ -1361,6 +1365,66 @@ pub enum GatewayEvent {
     },
     VoiceStateUpdate(VoiceState),
     VoiceServerUpdate(VoiceServerUpdate),
+    /// GUILD_ROLE_CREATE / GUILD_ROLE_UPDATE: insert or replace one role.
+    GuildRoleUpsert {
+        guild_id: Snowflake,
+        role: Role,
+    },
+    GuildRoleDelete {
+        guild_id: Snowflake,
+        role_id: Snowflake,
+    },
+    GuildMemberAdd {
+        guild_id: Snowflake,
+        member: Box<GuildMember>,
+    },
+    /// GUILD_MEMBER_REMOVE (left or kicked) and GUILD_BAN_ADD (`banned`).
+    GuildMemberRemove {
+        guild_id: Snowflake,
+        user_id: Snowflake,
+        banned: bool,
+    },
+    /// GUILD_BAN_REMOVE. Nothing stores bans yet; kept for the M7 bans list.
+    GuildBanRemove {
+        guild_id: Snowflake,
+        user_id: Snowflake,
+    },
+    /// USER_UPDATE: the current user changed.
+    UserUpdate(Box<User>),
+    MessageDeleteBulk {
+        ids: Vec<Snowflake>,
+        channel_id: Snowflake,
+    },
+    ReactionRemoveAll {
+        channel_id: Snowflake,
+        message_id: Snowflake,
+    },
+    ReactionRemoveEmoji {
+        channel_id: Snowflake,
+        message_id: Snowflake,
+        emoji: Emoji,
+    },
+    /// CHANNEL_PINS_UPDATE. `None` timestamp: the last pin was removed.
+    ChannelPinsUpdate {
+        channel_id: Snowflake,
+        last_pin_timestamp: Option<String>,
+    },
+    /// CHANNEL_RECIPIENT_ADD (group DMs).
+    ChannelRecipientAdd {
+        channel_id: Snowflake,
+        user: Box<User>,
+    },
+    ChannelRecipientRemove {
+        channel_id: Snowflake,
+        user_id: Snowflake,
+    },
+    /// RELATIONSHIP_UPDATE: a partial relationship. `None` fields were absent and keep
+    /// their stored value; `nickname: Some(None)` clears the nickname.
+    RelationshipUpdate {
+        user_id: Snowflake,
+        kind: Option<RelationshipKind>,
+        nickname: Option<Option<String>>,
+    },
 }
 
 /// Discord CDN URL helpers. `size` should be a power of two (16..=4096).

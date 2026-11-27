@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use nixcord_model::{
     Activity, Channel, ClientStatus, CustomStatus, Emoji, GatewayEvent, Guild, GuildFolder,
     GuildMember, ListMember, MemberListGroup, MemberListItem, MemberListOp, MemberListUpdate,
-    Message, MessageUpdate, Presence, ReadState, Ready, ReadySupplemental, Relationship, Snowflake,
-    Status, User, VoiceServerUpdate, VoiceState,
+    Message, MessageUpdate, Presence, ReadState, Ready, ReadySupplemental, Relationship, Role,
+    Snowflake, Status, User, VoiceServerUpdate, VoiceState,
 };
 use serde::de::{DeserializeOwned, Error as _};
 use serde::Deserialize;
@@ -544,9 +544,194 @@ pub fn decode_dispatch(t: &str, d: &str) -> Result<Option<GatewayEvent>, JsonErr
         "VOICE_SERVER_UPDATE" => {
             GatewayEvent::VoiceServerUpdate(serde_json::from_str::<VoiceServerUpdate>(d)?)
         }
+        // Shapes below: official docs (docs.discord.com/developers/events/gateway-events)
+        // and Userdoccers (docs.discord.food/topics/gateway-events); they agree unless noted.
+        //
+        // GUILD_ROLE_CREATE / GUILD_ROLE_UPDATE: `{ guild_id, role: role object }`.
+        "GUILD_ROLE_CREATE" | "GUILD_ROLE_UPDATE" => {
+            #[derive(Deserialize)]
+            struct RoleEv {
+                guild_id: Snowflake,
+                role: Role,
+            }
+            let r: RoleEv = serde_json::from_str(d)?;
+            GatewayEvent::GuildRoleUpsert {
+                guild_id: r.guild_id,
+                role: r.role,
+            }
+        }
+        // GUILD_ROLE_DELETE: `{ guild_id, role_id }`.
+        "GUILD_ROLE_DELETE" => {
+            #[derive(Deserialize)]
+            struct RoleDel {
+                guild_id: Snowflake,
+                role_id: Snowflake,
+            }
+            let r: RoleDel = serde_json::from_str(d)?;
+            GatewayEvent::GuildRoleDelete {
+                guild_id: r.guild_id,
+                role_id: r.role_id,
+            }
+        }
+        // GUILD_MEMBER_ADD: a guild member object (with `user`) plus `guild_id`.
+        "GUILD_MEMBER_ADD" => {
+            #[derive(Deserialize)]
+            struct Gid {
+                guild_id: Snowflake,
+            }
+            let g: Gid = serde_json::from_str(d)?;
+            let member: GuildMember = serde_json::from_str(d)?;
+            if member.id().is_none() {
+                return Err(JsonError::custom("member without user"));
+            }
+            GatewayEvent::GuildMemberAdd {
+                guild_id: g.guild_id,
+                member: Box::new(member),
+            }
+        }
+        // GUILD_MEMBER_REMOVE: `{ guild_id, user }`; GUILD_BAN_ADD / GUILD_BAN_REMOVE:
+        // `{ guild_id, user }` (Userdoccers: partial user; GUILD_BAN_ADD may also carry
+        // `delete_message_secs`). The docs disagree on full vs partial `user`, so only
+        // `user.id` is read.
+        "GUILD_MEMBER_REMOVE" | "GUILD_BAN_ADD" | "GUILD_BAN_REMOVE" => {
+            let u: GuildUserEv = serde_json::from_str(d)?;
+            match t {
+                "GUILD_BAN_REMOVE" => GatewayEvent::GuildBanRemove {
+                    guild_id: u.guild_id,
+                    user_id: u.user.id,
+                },
+                _ => GatewayEvent::GuildMemberRemove {
+                    guild_id: u.guild_id,
+                    user_id: u.user.id,
+                    banned: t == "GUILD_BAN_ADD",
+                },
+            }
+        }
+        // USER_UPDATE: "a user object", the current user only. No field table in either
+        // source; extra private-user fields (email, flags, ...) are ignored.
+        "USER_UPDATE" => GatewayEvent::UserUpdate(Box::new(serde_json::from_str::<User>(d)?)),
+        // MESSAGE_DELETE_BULK: `{ ids: [snowflake], channel_id, guild_id? }`.
+        "MESSAGE_DELETE_BULK" => {
+            #[derive(Deserialize)]
+            struct Bulk {
+                #[serde(default)]
+                ids: Vec<Snowflake>,
+                channel_id: Snowflake,
+            }
+            let b: Bulk = serde_json::from_str(d)?;
+            GatewayEvent::MessageDeleteBulk {
+                ids: b.ids,
+                channel_id: b.channel_id,
+            }
+        }
+        // MESSAGE_REACTION_REMOVE_ALL: `{ channel_id, message_id, guild_id? }`.
+        "MESSAGE_REACTION_REMOVE_ALL" => {
+            #[derive(Deserialize)]
+            struct All {
+                channel_id: Snowflake,
+                message_id: Snowflake,
+            }
+            let a: All = serde_json::from_str(d)?;
+            GatewayEvent::ReactionRemoveAll {
+                channel_id: a.channel_id,
+                message_id: a.message_id,
+            }
+        }
+        // MESSAGE_REACTION_REMOVE_EMOJI: `{ channel_id, guild_id?, message_id,
+        // emoji: partial emoji }`.
+        "MESSAGE_REACTION_REMOVE_EMOJI" => {
+            #[derive(Deserialize)]
+            struct ByEmoji {
+                channel_id: Snowflake,
+                message_id: Snowflake,
+                emoji: Emoji,
+            }
+            let e: ByEmoji = serde_json::from_str(d)?;
+            GatewayEvent::ReactionRemoveEmoji {
+                channel_id: e.channel_id,
+                message_id: e.message_id,
+                emoji: e.emoji,
+            }
+        }
+        // CHANNEL_PINS_UPDATE: `{ guild_id?, channel_id, last_pin_timestamp?: ?ISO8601 }`.
+        // Userdoccers: not sent when a pinned message is deleted.
+        "CHANNEL_PINS_UPDATE" => {
+            #[derive(Deserialize)]
+            struct Pins {
+                channel_id: Snowflake,
+                #[serde(default)]
+                last_pin_timestamp: Option<String>,
+            }
+            let p: Pins = serde_json::from_str(d)?;
+            GatewayEvent::ChannelPinsUpdate {
+                channel_id: p.channel_id,
+                last_pin_timestamp: p.last_pin_timestamp,
+            }
+        }
+        // User accounts only (Userdoccers). CHANNEL_RECIPIENT_ADD: `{ channel_id,
+        // user: partial user, nick? }`; CHANNEL_RECIPIENT_REMOVE: `{ channel_id, user }`.
+        // Group DMs only: adding someone to a 1:1 DM creates a new channel instead.
+        "CHANNEL_RECIPIENT_ADD" => {
+            #[derive(Deserialize)]
+            struct Add {
+                channel_id: Snowflake,
+                user: User,
+            }
+            let a: Add = serde_json::from_str(d)?;
+            GatewayEvent::ChannelRecipientAdd {
+                channel_id: a.channel_id,
+                user: Box::new(a.user),
+            }
+        }
+        "CHANNEL_RECIPIENT_REMOVE" => {
+            #[derive(Deserialize)]
+            struct Rm {
+                channel_id: Snowflake,
+                user: IdOnly,
+            }
+            let r: Rm = serde_json::from_str(d)?;
+            GatewayEvent::ChannelRecipientRemove {
+                channel_id: r.channel_id,
+                user_id: r.user.id,
+            }
+        }
+        // RELATIONSHIP_UPDATE (user accounts, Userdoccers): a *partial* relationship
+        // `{ id, type, nickname: ?string, since?, stranger_request?, user_ignored }` with
+        // no `user`. Userdoccers marks `type` and `nickname` required; both are still
+        // treated as optional here so an absent key keeps the stored value.
+        "RELATIONSHIP_UPDATE" => {
+            let v: Value = serde_json::from_str(d)?;
+            let Some(user_id) = v.get("id").and_then(snowflake_of) else {
+                return Err(JsonError::custom("relationship without id"));
+            };
+            let kind = v
+                .get("type")
+                .and_then(Value::as_u64)
+                .and_then(|n| u8::try_from(n).ok())
+                .map(nixcord_model::RelationshipKind::from);
+            let nickname = v.get("nickname").map(|n| n.as_str().map(str::to_owned));
+            GatewayEvent::RelationshipUpdate {
+                user_id,
+                kind,
+                nickname,
+            }
+        }
         _ => return Ok(None),
     };
     Ok(Some(ev))
+}
+
+/// An object of which only `id` is read (partial users).
+#[derive(Deserialize)]
+struct IdOnly {
+    id: Snowflake,
+}
+
+/// `{ guild_id, user }` (GUILD_MEMBER_REMOVE, GUILD_BAN_ADD, GUILD_BAN_REMOVE).
+#[derive(Deserialize)]
+struct GuildUserEv {
+    guild_id: Snowflake,
+    user: IdOnly,
 }
 
 /// Guild decode that also accepts the newer user-account shape where `name`/`icon`
@@ -2345,5 +2530,251 @@ mod emoji_tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+}
+
+/// M0 events: one decode test per event, on invented payloads shaped like the official
+/// docs / Userdoccers tables quoted next to each decoder.
+#[cfg(test)]
+mod m0_event_tests {
+    use super::*;
+    use nixcord_model::RelationshipKind;
+
+    fn dec(t: &str, d: &str) -> GatewayEvent {
+        decode_dispatch(t, d)
+            .unwrap_or_else(|e| panic!("{t}: {e}"))
+            .unwrap_or_else(|| panic!("{t}: not handled"))
+    }
+
+    #[test]
+    fn guild_role_create_and_update() {
+        let d = r#"{"guild_id":"1","role":{"id":"5","name":"mods","color":16711680,
+            "position":3,"permissions":"1024","hoist":true,"managed":false,"flags":0}}"#;
+        for t in ["GUILD_ROLE_CREATE", "GUILD_ROLE_UPDATE"] {
+            match dec(t, d) {
+                GatewayEvent::GuildRoleUpsert { guild_id, role } => {
+                    assert_eq!(guild_id, Snowflake(1));
+                    assert_eq!(role.id, Snowflake(5));
+                    assert_eq!(role.color, 0xFF0000);
+                    assert_eq!(role.position, 3);
+                    assert_eq!(role.permissions, nixcord_model::permissions::VIEW_CHANNEL);
+                }
+                e => panic!("{e:?}"),
+            }
+        }
+        assert!(decode_dispatch("GUILD_ROLE_UPDATE", r#"{"guild_id":"1"}"#).is_err());
+    }
+
+    #[test]
+    fn guild_role_delete() {
+        assert_eq!(
+            dec("GUILD_ROLE_DELETE", r#"{"guild_id":"1","role_id":"5"}"#),
+            GatewayEvent::GuildRoleDelete {
+                guild_id: Snowflake(1),
+                role_id: Snowflake(5)
+            }
+        );
+    }
+
+    #[test]
+    fn guild_member_add() {
+        let d = r#"{"guild_id":"1","user":{"id":"9","username":"newcomer"},"roles":["5"],
+            "nick":null,"joined_at":"2024-01-01T00:00:00+00:00","deaf":false,"mute":false}"#;
+        match dec("GUILD_MEMBER_ADD", d) {
+            GatewayEvent::GuildMemberAdd { guild_id, member } => {
+                assert_eq!(guild_id, Snowflake(1));
+                assert_eq!(member.id(), Some(Snowflake(9)));
+                assert_eq!(member.roles, vec![Snowflake(5)]);
+            }
+            e => panic!("{e:?}"),
+        }
+        assert!(decode_dispatch("GUILD_MEMBER_ADD", r#"{"guild_id":"1","roles":[]}"#).is_err());
+    }
+
+    #[test]
+    fn guild_member_remove() {
+        assert_eq!(
+            dec(
+                "GUILD_MEMBER_REMOVE",
+                r#"{"guild_id":"1","user":{"id":"9","username":"leaver","avatar":null}}"#
+            ),
+            GatewayEvent::GuildMemberRemove {
+                guild_id: Snowflake(1),
+                user_id: Snowflake(9),
+                banned: false
+            }
+        );
+    }
+
+    #[test]
+    fn guild_ban_add_and_remove() {
+        // Partial user and `delete_message_secs`, as Userdoccers describes.
+        assert_eq!(
+            dec(
+                "GUILD_BAN_ADD",
+                r#"{"guild_id":"1","user":{"id":"9"},"delete_message_secs":0}"#
+            ),
+            GatewayEvent::GuildMemberRemove {
+                guild_id: Snowflake(1),
+                user_id: Snowflake(9),
+                banned: true
+            }
+        );
+        assert_eq!(
+            dec(
+                "GUILD_BAN_REMOVE",
+                r#"{"guild_id":"1","user":{"id":"9","username":"x"}}"#
+            ),
+            GatewayEvent::GuildBanRemove {
+                guild_id: Snowflake(1),
+                user_id: Snowflake(9)
+            }
+        );
+    }
+
+    #[test]
+    fn user_update() {
+        let d = r#"{"id":"10","username":"me2","global_name":"Me Two","avatar":"abc",
+            "email":null,"verified":true,"flags":0,"premium_type":0}"#;
+        match dec("USER_UPDATE", d) {
+            GatewayEvent::UserUpdate(u) => {
+                assert_eq!(u.id, Snowflake(10));
+                assert_eq!(u.display_name(), "Me Two");
+                assert_eq!(u.avatar.as_deref(), Some("abc"));
+            }
+            e => panic!("{e:?}"),
+        }
+    }
+
+    #[test]
+    fn message_delete_bulk() {
+        assert_eq!(
+            dec(
+                "MESSAGE_DELETE_BULK",
+                r#"{"ids":["1","2","3"],"channel_id":"20","guild_id":"30"}"#
+            ),
+            GatewayEvent::MessageDeleteBulk {
+                ids: vec![Snowflake(1), Snowflake(2), Snowflake(3)],
+                channel_id: Snowflake(20)
+            }
+        );
+    }
+
+    #[test]
+    fn reaction_remove_all() {
+        assert_eq!(
+            dec(
+                "MESSAGE_REACTION_REMOVE_ALL",
+                r#"{"channel_id":"20","message_id":"3","guild_id":"30"}"#
+            ),
+            GatewayEvent::ReactionRemoveAll {
+                channel_id: Snowflake(20),
+                message_id: Snowflake(3)
+            }
+        );
+    }
+
+    #[test]
+    fn reaction_remove_emoji() {
+        assert_eq!(
+            dec(
+                "MESSAGE_REACTION_REMOVE_EMOJI",
+                r#"{"channel_id":"20","message_id":"3","emoji":{"id":"77","name":"blob"}}"#
+            ),
+            GatewayEvent::ReactionRemoveEmoji {
+                channel_id: Snowflake(20),
+                message_id: Snowflake(3),
+                emoji: Emoji {
+                    id: Some(Snowflake(77)),
+                    name: Some("blob".into()),
+                    animated: false
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn channel_pins_update() {
+        assert_eq!(
+            dec(
+                "CHANNEL_PINS_UPDATE",
+                r#"{"guild_id":"30","channel_id":"20","last_pin_timestamp":"2024-01-01T00:00:00+00:00"}"#
+            ),
+            GatewayEvent::ChannelPinsUpdate {
+                channel_id: Snowflake(20),
+                last_pin_timestamp: Some("2024-01-01T00:00:00+00:00".into())
+            }
+        );
+        // Null and absent both mean "no pins".
+        for d in [
+            r#"{"channel_id":"20","last_pin_timestamp":null}"#,
+            r#"{"channel_id":"20"}"#,
+        ] {
+            assert_eq!(
+                dec("CHANNEL_PINS_UPDATE", d),
+                GatewayEvent::ChannelPinsUpdate {
+                    channel_id: Snowflake(20),
+                    last_pin_timestamp: None
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn channel_recipient_add_and_remove() {
+        match dec(
+            "CHANNEL_RECIPIENT_ADD",
+            r#"{"channel_id":"50","user":{"id":"9","username":"friend"},"nick":"pal"}"#,
+        ) {
+            GatewayEvent::ChannelRecipientAdd { channel_id, user } => {
+                assert_eq!(channel_id, Snowflake(50));
+                assert_eq!(user.id, Snowflake(9));
+            }
+            e => panic!("{e:?}"),
+        }
+        assert_eq!(
+            dec(
+                "CHANNEL_RECIPIENT_REMOVE",
+                r#"{"channel_id":"50","user":{"id":"9","username":"friend"}}"#
+            ),
+            GatewayEvent::ChannelRecipientRemove {
+                channel_id: Snowflake(50),
+                user_id: Snowflake(9)
+            }
+        );
+    }
+
+    #[test]
+    fn relationship_update() {
+        // Userdoccers' partial shape: no `user`.
+        assert_eq!(
+            dec(
+                "RELATIONSHIP_UPDATE",
+                r#"{"id":"9","type":1,"nickname":"buddy","since":"2024-01-01T00:00:00+00:00","user_ignored":false}"#
+            ),
+            GatewayEvent::RelationshipUpdate {
+                user_id: Snowflake(9),
+                kind: Some(RelationshipKind::Friend),
+                nickname: Some(Some("buddy".into()))
+            }
+        );
+        // Null nickname clears it; absent keys keep the stored values.
+        assert_eq!(
+            dec("RELATIONSHIP_UPDATE", r#"{"id":"9","nickname":null}"#),
+            GatewayEvent::RelationshipUpdate {
+                user_id: Snowflake(9),
+                kind: None,
+                nickname: Some(None)
+            }
+        );
+        assert_eq!(
+            dec("RELATIONSHIP_UPDATE", r#"{"id":"9","type":2}"#),
+            GatewayEvent::RelationshipUpdate {
+                user_id: Snowflake(9),
+                kind: Some(RelationshipKind::Blocked),
+                nickname: None
+            }
+        );
+        assert!(decode_dispatch("RELATIONSHIP_UPDATE", r#"{"type":1}"#).is_err());
     }
 }
