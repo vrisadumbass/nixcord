@@ -190,6 +190,8 @@ pub enum Command {
         reply_to: Option<Snowflake>,
         /// Optional file attachments uploaded as multipart/form-data.
         attachments: Vec<UploadFile>,
+        /// With `reply_to`: notify the replied-to author (the reply banner's `@ ON`).
+        ping_reply: bool,
     },
     /// Add my reaction. The store update arrives as a gateway MESSAGE_REACTION_ADD.
     React {
@@ -638,8 +640,9 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
             content,
             reply_to,
             attachments,
+            ping_reply,
         } => match http
-            .send_message_with_files(channel, &content, reply_to, &attachments)
+            .send_message_with_files(channel, &content, reply_to, ping_reply, &attachments)
             .await
         {
             Ok(m) => events.send(AppEvent::Sent(Box::new(m))),

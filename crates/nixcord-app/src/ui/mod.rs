@@ -15,6 +15,7 @@ pub mod gif_picker;
 pub mod header_menus;
 pub mod login;
 pub mod markdown;
+pub mod mention_complete;
 pub mod presence;
 pub mod profile;
 pub mod search;
@@ -55,6 +56,8 @@ pub enum Action {
         content: String,
         reply_to: Option<Snowflake>,
         attachments: Vec<nixcord_http::UploadFile>,
+        /// With `reply_to`: notify the replied-to author (reply banner `@ ON` / `@ OFF`).
+        ping_reply: bool,
     },
     React {
         channel: Snowflake,
