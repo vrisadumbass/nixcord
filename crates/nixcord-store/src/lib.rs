@@ -353,9 +353,20 @@ impl Store {
                 channel_id,
                 message_id,
             } => {
+                // An ack at or before the current marker is a manual "Mark Unread" (ours
+                // echoed back, or another client's): the messages after it stay unread, so
+                // their mentions are recounted instead of cleared.
+                let backwards = self
+                    .last_read_message_id(*channel_id)
+                    .is_some_and(|read| *message_id <= read);
+                let mentions = if backwards {
+                    self.unread_mentions_after(*channel_id, *message_id)
+                } else {
+                    0
+                };
                 let entry = self.read_states.entry(*channel_id).or_default();
                 entry.last_read_message_id = Some(*message_id);
-                entry.mention_count = 0;
+                entry.mention_count = mentions;
             }
             GatewayEvent::ThreadCreate(ch) | GatewayEvent::ThreadUpdate(ch) => {
                 self.upsert_thread(ch);
@@ -1866,6 +1877,9 @@ impl Store {
         if let Some(mentions) = &u.mentions {
             m.mentions.clone_from(mentions);
         }
+        if let Some(p) = u.pinned {
+            m.pinned = p;
+        }
     }
 
     fn reaction_add(
@@ -2309,6 +2323,74 @@ impl Store {
             entry.mention_count = entry.mention_count.saturating_add(1);
         }
     }
+
+    // ---- message context menu: pins, deleting others' messages, mark unread ----
+
+    /// Can I pin and unpin messages here? Always in DMs; in servers MANAGE_MESSAGES or
+    /// the newer PIN_MESSAGES. Fails open like `can_send` when permissions are unknown.
+    pub fn can_pin_messages(&self, channel_id: Snowflake) -> bool {
+        self.has_permissions(channel_id, perm::MANAGE_MESSAGES)
+            || self.has_permissions(channel_id, perm::PIN_MESSAGES)
+    }
+
+    /// Can I delete other people's messages here (MANAGE_MESSAGES)? False in DMs, where
+    /// only your own messages can be deleted. Fails open when server permissions are
+    /// unknown, like the other helpers.
+    pub fn can_manage_messages(&self, channel_id: Snowflake) -> bool {
+        self.channels
+            .get(&channel_id)
+            .is_some_and(|c| c.guild_id.is_some())
+            && self.has_permissions(channel_id, perm::MANAGE_MESSAGES)
+    }
+
+    /// "Mark Unread" from `message_id`: move the read marker *backwards* to just before
+    /// it (the previous loaded message, or `message_id - 1` when it is the first known),
+    /// and recount the mentions of me among the now-unread messages (every message from
+    /// someone else counts in a DM, as on MESSAGE_CREATE). Unlike `mark_read_to`, this
+    /// may move the marker either way. Returns `(last read message id, mention count)`,
+    /// the values a manual ack sends.
+    pub fn mark_unread_from(
+        &mut self,
+        channel_id: Snowflake,
+        message_id: Snowflake,
+    ) -> (Snowflake, u32) {
+        let prev = self
+            .messages(channel_id)
+            .iter()
+            .rev()
+            .map(|m| m.id)
+            .find(|id| *id < message_id)
+            .unwrap_or(Snowflake(message_id.0.saturating_sub(1)));
+        let mentions = self.unread_mentions_after(channel_id, prev);
+        let entry = self.read_states.entry(channel_id).or_default();
+        entry.last_read_message_id = Some(prev);
+        entry.mention_count = mentions;
+        (prev, mentions)
+    }
+
+    /// Cache users shown outside messages (the "who reacted" list), so their profile card
+    /// can open. Known users are refreshed.
+    pub fn remember_users(&mut self, users: &[User]) {
+        for u in users {
+            self.cache_user(u);
+        }
+    }
+
+    /// Loaded messages after `after` in `channel_id` that would count as mentions of me.
+    fn unread_mentions_after(&self, channel_id: Snowflake, after: Snowflake) -> u32 {
+        let me = self.me.as_ref().map(|u| u.id);
+        let is_dm = self
+            .channels
+            .get(&channel_id)
+            .is_some_and(|c| matches!(c.kind, ChannelKind::Dm | ChannelKind::GroupDm));
+        let n = self
+            .messages(channel_id)
+            .iter()
+            .filter(|m| m.id > after && Some(m.author.id) != me)
+            .filter(|m| is_dm || self.is_mentioned(m))
+            .count();
+        u32::try_from(n).unwrap_or(u32::MAX)
+    }
 }
 
 /// Sort active threads most recently active first (matching `private_channels`).
@@ -2352,6 +2434,9 @@ mod event_tests;
 
 #[cfg(test)]
 mod settings_tests;
+
+#[cfg(test)]
+mod message_menu_tests;
 
 #[cfg(test)]
 mod voice_tests {
