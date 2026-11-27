@@ -65,10 +65,10 @@ crates/
                     resume, backoff, close codes; op 37 guild subscriptions, op 3 presence; GatewayCommand
   nixcord-http      REST: history (before/around), send/reply/multipart uploads/edit/delete,
                     reactions, typing, interactions, acks, relationships, create DM, threads,
-                    message search; 429 handling
+                    message search; rate-limit buckets, typed API errors (`user_message`)
   nixcord-store     pure state: messages (sliding window, cap 250/channel), read state &
                     mention counts, threads, presences (per-scope), member lists, permissions,
-                    reactions, typing, emoji, profile helpers
+                    reactions, typing, emoji, profile helpers, notification settings (mute/level)
   nixcord-capture   NIXCORD_CAPTURE: redacts payloads (no strings, hashed ids) for fixtures
   nixcord-markdown  Discord-flavored markdown -> AST (no egui), fuzz-tested
   nixcord-emoji     emoji table (emojibase), shortcodes, search, Twemoji filenames
@@ -83,7 +83,7 @@ crates/
     src/ui/           sidebar, chat, composer, forum, friends, search, markdown, components,
                       emoji_picker, emoji_text, presence, profile, viewer, settings, login
 assets/demo/        CC0 / public-domain / Apache-2.0 demo avatars, icons, photos, GIFs, emoji
-docs/               ARCHITECTURE.md, screenshots/ (from --demo only)
+docs/               ARCHITECTURE.md, ROADMAP.md (the plan; tick boxes there), screenshots/ (from --demo only)
 ```
 
 Data flow: the UI thread owns the `Store`. The backend sends `AppEvent`s over a channel,
@@ -162,6 +162,9 @@ demo mode only:
 - GIF search (`/gifs/search`, `/gifs/trending-gifs`), sending stickers, `GUILD_STICKERS_UPDATE`, and
   thread membership (`member`, `THREAD_LIST_SYNC.members`, `THREAD_MEMBER(S)_UPDATE`) that decides
   which threads the sidebar lists.
+- Everything built for roadmap M0: the role/member/ban/pins/recipient/relationship events,
+  `USER_GUILD_SETTINGS_UPDATE` (full vs partial updates unknown), REST rate-limit buckets, and
+  `NIXCORD_CAPTURE` output (read a capture before committing any of it as a fixture).
 - Live voice calls against real Discord voice servers (Op 4 signaling, Voice Gateway, UDP/AEAD RTP,
   and live audio capture/playback).
 

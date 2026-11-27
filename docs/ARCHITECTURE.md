@@ -86,6 +86,16 @@ only) so gateway and http can both call it; store does not use it.
   dropped, pinned users keep theirs), GUILD_BAN_REMOVE (no-op until the bans list),
   USER_UPDATE (refreshes `me`), MESSAGE_DELETE_BULK, MESSAGE_REACTION_REMOVE_ALL /
   _REMOVE_EMOJI, and CHANNEL_PINS_UPDATE (`Channel::last_pin_timestamp`).
+  GUILD_MEMBER_ADD is cached only when something can show the member: the focused
+  member-list guild, or a user the store already holds (cached user, relationship, DM
+  recipient, me).
+- Notification settings: `READY.user_guild_settings` (versioned `{entries}` object or a
+  bare array) and USER_GUILD_SETTINGS_UPDATE fold into per-scope settings (`None` scope:
+  private channels). The store exposes `guild_muted`, `channel_muted` (own override, then
+  parent channel and category), `suppress_everyone`, `suppress_roles` and
+  `notification_level`; mute end times are Unix seconds and the current time is passed
+  in. The update event replaces the whole entry. Unread and mention counts do not consult
+  these yet (roadmap M2).
 - Resilience: unknown events decode to `Ok(None)` and unknown fields are ignored; both
   are tested for every handled event in `nixcord-gateway/src/decode_fuzz.rs`, together
   with deterministic fuzzing of `decode_dispatch`, `dispatch_presences` and
@@ -115,6 +125,13 @@ Discord's rate limit docs:
   `"global": true` or `X-RateLimit-Global`) holds every route until `retry_after`.
 - 429s: a wait of at most 5 s is retried once, after the limiter has waited it out; a
   longer or repeated one is returned as `HttpError::RateLimited`.
+- Fail fast: when a bucket or a global hold needs a wait longer than 5 s, later requests
+  on it return `HttpError::RateLimited` at once instead of sleeping in the route queue.
+  This also applies after a success that reported `remaining: 0` with a far reset.
+- Errors: a Discord JSON error body (`{code, message, errors}`) becomes
+  `HttpError::Api(ApiError)`; 401/404/429 and permission 403s (no code, 50001, 50013)
+  keep their own variants. `HttpError::user_message()` gives the short sentence the app
+  shows in toasts; it never contains raw bodies, URLs or transport detail.
 - Maps are capped at 256 entries, expired ones pruned.
 
 ## Payload capture
@@ -129,8 +146,16 @@ so real payload shapes can become test fixtures:
 - Ids (15-20 digit strings, integers >= 10^15, id-like map keys) become salted hashes,
   consistent within one run; the salt is random per process. Permission bitfields are
   placeholders, never hashed.
-- Epoch-looking integers become a fixed time; other numbers, booleans and nulls are kept.
-  Free-text object keys and non-route path segments are replaced; queries are dropped.
+- Epoch-looking integers and floats become a fixed time. Numbers under a closed list of
+  keys that describe a real server or file (`color`, `position`, `member_count`, `count`,
+  `width`, ...; see `ZEROED_NUMBER_KEYS`) become 0. Other numbers, booleans and nulls are
+  kept (types, flags, enum levels).
+- Object keys are kept only when they look like field names (`[a-z_][a-z0-9_]{0,47}`);
+  others become `<key:N>`. A map keyed by a lowercase word of user data would still keep
+  it, so read a capture before committing any of it as a fixture.
+- REST paths keep only words from a closed route allowlist (`ROUTE_WORDS`); ids are
+  hashed, everything else is `<seg>`, including whatever follows `invites` or `reactions`
+  and webhook/interaction tokens. Queries and fragments are dropped.
 - Never written: outgoing payloads (identify carries the token), request bodies, headers.
 - Capped at 20 records per event type / route shape and 64 MiB in total.
 
@@ -150,10 +175,9 @@ tint, an accent, and text colors. Painted as an egui `Mesh` behind transparent p
 | app / UI / themes     | ui agent        | `cargo run` shows login, sidebar, chat, composer  |
 | integration, CI, docs | lead            | `cargo clippy -D warnings` + tests green in CI    |
 
-## Roadmap after v0.1
+## Roadmap
 
-Attachments and images, avatars, replies UI, markdown rendering, unread state, mentions,
-zlib-stream compression, member list, plugins (a stable Rust trait API plus WASM).
+See [ROADMAP.md](ROADMAP.md).
 
 ## Emoji
 

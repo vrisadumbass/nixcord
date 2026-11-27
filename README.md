@@ -32,7 +32,8 @@ are CC0, public domain or Apache-2.0; see [assets/demo/LICENSES.md](assets/demo/
 
 ## Status
 
-Early (v0.1). Working:
+Early (0.5 in development; see [CHANGELOG.md](CHANGELOG.md)). Most of this has only been
+exercised in `--demo` so far; live verification is milestone M0 of the roadmap. Working:
 
 - Login, servers (with drag-and-drop reordering & custom server folders), channels, Forum channels, active threads (with creation, archiving & locking), DMs, Friends page, history, message search (`Ctrl+F`), and send (with file uploads, drag-and-drop & `Ctrl+V` clipboard image paste)/edit/delete/reply.
 - Reactions, typing indicators, unread/mention badges, right-click "Mark as Read", in-app mention toasts, and `zlib-stream` reconnect/resume.
@@ -41,10 +42,13 @@ Early (v0.1). Working:
   autocomplete, and custom emoji.
 - An in-app image viewer, GIF/animated WebP playback, and inline H.264 video with audio.
 - Presence, persistent status and custom status editor, floating user profile popouts, the member list with role groups, and permission-aware channel lists.
+- Voice calls (signaling, Voice Gateway, encrypted RTP, Opus, DAVE end-to-end encryption).
+- Server stickers and a GIF picker.
 - Themes.
 
-Not yet: voice, OS desktop notifications, stickers/GIF picker, and plugins.
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design and roadmap.
+Not yet: video calls and screen share, OS desktop notifications, server administration,
+and plugins. See [docs/ROADMAP.md](docs/ROADMAP.md) for the plan and
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design.
 
 ## Network
 
@@ -91,7 +95,8 @@ Service), never into a plain file.
 ```
 crates/nixcord-model    serde data types
 crates/nixcord-gateway  websocket gateway (identify, heartbeat, resume)
-crates/nixcord-http     REST client
+crates/nixcord-http     REST client, rate limiting
+crates/nixcord-capture  opt-in redacted payload capture for test fixtures
 crates/nixcord-store    in-memory state, capped per channel
 crates/nixcord-video    inline video: MP4/MOV demux, OpenH264, symphonia audio, cpal
 crates/nixcord-voice    voice calls: Voice Gateway, AEAD RTP, rusty-opus, cpal
