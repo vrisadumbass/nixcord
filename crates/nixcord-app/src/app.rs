@@ -229,6 +229,9 @@ pub struct ViewState {
     pub custom_status_modal: Option<ui::presence::CustomStatusModal>,
     pub rail_drag: Option<ui::sidebar::RailDrag>,
     pub folder_modal: Option<ui::sidebar::FolderModal>,
+    /// Recent channels, last focus and the shortcuts sheet (`ui::shortcuts`).
+    pub keys: ui::shortcuts::KeyState,
+    pub quick_switcher: Option<ui::quick_switcher::QuickSwitcher>,
 }
 
 /// Tracks the two-part Discord voice handshake (`VOICE_STATE_UPDATE` + `VOICE_SERVER_UPDATE`).
@@ -1274,6 +1277,7 @@ impl NixApp {
         self.view.channel = ch;
         if let Some(c) = ch {
             self.view.last_channel.insert(self.view.guild, c);
+            self.view.keys.visit(c);
         }
         self.chat.reset();
     }
@@ -1747,6 +1751,7 @@ impl eframe::App for NixApp {
                 if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
                     self.view.search.want_focus = true;
                 }
+                ui::shortcuts::handle_keys(&ctx, self, &mut actions);
                 self.ensure_history();
                 self.sync_member_subscription();
                 self.update_seen();
@@ -1759,7 +1764,10 @@ impl eframe::App for NixApp {
                 ui::sidebar::folder_modal(&ctx, self, &mut actions);
                 ui::settings::window(&ctx, self, &mut actions);
                 ui::chat::delete_modal(&ctx, self, &mut actions);
+                ui::quick_switcher::show(&ctx, self, &mut actions);
+                ui::shortcuts::sheet(&ctx, self);
                 ui::viewer::show(&ctx, self);
+                ui::shortcuts::end_frame(&ctx, self);
             }
         }
         self.toast_ui(&ctx, &mut actions);
