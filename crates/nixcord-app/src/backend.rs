@@ -577,7 +577,7 @@ async fn login(
             let reason = if bad_token {
                 "That token was rejected by Discord.".to_string()
             } else {
-                e.to_string()
+                e.user_message()
             };
             events.send(AppEvent::LoginFailed { reason, bad_token });
             return;
@@ -613,7 +613,7 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
                 }),
                 Err(e) => events.send(AppEvent::HistoryFailed {
                     channel,
-                    error: format!("Couldn't load messages: {e}"),
+                    error: format!("Couldn't load messages: {}", e.user_message()),
                 }),
             }
         }
@@ -632,7 +632,7 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
                 channel,
                 content,
                 attachments,
-                error: format!("Couldn't send: {e}"),
+                error: format!("Couldn't send: {}", e.user_message()),
             }),
         },
         Command::React {
@@ -641,7 +641,10 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
             emoji,
         } => {
             if let Err(e) = http.add_reaction(channel, message, &emoji).await {
-                events.send(AppEvent::Error(format!("Couldn't add reaction: {e}")));
+                events.send(AppEvent::Error(format!(
+                    "Couldn't add reaction: {}",
+                    e.user_message()
+                )));
             }
         }
         Command::Unreact {
@@ -650,7 +653,10 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
             emoji,
         } => {
             if let Err(e) = http.remove_own_reaction(channel, message, &emoji).await {
-                events.send(AppEvent::Error(format!("Couldn't remove reaction: {e}")));
+                events.send(AppEvent::Error(format!(
+                    "Couldn't remove reaction: {}",
+                    e.user_message()
+                )));
             }
         }
         Command::Edit {
@@ -661,14 +667,20 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
             Ok(m) => events.send(AppEvent::Gateway(GatewayEvent::MessageUpdate(Box::new(
                 update_from(&m),
             )))),
-            Err(e) => events.send(AppEvent::Error(format!("Couldn't edit: {e}"))),
+            Err(e) => events.send(AppEvent::Error(format!(
+                "Couldn't edit: {}",
+                e.user_message()
+            ))),
         },
         Command::Delete { channel, message } => match http.delete_message(channel, message).await {
             Ok(()) => events.send(AppEvent::Gateway(GatewayEvent::MessageDelete {
                 id: message,
                 channel_id: channel,
             })),
-            Err(e) => events.send(AppEvent::Error(format!("Couldn't delete: {e}"))),
+            Err(e) => events.send(AppEvent::Error(format!(
+                "Couldn't delete: {}",
+                e.user_message()
+            ))),
         },
         Command::Typing { channel } => {
             if let Err(e) = http.trigger_typing(channel).await {
@@ -687,7 +699,7 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
                 Err(e) => events.send(AppEvent::InteractionDone {
                     message_id,
                     custom_id,
-                    error: Some(format!("Interaction failed: {e}")),
+                    error: Some(format!("Interaction failed: {}", e.user_message())),
                 }),
             }
         }
@@ -698,17 +710,24 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
         }
         Command::CreateDm { recipient_id } => match http.create_dm(recipient_id).await {
             Ok(ch) => events.send(AppEvent::DmCreated(Box::new(ch))),
-            Err(e) => events.send(AppEvent::Error(format!("Couldn't open DM: {e}"))),
+            Err(e) => events.send(AppEvent::Error(format!(
+                "Couldn't open DM: {}",
+                e.user_message()
+            ))),
         },
         Command::AcceptFriendRequest { user_id } => {
             if let Err(e) = http.put_relationship(user_id, None).await {
-                events.send(AppEvent::Error(format!("Couldn't accept request: {e}")));
+                events.send(AppEvent::Error(format!(
+                    "Couldn't accept request: {}",
+                    e.user_message()
+                )));
             }
         }
         Command::RemoveRelationship { user_id } => {
             if let Err(e) = http.remove_relationship(user_id).await {
                 events.send(AppEvent::Error(format!(
-                    "Couldn't update relationship: {e}"
+                    "Couldn't update relationship: {}",
+                    e.user_message()
                 )));
             }
         }
@@ -717,7 +736,10 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
                 .put_relationship(user_id, Some(RelationshipKind::Blocked))
                 .await
             {
-                events.send(AppEvent::Error(format!("Couldn't block user: {e}")));
+                events.send(AppEvent::Error(format!(
+                    "Couldn't block user: {}",
+                    e.user_message()
+                )));
             }
         }
         Command::SendFriendRequest { username } => {
@@ -725,7 +747,7 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
                 .send_friend_request(&username)
                 .await
                 .err()
-                .map(|e| e.to_string());
+                .map(|e| e.user_message());
             events.send(AppEvent::FriendRequestResult {
                 username,
                 error: err,
@@ -744,7 +766,7 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
                 Ok(result) => events.send(AppEvent::SearchResults { request_id, result }),
                 Err(e) => events.send(AppEvent::SearchFailed {
                     request_id,
-                    error: format!("Search failed: {e}"),
+                    error: format!("Search failed: {}", e.user_message()),
                 }),
             }
         }
@@ -752,7 +774,7 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
             let result = http
                 .gifs(query.as_deref())
                 .await
-                .map_err(|e| format!("Couldn't load GIFs: {e}"));
+                .map_err(|e| format!("Couldn't load GIFs: {}", e.user_message()));
             events.send(AppEvent::Gifs { request_id, result });
         }
         Command::SendSticker {
@@ -767,7 +789,10 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
                 "Couldn't send sticker: you don't have permission to use this sticker here."
                     .to_string(),
             )),
-            Err(e) => events.send(AppEvent::Error(format!("Couldn't send sticker: {e}"))),
+            Err(e) => events.send(AppEvent::Error(format!(
+                "Couldn't send sticker: {}",
+                e.user_message()
+            ))),
         },
         Command::LoadHistoryAround { channel, around } => {
             match http.messages_around(channel, around, HISTORY_PAGE).await {
@@ -778,7 +803,7 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
                 }),
                 Err(e) => events.send(AppEvent::HistoryFailed {
                     channel,
-                    error: format!("Couldn't jump to message: {e}"),
+                    error: format!("Couldn't jump to message: {}", e.user_message()),
                 }),
             }
         }
@@ -804,14 +829,16 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
                             match http.send_message(tid, &body, None).await {
                                 Ok(m) => events.send(AppEvent::Sent(Box::new(m))),
                                 Err(e) => events.send(AppEvent::Error(format!(
-                                    "Thread created, but starter message failed: {e}"
+                                    "Thread created, but starter message failed: {}",
+                                    e.user_message()
                                 ))),
                             }
                         }
                     }
                 }
                 Err(e) => events.send(AppEvent::CreateThreadFailed(format!(
-                    "Couldn't create thread: {e}"
+                    "Couldn't create thread: {}",
+                    e.user_message()
                 ))),
             }
         }
@@ -821,7 +848,10 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
             locked,
         } => match http.update_thread(thread_id, archived, locked).await {
             Ok(ch) => events.send(AppEvent::Gateway(GatewayEvent::ThreadUpdate(Box::new(ch)))),
-            Err(e) => events.send(AppEvent::Error(format!("Couldn't update thread: {e}"))),
+            Err(e) => events.send(AppEvent::Error(format!(
+                "Couldn't update thread: {}",
+                e.user_message()
+            ))),
         },
         Command::Login(_)
         | Command::Logout

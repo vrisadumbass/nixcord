@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
 
-use crate::Method;
+use crate::{HttpError, Method, AUTO_RETRY_MAX};
 
 /// Discord's global limit for a user or bot.
 pub const GLOBAL_PER_SECOND: u32 = 50;
@@ -159,10 +159,22 @@ impl RateLimiter {
     }
 
     /// Wait until the global limit and this route's bucket allow one request, and count it.
-    pub async fn acquire(&self, key: &str) {
+    ///
+    /// Waits of at most [`AUTO_RETRY_MAX`] are slept out. A longer one (a long 429 on this
+    /// route, or a long global hold) fails at once with [`HttpError::RateLimited`], so a
+    /// caller never sits in its route queue for minutes; that request is not counted.
+    pub async fn acquire(&self, key: &str) -> Result<(), HttpError> {
         loop {
             match self.try_acquire(key, Instant::now()) {
-                None => return,
+                None => return Ok(()),
+                Some(wait) if wait > AUTO_RETRY_MAX => {
+                    tracing::debug!(
+                        route = key,
+                        ?wait,
+                        "rate limit: wait too long, failing fast"
+                    );
+                    return Err(HttpError::RateLimited(wait));
+                }
                 Some(wait) => {
                     tracing::debug!(route = key, ?wait, "rate limit: waiting");
                     tokio::time::sleep(wait).await;
@@ -347,12 +359,12 @@ mod tests {
     async fn exhausted_bucket_waits_for_reset() {
         let rl = RateLimiter::default();
         let key = route_key(Method::Post, "/channels/1/messages");
-        rl.acquire(&key).await;
+        rl.acquire(&key).await.unwrap();
         rl.update(&key, &headers("b", 1, 2.0), None);
         let start = Instant::now();
-        rl.acquire(&key).await; // the one remaining
+        rl.acquire(&key).await.unwrap(); // the one remaining
         assert!(start.elapsed() < Duration::from_millis(1));
-        rl.acquire(&key).await; // waits for the reset
+        rl.acquire(&key).await.unwrap(); // waits for the reset
         assert!(start.elapsed() >= Duration::from_secs(2));
     }
 
@@ -386,7 +398,7 @@ mod tests {
             Some((Duration::from_secs(3), true)),
         );
         let start = Instant::now();
-        rl.acquire(&b).await;
+        rl.acquire(&b).await.unwrap();
         assert!(start.elapsed() >= Duration::from_secs(3));
     }
 
@@ -411,10 +423,12 @@ mod tests {
         let rl = RateLimiter::default();
         let start = Instant::now();
         for i in 0..GLOBAL_PER_SECOND {
-            rl.acquire(&format!("Get /channels/{i}/messages")).await;
+            rl.acquire(&format!("Get /channels/{i}/messages"))
+                .await
+                .unwrap();
         }
         assert!(start.elapsed() < Duration::from_millis(1));
-        rl.acquire("Get /users/@me").await;
+        rl.acquire("Get /users/@me").await.unwrap();
         assert!(start.elapsed() >= Duration::from_secs(1));
     }
 
@@ -440,6 +454,106 @@ mod tests {
             t.await.unwrap();
         }
         assert_eq!(*order.lock().unwrap(), vec![0, 1, 2]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn long_bucket_wait_fails_fast() {
+        let rl = RateLimiter::default();
+        let key = route_key(Method::Post, "/channels/1/messages");
+        let other = route_key(Method::Get, "/channels/1/messages");
+        rl.update(
+            &key,
+            &RateLimitHeaders::default(),
+            Some((Duration::from_secs(600), false)),
+        );
+        let start = Instant::now();
+        let _turn = rl.queue(&key).await;
+        match rl.acquire(&key).await {
+            Err(HttpError::RateLimited(wait)) => assert_eq!(wait, Duration::from_secs(600)),
+            other => panic!("{other:?}"),
+        }
+        // No sleep (the clock is paused, so any sleep would show), and nothing was counted.
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert_eq!(rl.state.lock().unwrap().window_count, 0);
+        // Other routes are unaffected.
+        rl.acquire(&other).await.unwrap();
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        // Once the reset is near enough, the wait is slept out again.
+        tokio::time::advance(Duration::from_secs(597)).await;
+        rl.acquire(&key).await.unwrap();
+        assert_eq!(start.elapsed(), Duration::from_secs(600));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn long_global_hold_fails_fast_on_every_route() {
+        let rl = RateLimiter::default();
+        let a = route_key(Method::Get, "/users/@me");
+        let b = route_key(Method::Get, "/channels/3/messages");
+        rl.update(
+            &a,
+            &RateLimitHeaders::default(),
+            Some((Duration::from_secs(600), true)),
+        );
+        let start = Instant::now();
+        for key in [&a, &b] {
+            match rl.acquire(key).await {
+                Err(HttpError::RateLimited(wait)) => assert_eq!(wait, Duration::from_secs(600)),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert_eq!(rl.state.lock().unwrap().window_count, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waits_up_to_the_auto_retry_max_still_sleep() {
+        let rl = RateLimiter::default();
+        let key = route_key(Method::Post, "/channels/1/typing");
+        rl.update(
+            &key,
+            &RateLimitHeaders::default(),
+            Some((AUTO_RETRY_MAX, false)),
+        );
+        let start = Instant::now();
+        rl.acquire(&key).await.unwrap();
+        assert_eq!(start.elapsed(), AUTO_RETRY_MAX);
+        assert_eq!(rl.state.lock().unwrap().window_count, 1);
+
+        // Just over the limit fails instead.
+        rl.update(
+            &key,
+            &RateLimitHeaders::default(),
+            Some((AUTO_RETRY_MAX + Duration::from_millis(1), false)),
+        );
+        assert!(matches!(
+            rl.acquire(&key).await,
+            Err(HttpError::RateLimited(_))
+        ));
+        assert_eq!(start.elapsed(), AUTO_RETRY_MAX);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fail_fast_releases_the_queue_for_later_callers() {
+        let rl = Arc::new(RateLimiter::default());
+        let key = route_key(Method::Post, "/channels/1/messages");
+        rl.update(
+            &key,
+            &RateLimitHeaders::default(),
+            Some((Duration::from_secs(600), false)),
+        );
+        let start = Instant::now();
+        let mut tasks = Vec::new();
+        for _ in 0..3 {
+            let (rl, key) = (rl.clone(), key.clone());
+            tasks.push(tokio::spawn(async move {
+                let _turn = rl.queue(&key).await;
+                rl.acquire(&key).await
+            }));
+        }
+        for t in tasks {
+            assert!(matches!(t.await.unwrap(), Err(HttpError::RateLimited(_))));
+        }
+        assert_eq!(start.elapsed(), Duration::ZERO);
     }
 
     #[test]

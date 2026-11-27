@@ -35,6 +35,9 @@ pub const AUTO_RETRY_MAX: Duration = Duration::from_secs(5);
 /// Error bodies are truncated to this many characters in [`HttpError::Status`].
 pub const ERROR_BODY_MAX_CHARS: usize = 300;
 
+/// Discord's own error `message` is capped to this many characters in [`ApiError`].
+pub const API_MESSAGE_MAX_CHARS: usize = 200;
+
 const DISCORD_EPOCH_MS: u64 = 1_420_070_400_000;
 
 #[derive(Debug, thiserror::Error)]
@@ -47,8 +50,13 @@ pub enum HttpError {
     NotFound,
     #[error("rate limited, retry after {0:?}")]
     RateLimited(std::time::Duration),
+    /// A non-2xx status whose body was not a Discord JSON error.
     #[error("http status {0}: {1}")]
     Status(u16, String),
+    /// A Discord JSON error (`{"code", "message", "errors"?}`). 401, 404, 429 and
+    /// permission 403s keep their own variants; see [`map_error_status`].
+    #[error("{0}")]
+    Api(ApiError),
     #[error("request failed: {0}")]
     Transport(String),
     #[error("bad response body: {0}")]
@@ -58,6 +66,205 @@ pub enum HttpError {
 }
 
 pub type Result<T> = std::result::Result<T, HttpError>;
+
+/// A parsed Discord error body: `{"code": 50013, "message": "Missing Permissions", ...}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiError {
+    /// HTTP status of the response.
+    pub status: u16,
+    /// Discord's JSON error code (`0` for generic errors).
+    pub code: u32,
+    /// Discord's short `message`, on one line, capped to [`API_MESSAGE_MAX_CHARS`].
+    pub message: String,
+    /// The first entry of the nested `errors` object (code 50035, Invalid Form Body).
+    pub field: Option<FieldError>,
+}
+
+/// One validation failure from the `errors` object of a Discord error body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldError {
+    /// Dotted path of the offending field, e.g. `content` or `embeds.0.title`.
+    pub path: String,
+    /// Discord's validation code, e.g. `BASE_TYPE_MAX_LENGTH`.
+    pub code: String,
+    /// Discord's sentence for it, capped to [`API_MESSAGE_MAX_CHARS`].
+    pub message: String,
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = if self.message.is_empty() {
+            "Discord error"
+        } else {
+            &self.message
+        };
+        write!(f, "{message} (HTTP {}, code {})", self.status, self.code)
+    }
+}
+
+impl ApiError {
+    /// Parse a Discord error body. `None` unless it is a JSON object with an integer `code`.
+    pub fn parse(status: u16, body: &str) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_str(body).ok()?;
+        let obj = v.as_object()?;
+        let code = u32::try_from(obj.get("code")?.as_u64()?).ok()?;
+        let message = obj.get("message").and_then(|m| m.as_str()).unwrap_or("");
+        let mut path = Vec::new();
+        Some(Self {
+            status,
+            code,
+            message: one_line(message, API_MESSAGE_MAX_CHARS),
+            field: obj
+                .get("errors")
+                .and_then(|e| first_field_error(e, &mut path, 0)),
+        })
+    }
+
+    /// See [`HttpError::user_message`].
+    pub fn user_message(&self) -> String {
+        const INVALID: &str = "Discord rejected that as invalid.";
+        match self.code {
+            50001 | 50013 => MSG_FORBIDDEN.to_string(),
+            50007 => "Cannot send messages to this user.".to_string(),
+            10003 => "That channel no longer exists.".to_string(),
+            10008 => "That message no longer exists.".to_string(),
+            40005 => "That upload is too large.".to_string(),
+            50035 => match &self.field {
+                Some(f) if f.code == "BASE_TYPE_MAX_LENGTH" => {
+                    if f.path.rsplit('.').next() == Some("content") {
+                        "Your message is too long.".to_string()
+                    } else {
+                        "That text is too long.".to_string()
+                    }
+                }
+                Some(f) => match toast_text(&f.message) {
+                    Some(m) => format!("Discord rejected that: {m}"),
+                    None => INVALID.to_string(),
+                },
+                None => INVALID.to_string(),
+            },
+            _ => toast_text(&self.message).unwrap_or_else(|| status_message(self.status)),
+        }
+    }
+}
+
+/// Depth-first search for the first `{"_errors": [{"code", "message"}]}` leaf.
+fn first_field_error(
+    v: &serde_json::Value,
+    path: &mut Vec<String>,
+    depth: usize,
+) -> Option<FieldError> {
+    let obj = v.as_object()?;
+    if let Some(first) = obj
+        .get("_errors")
+        .and_then(|e| e.as_array())
+        .and_then(|a| a.first())
+    {
+        let text =
+            |k: &str, max| one_line(first.get(k).and_then(|s| s.as_str()).unwrap_or(""), max);
+        return Some(FieldError {
+            path: one_line(&path.join("."), 80),
+            code: text("code", 80),
+            message: text("message", API_MESSAGE_MAX_CHARS),
+        });
+    }
+    if depth >= 8 {
+        return None;
+    }
+    obj.iter().find_map(|(k, child)| {
+        path.push(k.clone());
+        let found = first_field_error(child, path, depth + 1);
+        path.pop();
+        found
+    })
+}
+
+/// Whitespace and control characters collapsed to single spaces, trimmed, capped.
+fn one_line(s: &str, max: usize) -> String {
+    let joined = s
+        .split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    truncate_chars(&joined, max)
+}
+
+/// Discord-authored text that is fit for a toast: non-empty, short, and without links
+/// (so no URL, and no query string, can ride along). Ends with punctuation.
+fn toast_text(s: &str) -> Option<String> {
+    const MAX: usize = 120;
+    let s = one_line(s, MAX);
+    if s.is_empty() || s.contains("://") || s.contains("www.") {
+        return None;
+    }
+    Some(if s.ends_with(['.', '!', '?']) {
+        s
+    } else {
+        format!("{s}.")
+    })
+}
+
+const MSG_FORBIDDEN: &str = "You don't have permission to do that.";
+const MSG_NOT_FOUND: &str = "That no longer exists or couldn't be found.";
+
+fn status_message(status: u16) -> String {
+    match status {
+        401 => HttpError::Unauthorized.user_message(),
+        403 => MSG_FORBIDDEN.to_string(),
+        404 => MSG_NOT_FOUND.to_string(),
+        413 => "That upload is too large.".to_string(),
+        500..=599 => {
+            format!("Discord is having trouble right now (HTTP {status}). Try again later.")
+        }
+        _ => format!("Something went wrong (HTTP {status})."),
+    }
+}
+
+impl HttpError {
+    /// Discord's JSON error code, when the response carried one.
+    pub fn api_code(&self) -> Option<u32> {
+        match self {
+            HttpError::Api(e) => Some(e.code),
+            _ => None,
+        }
+    }
+
+    /// A short sentence for a toast. Built only from fixed text, numbers and Discord's own
+    /// short error `message`: never the token, a URL, or a raw response body.
+    pub fn user_message(&self) -> String {
+        match self {
+            HttpError::Unauthorized => {
+                "Discord rejected your login. Please sign in again.".to_string()
+            }
+            HttpError::Forbidden => MSG_FORBIDDEN.to_string(),
+            HttpError::NotFound => MSG_NOT_FOUND.to_string(),
+            HttpError::RateLimited(wait) => {
+                let secs = wait.as_secs_f64().ceil().max(1.0) as u64;
+                if secs < 120 {
+                    format!("Slow down: try again in {secs} s.")
+                } else {
+                    format!("Slow down: try again in {} min.", secs.div_ceil(60))
+                }
+            }
+            HttpError::Status(status, _) => status_message(*status),
+            HttpError::Api(e) => e.user_message(),
+            HttpError::Transport(_) => {
+                "Network problem: check your connection and try again.".to_string()
+            }
+            HttpError::Decode(_) => "Discord sent a response nixcord couldn't read.".to_string(),
+            HttpError::InvalidUpload(e) => match e {
+                MultipartError::TooManyFiles => {
+                    format!("Too many attachments (max {MAX_ATTACHMENTS}).")
+                }
+                MultipartError::FileTooLarge(_) => "That file is too large to upload.".to_string(),
+                MultipartError::TotalTooLarge => {
+                    "Those attachments are too large together.".to_string()
+                }
+                MultipartError::SerializePayload(_) => "Couldn't prepare that upload.".to_string(),
+            },
+        }
+    }
+}
 
 /// HTTP method of a [`Route`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -500,13 +707,25 @@ fn truncate_chars(s: &str, max: usize) -> String {
 }
 
 /// Map a non-2xx status to an error. Pure; unit-tested.
+///
+/// 401, 404 and 429 always map to their own variants. A 403 is [`HttpError::Forbidden`]
+/// unless its body names a Discord error code other than the permission ones (0, 50001
+/// Missing Access, 50013 Missing Permissions), e.g. 50007; that and any other status with
+/// a Discord JSON error body become [`HttpError::Api`]. Everything else is
+/// [`HttpError::Status`] with the truncated body.
 pub fn map_error_status(status: u16, retry_after_header: Option<&str>, body: &str) -> HttpError {
     match status {
         401 => HttpError::Unauthorized,
-        403 => HttpError::Forbidden,
         404 => HttpError::NotFound,
         429 => HttpError::RateLimited(parse_retry_after(retry_after_header, body)),
-        code => HttpError::Status(code, truncate_chars(body.trim(), ERROR_BODY_MAX_CHARS)),
+        403 => match ApiError::parse(status, body) {
+            Some(e) if !matches!(e.code, 0 | 50001 | 50013) => HttpError::Api(e),
+            _ => HttpError::Forbidden,
+        },
+        code => match ApiError::parse(code, body) {
+            Some(e) => HttpError::Api(e),
+            None => HttpError::Status(code, truncate_chars(body.trim(), ERROR_BODY_MAX_CHARS)),
+        },
     }
 }
 
@@ -593,7 +812,9 @@ impl Http {
     /// limit and its bucket ([`ratelimit::RateLimiter`]). Every response's rate limit
     /// headers are recorded. A 429 asking to wait at most [`AUTO_RETRY_MAX`] is retried
     /// once (after the limiter has waited it out); a longer or repeated one is returned as
-    /// [`HttpError::RateLimited`].
+    /// [`HttpError::RateLimited`]. While the limiter knows a route (or everything, after a
+    /// global 429) is held for longer than [`AUTO_RETRY_MAX`], requests fail with
+    /// [`HttpError::RateLimited`] straight away instead of queueing behind the wait.
     async fn send_limited(
         &self,
         method: Method,
@@ -602,11 +823,16 @@ impl Http {
     ) -> Result<Vec<u8>> {
         let limiter = &self.inner.limiter;
         let key = ratelimit::route_key(method, path);
+        // Callers pass `Route::path`, which has no query string (search text and the like
+        // live in `Route::query`). Cut at `?` anyway so a query can never reach the log.
+        let log_path = path.split('?').next().unwrap_or("");
+        // Dropped on every return below, including the fail-fast one from `acquire`.
         let _turn = limiter.queue(&key).await;
         let mut retried = false;
         loop {
-            limiter.acquire(&key).await;
-            tracing::debug!(?method, path, "http request");
+            // A wait longer than AUTO_RETRY_MAX is returned as `RateLimited` at once.
+            limiter.acquire(&key).await?;
+            tracing::debug!(?method, path = log_path, "http request");
             let resp = make()
                 .send()
                 .await
@@ -639,11 +865,11 @@ impl Http {
             }
             match err {
                 HttpError::RateLimited(wait) if !retried && wait <= AUTO_RETRY_MAX => {
-                    tracing::warn!(path, ?wait, "rate limited, retrying once");
+                    tracing::warn!(path = log_path, ?wait, "rate limited, retrying once");
                     retried = true;
                 }
                 err => {
-                    tracing::debug!(path, status, "http error");
+                    tracing::debug!(path = log_path, status, "http error");
                     return Err(err);
                 }
             }
@@ -899,7 +1125,13 @@ impl Http {
         let url = route.url(&self.inner.base).map_err(HttpError::Transport)?;
         // Shared buffer: a 429 retry re-sends it without copying up to 25 MiB again.
         let body = bytes::Bytes::from(body);
-        tracing::debug!(?method, path, bytes = body.len(), "http multipart request");
+        let log_path = path.split('?').next().unwrap_or("");
+        tracing::debug!(
+            ?method,
+            path = log_path,
+            bytes = body.len(),
+            "http multipart request"
+        );
         self.send_limited(method, path, || {
             client
                 .request(method.to_reqwest(), url.clone())
@@ -1106,6 +1338,268 @@ mod tests {
             HttpError::Status(400, b) => assert_eq!(b.chars().count(), ERROR_BODY_MAX_CHARS + 3),
             e => panic!("{e:?}"),
         }
+    }
+
+    #[test]
+    fn api_error_parsing() {
+        let body = r#"{"code": 50013, "message": "Missing Permissions"}"#;
+        // Permission 403s stay `Forbidden` (the app matches on it).
+        assert!(matches!(
+            map_error_status(403, None, body),
+            HttpError::Forbidden
+        ));
+        assert!(matches!(
+            map_error_status(403, None, r#"{"code":50001,"message":"Missing Access"}"#),
+            HttpError::Forbidden
+        ));
+        assert!(matches!(
+            map_error_status(403, None, "<html>"),
+            HttpError::Forbidden
+        ));
+        // Other coded 403s carry the code.
+        let e = map_error_status(
+            403,
+            None,
+            r#"{"message": "Cannot send messages to this user", "code": 50007}"#,
+        );
+        assert_eq!(e.api_code(), Some(50007));
+        match &e {
+            HttpError::Api(a) => {
+                assert_eq!(a.status, 403);
+                assert_eq!(a.message, "Cannot send messages to this user");
+                assert_eq!(a.field, None);
+            }
+            e => panic!("{e:?}"),
+        }
+        assert_eq!(
+            e.to_string(),
+            "Cannot send messages to this user (HTTP 403, code 50007)"
+        );
+        // 401 / 404 / 429 keep their variants whatever the body says.
+        assert!(matches!(
+            map_error_status(404, None, r#"{"message":"Unknown Message","code":10008}"#),
+            HttpError::NotFound
+        ));
+        assert!(matches!(
+            map_error_status(401, None, r#"{"message":"401: Unauthorized","code":0}"#),
+            HttpError::Unauthorized
+        ));
+        assert!(matches!(
+            map_error_status(429, None, r#"{"message":"x","retry_after":2,"code":20016}"#),
+            HttpError::RateLimited(d) if d == Duration::from_secs(2)
+        ));
+
+        // Nested form errors: the first leaf is kept with its path.
+        let form = r#"{"code":50035,"message":"Invalid Form Body","errors":{"embeds":{"0":
+            {"title":{"_errors":[{"code":"BASE_TYPE_MAX_LENGTH","message":"Must be 256 or fewer in length."}]}}}}}"#;
+        match map_error_status(400, None, form) {
+            HttpError::Api(a) => {
+                assert_eq!((a.status, a.code), (400, 50035));
+                let f = a.field.unwrap();
+                assert_eq!(f.path, "embeds.0.title");
+                assert_eq!(f.code, "BASE_TYPE_MAX_LENGTH");
+                assert_eq!(f.message, "Must be 256 or fewer in length.");
+            }
+            e => panic!("{e:?}"),
+        }
+
+        // Not a Discord error body: the old `Status` shape.
+        for body in [
+            "upstream",
+            "[]",
+            r#"{"message":"no code"}"#,
+            r#"{"code":"str"}"#,
+            r#"{"code":-1}"#,
+            r#"{"code":99999999999}"#,
+        ] {
+            assert!(
+                matches!(map_error_status(400, None, body), HttpError::Status(400, _)),
+                "{body}"
+            );
+        }
+        // Odd shapes do not panic; the message is one capped line.
+        let long = format!(
+            r#"{{"code":7,"message":"a\n\tb {}","errors":[1,2]}}"#,
+            "x".repeat(1000)
+        );
+        let a = ApiError::parse(500, &long).unwrap();
+        assert!(a.message.starts_with("a b xxx"));
+        assert_eq!(a.message.chars().count(), API_MESSAGE_MAX_CHARS + 3);
+        assert_eq!(a.field, None);
+        // Nesting deeper than the search goes is ignored, not followed.
+        let deep = format!(
+            r#"{{"code":50035,"errors":{}{{"_errors":[{{"code":"X","message":"m"}}]}}{}}}"#,
+            r#"{"k":"#.repeat(40),
+            "}".repeat(40)
+        );
+        let a = ApiError::parse(400, &deep).unwrap();
+        assert_eq!((a.message.as_str(), a.field), ("", None));
+    }
+
+    #[test]
+    fn user_messages() {
+        let api = |status, body: &str| match map_error_status(status, None, body) {
+            HttpError::Api(a) => HttpError::Api(a),
+            e => panic!("{e:?}"),
+        };
+        let permission = "You don't have permission to do that.";
+        assert_eq!(HttpError::Forbidden.user_message(), permission);
+        assert_eq!(
+            map_error_status(
+                403,
+                None,
+                r#"{"code":50013,"message":"Missing Permissions"}"#
+            )
+            .user_message(),
+            permission
+        );
+        // 50013 can also arrive on another status.
+        assert_eq!(
+            api(400, r#"{"code":50013,"message":"Missing Permissions"}"#).user_message(),
+            permission
+        );
+        assert_eq!(
+            api(403, r#"{"code":50007,"message":"whatever"}"#).user_message(),
+            "Cannot send messages to this user."
+        );
+        assert_eq!(
+            HttpError::RateLimited(Duration::from_millis(11_200)).user_message(),
+            "Slow down: try again in 12 s."
+        );
+        assert_eq!(
+            HttpError::RateLimited(Duration::from_millis(10)).user_message(),
+            "Slow down: try again in 1 s."
+        );
+        assert_eq!(
+            HttpError::RateLimited(Duration::from_secs(600)).user_message(),
+            "Slow down: try again in 10 min."
+        );
+        assert!(HttpError::Unauthorized.user_message().contains("sign in"));
+        assert!(HttpError::NotFound.user_message().contains("found"));
+        assert_eq!(
+            api(400, r#"{"code":10003,"message":"Unknown Channel"}"#).user_message(),
+            "That channel no longer exists."
+        );
+        assert_eq!(
+            api(400, r#"{"code":10008,"message":"Unknown Message"}"#).user_message(),
+            "That message no longer exists."
+        );
+
+        let too_long = r#"{"code":50035,"message":"Invalid Form Body","errors":{"content":
+            {"_errors":[{"code":"BASE_TYPE_MAX_LENGTH","message":"Must be 2000 or fewer in length."}]}}}"#;
+        assert_eq!(
+            api(400, too_long).user_message(),
+            "Your message is too long."
+        );
+        let other_field = r#"{"code":50035,"message":"Invalid Form Body","errors":{"name":
+            {"_errors":[{"code":"BASE_TYPE_REQUIRED","message":"This field is required"}]}}}"#;
+        assert_eq!(
+            api(400, other_field).user_message(),
+            "Discord rejected that: This field is required."
+        );
+        assert_eq!(
+            api(400, r#"{"code":50035,"message":"Invalid Form Body"}"#).user_message(),
+            "Discord rejected that as invalid."
+        );
+
+        // Fallback: Discord's own message, as one capped sentence.
+        assert_eq!(
+            api(
+                400,
+                r#"{"code":50006,"message":"Cannot send an empty message"}"#
+            )
+            .user_message(),
+            "Cannot send an empty message."
+        );
+        let long = format!(r#"{{"code":1,"message":"{}"}}"#, "word ".repeat(200));
+        assert!(api(400, &long).user_message().chars().count() <= 124);
+        // A message carrying a link (and so possibly a query string) is not shown.
+        let link = r#"{"code":1,"message":"see https://example.invalid/a?token=abc"}"#;
+        assert_eq!(
+            api(400, link).user_message(),
+            "Something went wrong (HTTP 400)."
+        );
+        assert_eq!(
+            api(503, r#"{"code":0,"message":""}"#).user_message(),
+            "Discord is having trouble right now (HTTP 503). Try again later."
+        );
+
+        // Raw bodies and transport details never reach the toast.
+        let secret = "secret-body https://example.invalid/x?q=1";
+        for e in [
+            HttpError::Status(502, secret.into()),
+            HttpError::Status(418, secret.into()),
+            HttpError::Transport(secret.into()),
+            HttpError::Decode(secret.into()),
+            HttpError::InvalidUpload(MultipartError::FileTooLarge(secret.into())),
+            HttpError::InvalidUpload(MultipartError::SerializePayload(secret.into())),
+        ] {
+            let m = e.user_message();
+            assert!(!m.contains("secret") && !m.contains('?'), "{m}");
+            assert!(m.ends_with('.'), "{m}");
+        }
+        assert!(HttpError::Transport(String::new())
+            .user_message()
+            .starts_with("Network problem"));
+    }
+
+    #[tokio::test]
+    async fn long_429_fails_later_requests_fast() {
+        // One response only: the second and third calls must not reach the server.
+        let (base, h) = mock(vec![resp(
+            "429 Too Many Requests",
+            "Retry-After: 600\r\n",
+            r#"{"message":"You are being rate limited.","retry_after":600.0,"global":false}"#,
+        )])
+        .await;
+        let http = Http::with_base_url("t".into(), base);
+        let start = std::time::Instant::now();
+        for _ in 0..3 {
+            match http.messages(C, None, 10).await {
+                Err(HttpError::RateLimited(d)) => {
+                    assert!(d > Duration::from_secs(590) && d <= Duration::from_secs(600))
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert_eq!(h.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn long_global_429_fails_other_routes_fast() {
+        let (base, h) = mock(vec![resp(
+            "429 Too Many Requests",
+            "X-RateLimit-Global: true\r\n",
+            r#"{"message":"You are being rate limited.","retry_after":600.0,"global":true}"#,
+        )])
+        .await;
+        let http = Http::with_base_url("t".into(), base);
+        let start = std::time::Instant::now();
+        assert!(matches!(
+            http.current_user().await,
+            Err(HttpError::RateLimited(_))
+        ));
+        assert!(matches!(
+            http.messages(C, None, 10).await,
+            Err(HttpError::RateLimited(_))
+        ));
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert_eq!(h.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn api_error_from_server() {
+        let (base, _h) = mock(vec![resp(
+            "403 Forbidden",
+            "",
+            r#"{"message": "Cannot send messages to this user", "code": 50007}"#,
+        )])
+        .await;
+        let http = Http::with_base_url("t".into(), base);
+        let e = http.send_message(C, "hi", None).await.unwrap_err();
+        assert_eq!(e.api_code(), Some(50007));
+        assert_eq!(e.user_message(), "Cannot send messages to this user.");
     }
 
     #[test]
