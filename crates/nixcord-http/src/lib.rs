@@ -371,6 +371,35 @@ impl Route {
         r
     }
 
+    /// GET /channels/{id}/pins: the channel's pinned messages, newest pin first.
+    pub fn pins(channel_id: Snowflake) -> Self {
+        Self::new(Method::Get, format!("/channels/{channel_id}/pins"))
+    }
+
+    /// PATCH /users/@me/guilds/{guild_id}/settings (`@me` for private channels) with one
+    /// channel override: mute or unmute `channel_id` until changed again. Shape from
+    /// Userdoccers ("Modify User Guild Settings"); untested against live Discord.
+    pub fn set_channel_muted(
+        guild_id: Option<Snowflake>,
+        channel_id: Snowflake,
+        muted: bool,
+    ) -> Self {
+        let scope = guild_id.map_or_else(|| "@me".to_string(), |g| g.to_string());
+        let mut r = Self::new(Method::Patch, format!("/users/@me/guilds/{scope}/settings"));
+        let mute_config = if muted {
+            serde_json::json!({ "selected_time_window": -1, "end_time": null })
+        } else {
+            serde_json::Value::Null
+        };
+        let mut overrides = serde_json::Map::new();
+        overrides.insert(
+            channel_id.to_string(),
+            serde_json::json!({ "muted": muted, "mute_config": mute_config }),
+        );
+        r.body = Some(serde_json::json!({ "channel_overrides": overrides }));
+        r
+    }
+
     pub fn messages_around(channel_id: Snowflake, around: Snowflake, limit: u8) -> Self {
         let mut r = Self::new(Method::Get, format!("/channels/{channel_id}/messages"));
         r.query.push(("limit", limit.clamp(1, 100).to_string()));
@@ -1044,6 +1073,23 @@ impl Http {
     }
 
     /// GET /channels/{id}/messages?around={around}&limit={limit}.
+    /// GET /channels/{id}/pins.
+    pub async fn pins(&self, channel_id: Snowflake) -> Result<Vec<Message>> {
+        self.json(Route::pins(channel_id)).await
+    }
+
+    /// Mute or unmute one channel in my notification settings. The response body (the
+    /// updated settings object) is ignored: USER_GUILD_SETTINGS_UPDATE carries the result.
+    pub async fn set_channel_muted(
+        &self,
+        guild_id: Option<Snowflake>,
+        channel_id: Snowflake,
+        muted: bool,
+    ) -> Result<()> {
+        self.empty(Route::set_channel_muted(guild_id, channel_id, muted))
+            .await
+    }
+
     pub async fn messages_around(
         &self,
         channel_id: Snowflake,
@@ -1814,6 +1860,26 @@ mod tests {
         assert!(http.current_user().await.is_ok());
         assert!(start.elapsed() >= Duration::from_millis(150));
         assert_eq!(h.await.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn pins_and_mute_routes() {
+        let p = Route::pins(C);
+        assert_eq!(p.method, Method::Get);
+        assert_eq!(p.path, format!("/channels/{C}/pins"));
+
+        let m = Route::set_channel_muted(Some(Snowflake(7)), C, true);
+        assert_eq!(m.method, Method::Patch);
+        assert_eq!(m.path, "/users/@me/guilds/7/settings");
+        let o = &m.body.as_ref().unwrap()["channel_overrides"][C.to_string()];
+        assert_eq!(o["muted"], true);
+        assert_eq!(o["mute_config"]["selected_time_window"], -1);
+
+        let u = Route::set_channel_muted(None, C, false);
+        assert_eq!(u.path, "/users/@me/guilds/@me/settings");
+        let o = &u.body.as_ref().unwrap()["channel_overrides"][C.to_string()];
+        assert_eq!(o["muted"], false);
+        assert!(o["mute_config"].is_null());
     }
 
     #[tokio::test]
