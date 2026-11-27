@@ -20,7 +20,6 @@ Nothing in this release has been verified live yet.
 - `NIXCORD_CAPTURE=<dir>`: redacted capture of payload shapes for test fixtures.
 - Decoder resilience and fuzz tests for the gateway dispatch decoder.
 - This changelog and the roadmap.
-
 - M1 features, built and tested on invented data only: mention autocomplete for users, roles,
   `@everyone` / `@here` and channels; reply ping toggle; right-click message menu with Pin / Unpin,
   Mark Unread and Copy Message Link / ID; who-reacted list; polls with voting; forwarded messages;
