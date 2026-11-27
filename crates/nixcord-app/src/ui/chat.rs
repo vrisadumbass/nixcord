@@ -160,16 +160,18 @@ pub fn header(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Ac
             app.view.search.want_focus = false;
             resp.request_focus();
         }
-        if resp.has_focus() {
-            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                let raw = app.view.search.input.trim().to_string();
-                if !raw.is_empty() {
-                    actions.push(Action::SearchMessages { raw, offset: 0 });
-                }
-            } else if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                resp.surrender_focus();
-                actions.push(Action::CloseSearch);
+        if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            let raw = app.view.search.input.trim().to_string();
+            if !raw.is_empty() {
+                actions.push(Action::SearchMessages { raw, offset: 0 });
             }
+        }
+        // egui drops focus on Escape before this runs, so also accept "had focus last
+        // frame"; otherwise Escape could never close the search.
+        let had_focus = resp.has_focus() || app.view.keys.last_focus == Some(resp.id);
+        if had_focus && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            resp.surrender_focus();
+            actions.push(Action::CloseSearch);
         }
         ui.add_space(8.0);
         let shown = app.members_visible(ui.ctx());

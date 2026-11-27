@@ -462,6 +462,20 @@ impl NixApp {
                 self.store.apply(&ev);
                 if let GatewayEvent::Ready(ref ready) = ev {
                     self.restore_saved_presence(ready);
+                    // Screenshot aid: NIXCORD_DEMO_OPEN=<channel id> opens that demo
+                    // channel at start, so a view can be captured without any input.
+                    if self.demo {
+                        let open = std::env::var("NIXCORD_DEMO_OPEN")
+                            .ok()
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .map(Snowflake);
+                        if let Some(id) = open {
+                            if let Some(guild) = self.store.channel(id).map(|c| c.guild_id) {
+                                self.view.guild = guild;
+                                self.select_channel(Some(id));
+                            }
+                        }
+                    }
                 }
                 if let GatewayEvent::MessageCreate(ref m) = ev {
                     if self.store.should_notify(m, self.view.channel) {

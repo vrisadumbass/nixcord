@@ -32,7 +32,7 @@ pub struct KeyState {
     pub sheet_open: bool,
     /// Widget that had keyboard focus at the end of the last frame. A plain Escape clears
     /// egui's focus before the UI runs, so this is how we know where Escape was pressed.
-    last_focus: Option<Id>,
+    pub(crate) last_focus: Option<Id>,
 }
 
 impl KeyState {

@@ -229,7 +229,11 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
     }
 
     // Emoji and `@` / `#` autocomplete: its keys are taken before the text edit sees them.
-    let ac = if focused {
+    // egui drops focus on Escape before widgets run, so on that frame the box no longer
+    // has focus: treat "had focus last frame and Escape was pressed" as focused too, or
+    // Escape could never dismiss the list.
+    let escaping = app.view.keys.last_focus == Some(id) && ui.input(|i| i.key_pressed(Key::Escape));
+    let ac = if focused || escaping {
         autocomplete(ui.ctx(), app, id, ch)
     } else {
         None
@@ -254,6 +258,8 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
         }
         if esc {
             app.composer.ac_dismissed = Some(ac.query.clone());
+            // Keep typing where you were: Escape only closes the list.
+            ui.memory_mut(|m| m.request_focus(id));
         }
         if pick {
             let p = ac.items.pick(app.composer.ac_selected);
