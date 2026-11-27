@@ -2309,6 +2309,94 @@ impl Store {
             entry.mention_count = entry.mention_count.saturating_add(1);
         }
     }
+
+    // ---- mention autocomplete ----
+
+    /// May I use `@everyone` / `@here` in this channel (MENTION_EVERYONE, `1 << 17`)?
+    /// Server channels only (threads use their parent); unknown permissions fail open like
+    /// `can_send`. Private channels: false, the official client offers neither there.
+    pub fn can_mention_everyone(&self, channel_id: Snowflake) -> bool {
+        /// Not in `nixcord_model::permissions` yet. Source: docs.discord.com/developers,
+        /// "Permissions" (MENTION_EVERYONE = 1 << 17).
+        const MENTION_EVERYONE: u64 = 1 << 17;
+        self.channels
+            .get(&channel_id)
+            .is_some_and(|c| c.guild_id.is_some())
+            && self.has_permissions(channel_id, MENTION_EVERYONE)
+    }
+
+    /// Users the composer can offer after `@` in this channel, from what is already known
+    /// (nothing is fetched): the channel's recent authors first (newest first, with
+    /// `recent = Some(rank)`), then in a server the loaded member list rows and cached
+    /// members of that server, in a DM or group DM the recipients. No duplicates, at most
+    /// [`MENTION_CANDIDATES_MAX`].
+    pub fn mention_candidates<'a>(&'a self, channel_id: Snowflake) -> Vec<MentionCandidate<'a>> {
+        let Some(ch) = self.channels.get(&channel_id) else {
+            return Vec::new();
+        };
+        let guild = ch.guild_id;
+        let mut seen: HashSet<Snowflake> = HashSet::new();
+        let mut out: Vec<MentionCandidate<'a>> = Vec::new();
+        let mut push = |out: &mut Vec<MentionCandidate<'a>>, user: &'a User, recent| {
+            if out.len() >= MENTION_CANDIDATES_MAX || !seen.insert(user.id) {
+                return false;
+            }
+            let user = self.users.get(&user.id).unwrap_or(user);
+            let nick = guild.and_then(|g| self.member_nick(g, user.id));
+            out.push(MentionCandidate { user, nick, recent });
+            true
+        };
+        let mut rank = 0u32;
+        for m in self.messages(channel_id).iter().rev() {
+            if push(&mut out, &m.author, Some(rank)) {
+                rank += 1;
+            }
+        }
+        match guild {
+            Some(g) => {
+                let rows = self.member_list(g).map_or(&[][..], |l| l.rows());
+                for row in rows.iter().flatten() {
+                    if let ListRow::Member(id) = row {
+                        if let Some(u) = self.users.get(id) {
+                            push(&mut out, u, None);
+                        }
+                    }
+                }
+                let mut cached: Vec<Snowflake> = self
+                    .members
+                    .keys()
+                    .filter(|(mg, _)| *mg == g)
+                    .map(|&(_, u)| u)
+                    .collect();
+                // HashMap order is random; keep the result stable between frames.
+                cached.sort_unstable();
+                for id in cached {
+                    if let Some(u) = self.users.get(&id) {
+                        push(&mut out, u, None);
+                    }
+                }
+            }
+            None => {
+                for u in &ch.recipients {
+                    push(&mut out, u, None);
+                }
+            }
+        }
+        out
+    }
+}
+
+/// At most this many users are offered to `@` autocomplete before ranking.
+pub const MENTION_CANDIDATES_MAX: usize = 1000;
+
+/// A user `@` autocomplete may offer (see [`Store::mention_candidates`]).
+#[derive(Debug, Clone, Copy)]
+pub struct MentionCandidate<'a> {
+    pub user: &'a User,
+    /// Server nickname, when known and set.
+    pub nick: Option<&'a str>,
+    /// Rank among the channel's recent authors (0 = newest), `None` if not one.
+    pub recent: Option<u32>,
 }
 
 /// Sort active threads most recently active first (matching `private_channels`).
@@ -2352,6 +2440,9 @@ mod event_tests;
 
 #[cfg(test)]
 mod settings_tests;
+
+#[cfg(test)]
+mod mention_tests;
 
 #[cfg(test)]
 mod voice_tests {

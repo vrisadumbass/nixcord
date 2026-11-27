@@ -462,6 +462,25 @@ impl Route {
         nonce: &str,
         reply_to: Option<Snowflake>,
     ) -> Self {
+        Self::send_reply(channel_id, content, nonce, reply_to, true)
+    }
+
+    /// [`Route::send_message`] with the reply ping chosen: `ping_reply: false` sends the
+    /// reply without notifying the replied-to author (the composer's `@ OFF`).
+    ///
+    /// A reply sends `allowed_mentions: {"parse": ["users","roles","everyone"],
+    /// "replied_user": ping_reply}`. `parse` must be listed: an `allowed_mentions` without
+    /// it parses no mentions at all, so `<@id>` in a reply's text would not ping.
+    /// Source: docs.discord.com/developers, "Allowed Mentions Object" (`replied_user`
+    /// defaults to false); the official client sends the same object with `@ OFF`
+    /// (from memory of its requests, not re-checked).
+    pub fn send_reply(
+        channel_id: Snowflake,
+        content: &str,
+        nonce: &str,
+        reply_to: Option<Snowflake>,
+        ping_reply: bool,
+    ) -> Self {
         let mut r = Self::new(Method::Post, format!("/channels/{channel_id}/messages"));
         let mut body = serde_json::json!({
             "content": content,
@@ -470,7 +489,10 @@ impl Route {
         });
         if let Some(mid) = reply_to {
             body["message_reference"] = serde_json::json!({ "message_id": mid });
-            body["allowed_mentions"] = serde_json::json!({ "replied_user": true });
+            body["allowed_mentions"] = serde_json::json!({
+                "parse": ["users", "roles", "everyone"],
+                "replied_user": ping_reply,
+            });
         }
         r.body = Some(body);
         r
@@ -1126,18 +1148,20 @@ impl Http {
     }
 
     /// POST /channels/{id}/messages with optional multipart file attachments.
-    /// Falls back to plain JSON [`Http::send_message`] when `files` is empty.
+    /// Falls back to a plain JSON body when `files` is empty. `ping_reply` only matters
+    /// with `reply_to` (see [`Route::send_reply`]).
     pub async fn send_message_with_files(
         &self,
         channel_id: Snowflake,
         content: &str,
         reply_to: Option<Snowflake>,
+        ping_reply: bool,
         files: &[UploadFile],
     ) -> Result<Message> {
+        let route = Route::send_reply(channel_id, content, &generate_nonce(), reply_to, ping_reply);
         if files.is_empty() {
-            return self.send_message(channel_id, content, reply_to).await;
+            return self.json(route).await;
         }
-        let route = Route::send_message(channel_id, content, &generate_nonce(), reply_to);
         let payload = route.body.unwrap_or_else(|| serde_json::json!({}));
         let encoded = multipart::encode(&payload, files)?;
         let bytes = self
@@ -1280,11 +1304,91 @@ mod tests {
                 "nonce": "5",
                 "enforce_nonce": true,
                 "message_reference": {"message_id": "222"},
-                "allowed_mentions": {"replied_user": true},
+                "allowed_mentions": {
+                    "parse": ["users", "roles", "everyone"],
+                    "replied_user": true,
+                },
             }))
         );
         let r = Route::edit_message(C, M, "new");
         assert_eq!(r.body, Some(serde_json::json!({"content": "new"})));
+    }
+
+    #[test]
+    fn reply_ping_toggle_body() {
+        let on = Route::send_reply(C, "re <@9>", "5", Some(M), true);
+        assert_eq!(
+            on.body,
+            Route::send_message(C, "re <@9>", "5", Some(M)).body
+        );
+        let off = Route::send_reply(C, "re <@9>", "5", Some(M), false);
+        assert_eq!(
+            off.body,
+            Some(serde_json::json!({
+                "content": "re <@9>",
+                "nonce": "5",
+                "enforce_nonce": true,
+                "message_reference": {"message_id": "222"},
+                "allowed_mentions": {
+                    "parse": ["users", "roles", "everyone"],
+                    "replied_user": false,
+                },
+            }))
+        );
+        // Not a reply: no allowed_mentions at all (Discord parses every mention).
+        let plain = Route::send_reply(C, "hi", "5", None, false);
+        assert!(plain.body.unwrap().get("allowed_mentions").is_none());
+    }
+
+    #[tokio::test]
+    async fn reply_ping_off_json_and_multipart() {
+        let msg = r#"{"id":"9","channel_id":"111","author":{"id":"42","username":"nix"},"content":"hey","timestamp":"2024-01-01T00:00:00+00:00"}"#;
+        let (base, h) = mock(vec![
+            resp("200 OK", "", msg),
+            resp("200 OK", "", msg),
+            resp("200 OK", "", msg),
+        ])
+        .await;
+        let http = Http::with_base_url("t".into(), base);
+        let file = [UploadFile::from_bytes("a.txt", b"abc".to_vec())];
+        http.send_message_with_files(C, "hey", Some(M), false, &[])
+            .await
+            .unwrap();
+        http.send_message_with_files(C, "hey", Some(M), false, &file)
+            .await
+            .unwrap();
+        http.send_message_with_files(C, "hey", Some(M), true, &file)
+            .await
+            .unwrap();
+        let reqs = h.await.unwrap();
+        let json_body = |r: &str| -> serde_json::Value {
+            serde_json::from_str(r.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+        };
+        // The multipart body's `payload_json` part.
+        let payload = |r: &str| -> serde_json::Value {
+            let part = r
+                .split("name=\"payload_json\"")
+                .nth(1)
+                .expect("payload_json part");
+            let json = part.split("\r\n\r\n").nth(1).unwrap();
+            let end = json.find("\r\n--").unwrap();
+            serde_json::from_str(&json[..end]).unwrap()
+        };
+        let v = json_body(&reqs[0]);
+        assert_eq!(v["allowed_mentions"]["replied_user"], false);
+        assert_eq!(
+            v["allowed_mentions"]["parse"],
+            serde_json::json!(["users", "roles", "everyone"])
+        );
+        assert!(reqs[1].to_ascii_lowercase().contains("multipart/form-data"));
+        let v = payload(&reqs[1]);
+        assert_eq!(v["message_reference"]["message_id"], "222");
+        assert_eq!(v["allowed_mentions"]["replied_user"], false);
+        assert_eq!(
+            v["allowed_mentions"]["parse"],
+            serde_json::json!(["users", "roles", "everyone"])
+        );
+        assert_eq!(payload(&reqs[2])["allowed_mentions"]["replied_user"], true);
     }
 
     #[test]

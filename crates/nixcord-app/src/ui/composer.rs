@@ -15,10 +15,20 @@
 //! composer: Up/Down select, Tab/Enter insert, Escape closes. On send, complete
 //! `:shortcodes:` become unicode emoji, and custom `:name:` becomes `<:name:id>` when the
 //! name is unique in the channel's server.
+//!
+//! Mentions: `@` at a word start lists users (recent authors, member list rows, cached
+//! members; DM recipients in DMs), the server's roles and `@everyone` / `@here` when
+//! permitted; `#` lists the server's channels. Same keys as the emoji list. The box shows
+//! `@name`, the message carries `<@id>` (see `mention_complete`). The reply banner has an
+//! `@ ON` / `@ OFF` toggle for pinging the replied-to author.
 
 use super::emoji_picker::{self, Picked};
+use super::mention_complete::{
+    self, ChannelCand, MentionItem, Query, RoleCand, Trigger, UserCand, MAX_ROWS,
+};
 use super::{bold, emoji_text, fmt_size, icon_button, paint_plus, prop, Action, Icon};
 use crate::app::{ComposerState, NixApp};
+use crate::media::Media;
 use crate::theme::Theme;
 use eframe::egui::{
     self, text::CCursor, text::CCursorRange, text_edit::TextEditState, Align, Align2, Color32,
@@ -27,6 +37,8 @@ use eframe::egui::{
 };
 use nixcord_http::{UploadFile, MAX_ATTACHMENTS, MAX_FILE_BYTES, MAX_TOTAL_BYTES};
 use nixcord_model::{ChannelKind, Snowflake};
+use nixcord_store::Store;
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -60,24 +72,29 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
         _ => format!("#{}", channel.label()),
     };
     let placeholder = format!("Message {channel_label}");
+    // Follow edits made since the last frame (by anyone) before reading mention spans.
+    app.composer.mentions.sync(&app.composer.text);
 
     // Edit / reply banner.
+    let mut ping_toggle: Option<bool> = None;
     let banner = if app.composer.editing.is_some() {
         Some("Editing message  ·  escape to cancel  ·  enter to save".to_string())
     } else {
         app.composer.reply_to.map(|rid| {
-            let who = app
-                .store
-                .messages(ch)
-                .iter()
-                .find(|m| m.id == rid)
-                .map_or_else(
-                    || "message".to_string(),
-                    |m| m.author.display_name().to_string(),
-                );
+            let target = app.store.messages(ch).iter().find(|m| m.id == rid);
+            // Replying to yourself never pings, so there is nothing to toggle.
+            let mine = target.is_some_and(|m| Some(m.author.id) == app.store.me().map(|u| u.id));
+            if !mine {
+                ping_toggle = Some(reply_ping(&app.composer));
+            }
+            let who = target.map_or_else(
+                || "message".to_string(),
+                |m| m.author.display_name().to_string(),
+            );
             format!("Replying to {who}")
         })
     };
+    let mut toggle_ping = false;
     let mut cancel = false;
 
     if app.store.is_detached(ch) {
@@ -160,11 +177,21 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
                         {
                             cancel = true;
                         }
+                        if let Some(on) = ping_toggle {
+                            ui.add_space(8.0);
+                            if reply_ping_button(ui, t, on).clicked() {
+                                toggle_ping = true;
+                            }
+                        }
                     });
                 });
             });
     } else {
         ui.add_space(2.0);
+    }
+    if toggle_ping {
+        let on = reply_ping(&app.composer);
+        app.composer.reply_no_ping = if on { app.composer.reply_to } else { None };
     }
 
     // Horizontal attachment preview tray above the composer box (hidden while editing).
@@ -201,9 +228,9 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
         }
     }
 
-    // Emoji autocomplete: its keys are taken before the text edit sees them.
+    // Emoji and `@` / `#` autocomplete: its keys are taken before the text edit sees them.
     let ac = if focused {
-        autocomplete(ui.ctx(), app, id)
+        autocomplete(ui.ctx(), app, id, ch)
     } else {
         None
     };
@@ -229,8 +256,8 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
             app.composer.ac_dismissed = Some(ac.query.clone());
         }
         if pick {
-            let p = ac.items[app.composer.ac_selected].0.clone();
-            accept(ui.ctx(), app, id, ac.start..ac.end, &p, actions);
+            let p = ac.items.pick(app.composer.ac_selected);
+            accept(ui.ctx(), app, id, ac.start..ac.end, p, actions);
         }
     }
     let (enter, shift, up, esc) = ui.input(|i| {
@@ -384,6 +411,7 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
     if changed {
         app.composer.ac_selected = 0;
         app.composer.ac_dismissed = None;
+        app.composer.mentions.sync(&app.composer.text);
     }
     if attach_clicked {
         let slots = MAX_ATTACHMENTS.saturating_sub(app.composer.attachments.len());
@@ -393,8 +421,8 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
     // Autocomplete popup, above the composer.
     if let Some(ac) = &ac {
         if let Some(i) = autocomplete_popup(ui.ctx(), app, ac, frame.response.rect) {
-            let p = ac.items[i].0.clone();
-            accept(ui.ctx(), app, id, ac.start..ac.end, &p, actions);
+            let p = ac.items.pick(i);
+            accept(ui.ctx(), app, id, ac.start..ac.end, p, actions);
         }
     }
 
@@ -425,11 +453,14 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
     if let Some(anchor) = app.composer.gif_picker {
         let out = super::gif_picker::show(ui.ctx(), app, anchor, actions);
         if let Some(url) = out.picked {
+            let ping_reply = reply_ping(&app.composer);
+            app.composer.reply_no_ping = None;
             actions.push(Action::Send {
                 channel: ch,
                 content: url,
                 reply_to: app.composer.reply_to.take(),
                 attachments: Vec::new(),
+                ping_reply,
             });
         }
         if out.close {
@@ -501,8 +532,10 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
     if cancel {
         if app.composer.editing.take().is_some() {
             app.composer.text.clear();
+            app.composer.mentions.clear();
         }
         app.composer.reply_to = None;
+        app.composer.reply_no_ping = None;
     }
 
     // Typing notifications, throttled.
@@ -1262,12 +1295,45 @@ fn close_pickers(ctx: &egui::Context, app: &mut NixApp) {
     }
 }
 
-/// An open autocomplete: the `:query` spans bytes `start..end` (end = caret).
+/// An open autocomplete: the `:query` / `@query` / `#query` spans bytes `start..end`
+/// (end = caret).
 struct Autocomplete {
     start: usize,
     end: usize,
+    /// What Escape dismisses: the emoji query, or the mention query with its trigger.
     query: String,
-    items: Vec<(Picked, String)>,
+    /// Header line of the popup.
+    title: String,
+    items: AcItems,
+    /// Server of the channel (avatars and role colours of user rows).
+    guild: Option<Snowflake>,
+}
+
+enum AcItems {
+    Emoji(Vec<(Picked, String)>),
+    Mention(Vec<MentionItem>),
+}
+
+/// The row chosen in an [`Autocomplete`].
+enum AcPick {
+    Emoji(Picked),
+    Mention(MentionItem),
+}
+
+impl AcItems {
+    fn len(&self) -> usize {
+        match self {
+            Self::Emoji(v) => v.len(),
+            Self::Mention(v) => v.len(),
+        }
+    }
+
+    fn pick(&self, i: usize) -> AcPick {
+        match self {
+            Self::Emoji(v) => AcPick::Emoji(v[i].0.clone()),
+            Self::Mention(v) => AcPick::Mention(v[i].clone()),
+        }
+    }
 }
 
 fn char_to_byte(s: &str, chars: usize) -> usize {
@@ -1280,9 +1346,27 @@ fn caret(ctx: &egui::Context, id: Id, text: &str) -> Option<usize> {
     (r.primary.index == r.secondary.index).then(|| char_to_byte(text, r.primary.index.into()))
 }
 
-fn autocomplete(ctx: &egui::Context, app: &NixApp, id: Id) -> Option<Autocomplete> {
+fn autocomplete(ctx: &egui::Context, app: &NixApp, id: Id, ch: Snowflake) -> Option<Autocomplete> {
     let text = &app.composer.text;
     let end = caret(ctx, id, text)?;
+    let guild = app.store.channel(ch).and_then(|c| c.guild_id);
+    if let Some(q) = mention_complete::mention_query(&text[..end]) {
+        let key = format!("{}{}", sigil(q.trigger), q.text);
+        if app.composer.ac_dismissed.as_deref() == Some(key.as_str()) {
+            return None;
+        }
+        let items = mention_items(&app.store, ch, q);
+        if !items.is_empty() {
+            return Some(Autocomplete {
+                start: q.start,
+                end,
+                title: mention_title(q),
+                query: key,
+                items: AcItems::Mention(items),
+                guild,
+            });
+        }
+    }
     let (start, query) = nixcord_emoji::shortcode_query(&text[..end])?;
     if app.composer.ac_dismissed.as_deref() == Some(query) {
         return None;
@@ -1292,22 +1376,153 @@ fn autocomplete(ctx: &egui::Context, app: &NixApp, id: Id) -> Option<Autocomplet
         start,
         end,
         query: query.to_string(),
-        items,
+        title: format!("EMOJI MATCHING :{}", query.to_uppercase()),
+        items: AcItems::Emoji(items),
+        guild,
     })
 }
 
-/// Replace the `:query` with the pick and count it.
+fn sigil(t: Trigger) -> char {
+    match t {
+        Trigger::Mention => '@',
+        Trigger::Channel => '#',
+    }
+}
+
+/// `MEMBERS`, or `MEMBERS MATCHING @AD` once something is typed.
+fn mention_title(q: Query<'_>) -> String {
+    let kind = match q.trigger {
+        Trigger::Mention => "MEMBERS",
+        Trigger::Channel => "CHANNELS",
+    };
+    if q.text.is_empty() {
+        kind.to_string()
+    } else {
+        format!(
+            "{kind} MATCHING {}{}",
+            sigil(q.trigger),
+            q.text.to_uppercase()
+        )
+    }
+}
+
+/// Rows for an `@` / `#` query in channel `ch`, from what the store already knows (no
+/// network). `#` lists the server's viewable text, announcement, forum and voice
+/// channels, and is not offered in DMs.
+fn mention_items(store: &Store, ch: Snowflake, q: Query<'_>) -> Vec<MentionItem> {
+    let guild = store.channel(ch).and_then(|c| c.guild_id);
+    match q.trigger {
+        Trigger::Mention => {
+            let cands = store.mention_candidates(ch);
+            let users: Vec<UserCand<'_>> = cands
+                .iter()
+                .map(|c| UserCand {
+                    id: c.user.id,
+                    username: &c.user.username,
+                    global_name: c.user.global_name.as_deref(),
+                    nick: c.nick,
+                    recent: c.recent,
+                })
+                .collect();
+            let roles: Vec<RoleCand<'_>> = guild
+                .and_then(|g| store.guild(g))
+                .map(|g| {
+                    g.roles
+                        .iter()
+                        // The @everyone role has the server's id; it's offered as text.
+                        .filter(|r| r.id != g.id && !r.name.is_empty())
+                        .map(|r| RoleCand {
+                            id: r.id,
+                            name: &r.name,
+                            color: r.color,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let everyone = store.can_mention_everyone(ch);
+            mention_complete::rank_mentions(q.text, &users, &roles, everyone, MAX_ROWS)
+        }
+        Trigger::Channel => {
+            let Some(g) = guild else {
+                return Vec::new();
+            };
+            let visible = store.visible_guild_channels(g);
+            let chans: Vec<ChannelCand<'_>> = visible
+                .iter()
+                .filter(|c| {
+                    matches!(
+                        c.kind,
+                        ChannelKind::Text
+                            | ChannelKind::Announcement
+                            | ChannelKind::Forum
+                            | ChannelKind::Voice
+                            | ChannelKind::Other(13)
+                    )
+                })
+                .filter_map(|c| {
+                    Some(ChannelCand {
+                        id: c.id,
+                        name: c.name.as_deref().filter(|n| !n.is_empty())?,
+                        kind: c.kind,
+                    })
+                })
+                .collect();
+            mention_complete::rank_channels(q.text, &chans, MAX_ROWS)
+        }
+    }
+}
+
+/// Replace the query with the pick: an emoji (counted for "Frequently Used"), or a
+/// readable `@name ` / `#name ` that is sent in its wire form (see `mention_complete`).
 fn accept(
     ctx: &egui::Context,
     app: &mut NixApp,
     id: Id,
     range: std::ops::Range<usize>,
-    p: &Picked,
+    p: AcPick,
     actions: &mut Vec<Action>,
 ) {
-    actions.push(Action::EmojiUsed(p.usage_key()));
-    insert_at_cursor(ctx, app, id, Some(range), &p.markup());
+    match p {
+        AcPick::Emoji(p) => {
+            actions.push(Action::EmojiUsed(p.usage_key()));
+            insert_at_cursor(ctx, app, id, Some(range), &p.markup());
+        }
+        AcPick::Mention(item) => {
+            let display = item.display();
+            let start = range.start;
+            insert_at_cursor(ctx, app, id, Some(range), &format!("{display} "));
+            let composer = &mut app.composer;
+            composer
+                .mentions
+                .add(&composer.text, start, &display, &item.wire());
+        }
+    }
     app.composer.ac_selected = 0;
+}
+
+/// Is the reply going to ping its author (`@ ON`)?
+fn reply_ping(c: &ComposerState) -> bool {
+    c.reply_no_ping.is_none() || c.reply_no_ping != c.reply_to
+}
+
+/// The `@ ON` / `@ OFF` toggle in the reply banner.
+fn reply_ping_button(ui: &mut Ui, t: &Theme, on: bool) -> egui::Response {
+    let (label, color, tip) = if on {
+        (
+            "@ ON",
+            t.accent,
+            "Click to disable pinging the original author.",
+        )
+    } else {
+        (
+            "@ OFF",
+            t.muted,
+            "Click to enable pinging the original author.",
+        )
+    };
+    ui.add(egui::Button::new(RichText::new(label).font(bold(12.5)).color(color)).frame(false))
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text(tip)
 }
 
 /// Insert `s` at the caret (or replace byte range `replace`), leaving the caret after it.
@@ -1350,7 +1565,31 @@ fn autocomplete_popup(
     ac: &Autocomplete,
     composer: Rect,
 ) -> Option<usize> {
-    let t = app.theme;
+    let (clicked, hover) = paint_autocomplete(
+        ctx,
+        app.theme,
+        &app.store,
+        &app.media,
+        ac,
+        composer,
+        app.composer.ac_selected,
+    );
+    if let Some(i) = hover {
+        app.composer.ac_selected = i;
+    }
+    clicked
+}
+
+/// Paint the popup; returns the (clicked, hovered) rows.
+fn paint_autocomplete(
+    ctx: &egui::Context,
+    t: &Theme,
+    store: &Store,
+    media: &RefCell<Media>,
+    ac: &Autocomplete,
+    composer: Rect,
+    selected: usize,
+) -> (Option<usize>, Option<usize>) {
     let h = 32.0 + ac.items.len() as f32 * AC_ROW_H + 8.0;
     let rect = Rect::from_min_size(
         Pos2::new(composer.left(), composer.top() - h - 6.0),
@@ -1358,8 +1597,6 @@ fn autocomplete_popup(
     );
     let mut clicked = None;
     let mut hover = None;
-    let selected = app.composer.ac_selected;
-    let app_ref: &NixApp = app;
     egui::Area::new(Id::unique("nixcord-emoji-autocomplete"))
         .order(egui::Order::Foreground)
         .fixed_pos(rect.min)
@@ -1376,11 +1613,11 @@ fn autocomplete_popup(
             p.text(
                 Pos2::new(r.left() + 16.0, r.top() + 18.0),
                 Align2::LEFT_CENTER,
-                format!("EMOJI MATCHING :{}", ac.query.to_uppercase()),
+                &ac.title,
                 bold(11.5),
                 t.muted,
             );
-            for (i, (pick, label)) in ac.items.iter().enumerate() {
+            for i in 0..ac.items.len() {
                 let row = Rect::from_min_size(
                     Pos2::new(r.left() + 8.0, r.top() + 32.0 + i as f32 * AC_ROW_H),
                     Vec2::new(r.width() - 16.0, AC_ROW_H),
@@ -1397,41 +1634,133 @@ fn autocomplete_popup(
                     Pos2::new(row.left() + 8.0 + 11.0, row.center().y),
                     Vec2::splat(22.0),
                 );
-                match pick {
-                    Picked::Unicode(s) => {
-                        emoji_text::paint_emoji_ui(ui, icon, s, &app_ref.media, t.text);
-                    }
-                    Picked::Custom { id, animated, .. } => {
-                        let tex = app_ref
-                            .media
-                            .borrow_mut()
-                            .emoji_texture(id.0, *animated, 22.0);
-                        if let Some(tex) = tex {
-                            ui.painter().image(
-                                tex,
-                                icon,
-                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                Color32::WHITE,
-                            );
+                let name_color = if i == selected { t.strong } else { t.text };
+                match &ac.items {
+                    AcItems::Emoji(items) => {
+                        let (pick, label) = &items[i];
+                        match pick {
+                            Picked::Unicode(s) => {
+                                emoji_text::paint_emoji_ui(ui, icon, s, media, t.text);
+                            }
+                            Picked::Custom { id, animated, .. } => {
+                                let tex = media.borrow_mut().emoji_texture(id.0, *animated, 22.0);
+                                if let Some(tex) = tex {
+                                    ui.painter().image(
+                                        tex,
+                                        icon,
+                                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                        Color32::WHITE,
+                                    );
+                                }
+                            }
                         }
+                        ui.painter().text(
+                            Pos2::new(icon.right() + 10.0, row.center().y),
+                            Align2::LEFT_CENTER,
+                            label,
+                            prop(15.0),
+                            name_color,
+                        );
+                    }
+                    AcItems::Mention(items) => {
+                        let row_ctx = MentionRow {
+                            t,
+                            store,
+                            media,
+                            guild: ac.guild,
+                            name_color,
+                        };
+                        row_ctx.paint(ui, row, icon, &items[i]);
                     }
                 }
-                ui.painter().text(
-                    Pos2::new(icon.right() + 10.0, row.center().y),
-                    Align2::LEFT_CENTER,
-                    label,
-                    prop(15.0),
-                    if i == selected { t.strong } else { t.text },
-                );
                 if resp.clicked() {
                     clicked = Some(i);
                 }
             }
         });
-    if let Some(i) = hover {
-        app.composer.ac_selected = i;
+    (clicked, hover)
+}
+
+/// What a `@` / `#` popup row needs to draw itself.
+struct MentionRow<'a> {
+    t: &'a Theme,
+    store: &'a Store,
+    media: &'a RefCell<Media>,
+    guild: Option<Snowflake>,
+    /// Text colour of the main label (brighter on the selected row).
+    name_color: Color32,
+}
+
+impl MentionRow<'_> {
+    /// User: avatar, name (role colour when known), username dimmed. Role: coloured dot
+    /// and name. `@everyone` / `@here`: what they do. Channel: its icon and name.
+    fn paint(&self, ui: &Ui, row: Rect, icon: Rect, item: &MentionItem) {
+        let t = self.t;
+        let p = ui.painter().with_clip_rect(row.intersect(ui.clip_rect()));
+        let text_x = icon.right() + 10.0;
+        let label = |text: &str, font: egui::FontId, color: Color32, x: f32| -> f32 {
+            let g = emoji_text::layout(&p, text, font, color, f32::INFINITY, 1);
+            let w = g.size().x;
+            g.paint(
+                &p,
+                Pos2::new(x, row.center().y - g.size().y / 2.0),
+                self.media,
+            );
+            x + w
+        };
+        match item {
+            MentionItem::User { id, name, username } => {
+                match self.store.user(*id) {
+                    Some(u) => {
+                        let member = self.guild.map(|g| (g, self.store.member_avatar(g, *id)));
+                        self.media
+                            .borrow_mut()
+                            .paint_avatar(ui, icon.center(), 24.0, u, member);
+                    }
+                    None => super::paint_default_avatar(ui, icon.center(), 24.0, *id),
+                }
+                let color =
+                    super::role_color(self.store, self.guild, *id).unwrap_or(self.name_color);
+                let end = label(name, prop(15.0), color, text_x);
+                label(username, prop(13.5), t.muted, end + 8.0);
+            }
+            MentionItem::Role { name, color, .. } => {
+                let dot = if *color == 0 {
+                    t.muted
+                } else {
+                    Color32::from_rgb((color >> 16) as u8, (color >> 8) as u8, *color as u8)
+                };
+                p.circle_filled(icon.center(), 6.0, dot);
+                label(&format!("@{name}"), prop(15.0), self.name_color, text_x);
+            }
+            MentionItem::Everyone | MentionItem::Here => {
+                p.text(
+                    icon.center(),
+                    Align2::CENTER_CENTER,
+                    "@",
+                    bold(17.0),
+                    t.muted,
+                );
+                let what = if *item == MentionItem::Everyone {
+                    "Notify everyone who has permission to view this channel."
+                } else {
+                    "Notify everyone online who has permission to view this channel."
+                };
+                let end = label(&item.display(), prop(15.0), self.name_color, text_x);
+                label(what, prop(13.0), t.muted, end + 10.0);
+            }
+            MentionItem::Channel { name, kind, .. } => {
+                let (glyph, font) = match kind {
+                    ChannelKind::Voice | ChannelKind::Other(13) => ("\u{1F50A}", prop(14.0)),
+                    ChannelKind::Announcement => ("\u{1F4E2}", prop(14.0)),
+                    ChannelKind::Forum => ("\u{1F4AC}", prop(14.0)),
+                    _ => ("#", prop(20.0)),
+                };
+                p.text(icon.center(), Align2::CENTER_CENTER, glyph, font, t.muted);
+                label(name, prop(15.0), self.name_color, text_x);
+            }
+        }
     }
-    clicked
 }
 
 /// `:shortcode:` -> unicode emoji; custom `:name:` -> `<:name:id>` when exactly one usable
@@ -1452,7 +1781,10 @@ fn convert_shortcodes(app: &NixApp, ch: Snowflake, content: &str) -> String {
 }
 
 fn submit(app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Action>) {
-    let content = convert_shortcodes(app, ch, app.composer.text.trim());
+    // Readable `@name` picks become `<@id>` etc. before anything else touches the text.
+    app.composer.mentions.sync(&app.composer.text);
+    let wired = app.composer.mentions.to_wire(&app.composer.text);
+    let content = convert_shortcodes(app, ch, wired.trim());
     if let Some(mid) = app.composer.editing.take() {
         if !content.is_empty() {
             actions.push(Action::Edit {
@@ -1462,20 +1794,25 @@ fn submit(app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Action>) {
             });
         }
         app.composer.text.clear();
+        app.composer.mentions.clear();
         return;
     }
     if content.is_empty() && app.composer.attachments.is_empty() {
         return;
     }
+    let ping_reply = reply_ping(&app.composer);
     let reply_to = app.composer.reply_to.take();
+    app.composer.reply_no_ping = None;
     let attachments = std::mem::take(&mut app.composer.attachments);
     app.composer.text.clear();
+    app.composer.mentions.clear();
     app.composer.last_typing = None;
     actions.push(Action::Send {
         channel: ch,
         content,
         reply_to,
         attachments,
+        ping_reply,
     });
 }
 
@@ -1724,5 +2061,180 @@ mod tests {
         let rgba = color_image_to_rgba8(&color_img);
         let png = encode_rgba_png(2, 1, &rgba).unwrap();
         assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    // ---- mention autocomplete (invented data) ----
+
+    const G: u64 = 500;
+    const TEXT: u64 = 510;
+    const DM: u64 = 520;
+
+    fn mk_user(id: u64, name: &str) -> nixcord_model::User {
+        nixcord_model::User {
+            id: Snowflake(id),
+            username: name.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Me (1) in server G as owner, with members 2 "ada" (nick "Captain", red role) and
+    /// 3 "bo"; channels of every kind; a DM with 4 "cy".
+    fn mention_store() -> Store {
+        use nixcord_model::{Channel, Guild, GuildMember, Ready, Role};
+        let chan = |id: u64, kind: ChannelKind, name: &str, pos: i32| Channel {
+            id: Snowflake(id),
+            kind,
+            guild_id: Some(Snowflake(G)),
+            name: Some(name.into()),
+            position: pos,
+            ..Default::default()
+        };
+        let member = |id: u64, name: &str, nick: Option<&str>, roles: Vec<Snowflake>| GuildMember {
+            user: Some(mk_user(id, name)),
+            nick: nick.map(Into::into),
+            roles,
+            ..Default::default()
+        };
+        let guild = Guild {
+            id: Snowflake(G),
+            name: "server".into(),
+            owner_id: Some(Snowflake(1)),
+            channels: vec![
+                chan(TEXT, ChannelKind::Text, "general", 0),
+                chan(511, ChannelKind::Category, "info", 1),
+                chan(512, ChannelKind::Announcement, "news", 2),
+                chan(513, ChannelKind::Forum, "ideas", 3),
+                chan(514, ChannelKind::Voice, "lounge", 4),
+            ],
+            roles: vec![
+                Role {
+                    id: Snowflake(G),
+                    name: "@everyone".into(),
+                    ..Default::default()
+                },
+                Role {
+                    id: Snowflake(70),
+                    name: "crew".into(),
+                    color: 0xE74C3C,
+                    position: 1,
+                    ..Default::default()
+                },
+            ],
+            members: vec![
+                member(1, "me", None, Vec::new()),
+                member(2, "ada", Some("Captain"), vec![Snowflake(70)]),
+                member(3, "bo", None, Vec::new()),
+            ],
+            ..Default::default()
+        };
+        let dm = Channel {
+            id: Snowflake(DM),
+            kind: ChannelKind::Dm,
+            recipients: vec![mk_user(4, "cy")],
+            ..Default::default()
+        };
+        let mut s = Store::new();
+        s.apply(&nixcord_model::GatewayEvent::Ready(Box::new(Ready {
+            user: mk_user(1, "me"),
+            guilds: vec![guild],
+            private_channels: vec![dm],
+            session_id: "s".into(),
+            ..Default::default()
+        })));
+        s
+    }
+
+    fn query(text: &str) -> Query<'_> {
+        mention_complete::mention_query(text).expect("a query")
+    }
+
+    #[test]
+    fn mention_items_in_a_server() {
+        let s = mention_store();
+        let got = mention_items(&s, Snowflake(TEXT), query("@"));
+        let shown: Vec<String> = got.iter().map(MentionItem::display).collect();
+        // Users, then the role (not the @everyone role), then @everyone / @here (owner).
+        assert_eq!(
+            shown,
+            vec!["@bo", "@ada", "@me", "@crew", "@everyone", "@here"]
+        );
+        let got = mention_items(&s, Snowflake(TEXT), query("@cap"));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].wire(), "<@2>");
+        let got = mention_items(&s, Snowflake(TEXT), query("@cr"));
+        assert_eq!(got[0].wire(), "<@&70>");
+        // Channels: no categories, sidebar order.
+        let got = mention_items(&s, Snowflake(TEXT), query("#"));
+        let shown: Vec<String> = got.iter().map(MentionItem::display).collect();
+        assert_eq!(shown, vec!["#general", "#news", "#ideas", "#lounge"]);
+        assert_eq!(
+            mention_items(&s, Snowflake(TEXT), query("#lo"))[0].wire(),
+            "<#514>"
+        );
+    }
+
+    #[test]
+    fn mention_items_in_a_dm() {
+        let s = mention_store();
+        let got = mention_items(&s, Snowflake(DM), query("@"));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].display(), "@cy");
+        assert!(mention_items(&s, Snowflake(DM), query("#")).is_empty());
+    }
+
+    #[test]
+    fn reply_ping_is_on_for_each_new_reply() {
+        let mut c = ComposerState {
+            reply_to: Some(Snowflake(1)),
+            ..ComposerState::default()
+        };
+        assert!(reply_ping(&c));
+        c.reply_no_ping = c.reply_to;
+        assert!(!reply_ping(&c));
+        // A different reply: ON again without anyone resetting the flag.
+        c.reply_to = Some(Snowflake(2));
+        assert!(reply_ping(&c));
+    }
+
+    #[test]
+    fn headless_mention_popup_renders_and_hovers() {
+        let ctx = egui::Context::default();
+        let theme = crate::theme::by_name(crate::theme::DEFAULT_THEME);
+        let store = mention_store();
+        let media = RefCell::new(Media::new(&ctx, true));
+        let mut items = mention_items(&store, Snowflake(TEXT), query("@"));
+        items.extend(mention_items(&store, Snowflake(TEXT), query("#")));
+        let n = items.len();
+        let ac = Autocomplete {
+            start: 0,
+            end: 1,
+            query: "@".into(),
+            title: mention_title(query("@")),
+            items: AcItems::Mention(items),
+            guild: Some(Snowflake(G)),
+        };
+        let composer = Rect::from_min_size(Pos2::new(0.0, 600.0), Vec2::new(500.0, 52.0));
+        let h = 32.0 + n as f32 * AC_ROW_H + 8.0;
+        // The middle of row 1 (rows start 32 px below the popup's top).
+        let row1 = Pos2::new(100.0, 600.0 - 6.0 - h + 32.0 + AC_ROW_H * 1.5);
+        let mut hovered = None;
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 800.0))),
+                events: vec![egui::Event::PointerMoved(row1)],
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| {
+                let (clicked, hover) =
+                    paint_autocomplete(ui.ctx(), theme, &store, &media, &ac, composer, 0);
+                assert!(clicked.is_none());
+                hovered = hover;
+            })
+            .textures_delta
+            .clear();
+        }
+        assert_eq!(hovered, Some(1));
+        assert_eq!(ac.title, "MEMBERS");
+        assert_eq!(mention_title(query("#ge")), "CHANNELS MATCHING #GE");
     }
 }

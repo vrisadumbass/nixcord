@@ -136,6 +136,11 @@ pub struct ComposerState {
     pub attach_rxs: Vec<AttachRx>,
     /// True while a native OS file picker dialog is currently open.
     pub attach_dialog_open: bool,
+    /// `@` / `#` autocomplete picks: readable `@name` in `text`, `<@id>` when sent.
+    pub mentions: crate::ui::mention_complete::MentionSpans,
+    /// The reply whose ping was turned off (`@ OFF`). Any other reply pings, so the
+    /// toggle is back ON for each new reply.
+    pub reply_no_ping: Option<Snowflake>,
 }
 
 pub type AttachRx = std::sync::mpsc::Receiver<(Vec<nixcord_http::UploadFile>, Vec<String>)>;
@@ -774,6 +779,7 @@ impl NixApp {
                 content,
                 reply_to,
                 attachments,
+                ping_reply,
             } => {
                 // Sending while scrolled back: return to the live end so the message shows.
                 if self.store.is_detached(channel) {
@@ -784,6 +790,7 @@ impl NixApp {
                     content,
                     reply_to,
                     attachments,
+                    ping_reply,
                 });
             }
             Action::React {

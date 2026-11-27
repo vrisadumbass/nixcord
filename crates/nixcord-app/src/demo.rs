@@ -784,6 +784,19 @@ fn reply_to(m: &mut Message, target: &Message) {
     m.referenced_message = Some(Box::new(quoted));
 }
 
+/// User ids of the `<@id>` / `<@!id>` mentions in a sent message (not roles `<@&id>`).
+fn demo_user_mentions(content: &str) -> Vec<Snowflake> {
+    content
+        .split("<@")
+        .skip(1)
+        .filter_map(|rest| {
+            let digits = rest.strip_prefix('!').unwrap_or(rest);
+            let id = &digits[..digits.find('>')?];
+            id.parse().ok().map(Snowflake)
+        })
+        .collect()
+}
+
 fn history_for(channel: Snowflake, people: &[User]) -> Vec<Message> {
     // Deterministic per channel: 120 messages spread over the last ~2 days, ending a
     // quarter of an hour ago (the showcase, if any, comes after).
@@ -1689,6 +1702,7 @@ pub async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx
                 content,
                 reply_to: reply_target,
                 attachments,
+                ping_reply,
             } => {
                 seq += 1;
                 let t = now_ms();
@@ -1713,8 +1727,17 @@ pub async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx
                         .and_then(|h| h.iter().find(|m| m.id == id))
                 }) {
                     reply_to(&mut mine, target);
-                    if target.author.id != mine.author.id {
+                    // `@ OFF` in the reply banner: the author is not pinged.
+                    if ping_reply && target.author.id != mine.author.id {
                         mine.mentions.push(target.author.clone());
+                    }
+                }
+                // `<@id>` from mention autocomplete, as Discord fills `mentions`.
+                for id in demo_user_mentions(&mine.content) {
+                    if let Some(u) = people.iter().find(|u| u.id == id) {
+                        if !mine.mentions.iter().any(|m| m.id == id) {
+                            mine.mentions.push(u.clone());
+                        }
                     }
                 }
                 histories.entry(channel).or_default().push(mine.clone());
@@ -2273,5 +2296,14 @@ mod tests {
     fn dm_history_has_no_members() {
         let h = history_for(Snowflake(1), &people());
         assert!(h.iter().all(|m| m.member.is_none() && m.guild_id.is_none()));
+    }
+
+    #[test]
+    fn sent_user_mentions_are_found() {
+        assert_eq!(
+            demo_user_mentions("hi <@1002> and <@!1003>, not <@&7> or <#5> or <@x>"),
+            vec![Snowflake(1002), Snowflake(1003)]
+        );
+        assert!(demo_user_mentions("plain @name").is_empty());
     }
 }
