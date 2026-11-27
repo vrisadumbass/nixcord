@@ -93,18 +93,26 @@ The gaps a user notices in the first hour.
       color emoji in the text box (custom editor widget, replaces `TextEdit`);
       reply-ping toggle, `@silent`, spoiler and alt text on attachments, upload progress
       and size-limit errors, slowmode countdown.
+      *Built*: `@user` / `@role` / `@everyone` / `#channel` autocomplete and the
+      reply-ping toggle. Not built: colour emoji in the box, `@silent`, spoiler and
+      alt text, upload progress, slowmode.
 - [ ] Message context menu: copy text / link / id, mark unread, pin, edit, delete,
       "who reacted" list, super-reaction display.
+      *Built* except super-reaction display.
 - [ ] Pins: pinned messages panel, pin/unpin, pin system messages.
+      *Built*: the panel and pin/unpin. Not built: pin system messages.
 - [ ] Forwarded messages (`message_snapshots`): render and send.
+      *Built*: rendering with a jump to the original. Not built: sending.
 - [ ] Polls: render, vote, results, create.
+      *Built*: render, vote, remove vote, live results. Not built: creating polls.
 - [ ] Voice messages: Ogg/Opus playback with waveform (decoder already in `nixcord-voice`).
 - [ ] Stickers: Lottie and APNG rendering (evaluate a pure-Rust Lottie renderer against
       the size budget; keep the name card as fallback).
 - [ ] Invite embeds, join-by-invite, message link previews, NSFW channel gate.
 - [ ] All system message types (joins, boosts, pins, thread created, call started, etc.).
 - [ ] Quick switcher (`Ctrl+K`), keyboard navigation (`Alt+Up/Down`, `Esc` to mark read),
-      a shortcuts cheat sheet.
+      a shortcuts cheat sheet. *Built* (`Ctrl+K`, `Alt+Up/Down`, `Alt+Shift+Up/Down`,
+      `Ctrl+Alt+Up/Down`, `Esc` / `Shift+Esc`, `Ctrl+/`).
 
 ## M2: Notifications, settings sync and account (v0.7)
 

@@ -21,6 +21,19 @@ Nothing in this release has been verified live yet.
 - Decoder resilience and fuzz tests for the gateway dispatch decoder.
 - This changelog and the roadmap.
 
+- M1 features, built and tested on invented data only: mention autocomplete for users, roles,
+  `@everyone` / `@here` and channels; reply ping toggle; right-click message menu with Pin / Unpin,
+  Mark Unread and Copy Message Link / ID; who-reacted list; polls with voting; forwarded messages;
+  quick switcher (`Ctrl+K`), keyboard navigation and a shortcuts sheet (`Ctrl+/`).
+- UI parity with the official client: floating user card, header Threads / notification / Pins
+  buttons, server tags, nameplates, DM intro, device menus on mute and deafen.
+
+### Fixed
+- `Esc` now cancels a reply or edit, dismisses autocomplete and closes the header search.
+- Mentions typed inside a reply now ping (replies send `allowed_mentions.parse`).
+- A category is listed when any of its channels is visible; store, directory and unknown channel
+  types are no longer listed.
+
 ### Changed
 - A rate limit longer than 5 s now fails the request at once with a "slow down" message
   instead of leaving it waiting.

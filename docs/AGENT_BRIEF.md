@@ -26,7 +26,10 @@ for everyone. Read [AGENTS.md](../AGENTS.md), [ARCHITECTURE.md](ARCHITECTURE.md)
 4. **Build with the shared target dir.** Set
    `CARGO_TARGET_DIR=C:\Users\nizam\Downloads\rustcord\target-test` for every cargo
    command. Other agents use it too, so cargo may wait on a lock: that is expected, just
-   wait. Never `cargo build` or `cargo run` the binary (they would overwrite a shared exe).
+   wait. Also set `__CARGO_DEFAULT_LIB_METADATA` to a value unique to you: worktrees have
+   the same crate paths, so without it agents overwrite each other's artifacts and you
+   see compile errors that are not yours. Never `cargo build` or `cargo run` the binary
+   (they would overwrite a shared exe).
    Use `cargo clippy` and `cargo test` only.
 5. **Stay in your files.** Your prompt lists what you own. In shared files (`app.rs`,
    `backend.rs`, `demo.rs`, `ui/mod.rs`, `ui/chat.rs`, `nixcord-model/src/lib.rs`,

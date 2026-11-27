@@ -50,6 +50,7 @@ Environment variables:
 | `NIXCORD_DEMO=1` / `--demo` | Demo mode, with no Discord network traffic |
 | `NIXCORD_DEMO_NET=1` | Demo may fetch Twemoji and public sample media |
 | `NIXCORD_DEMO_VIDEO=<path>` | Adds a local video file to the demo |
+| `NIXCORD_DEMO_OPEN=<channel id>` | Demo opens that channel at start (screenshots without input; 102 is the feature showcase) |
 | `NIXCORD_LOG=nixcord_gateway=debug,...` | Log filter; transport crates are always capped at `warn` |
 | `NIXCORD_LOG_FILE=<path>` | Write the log to a file (release builds have no console) |
 | `NIXCORD_CAPTURE=<dir>` | Append redacted gateway dispatches and REST response bodies to `<dir>/gateway.jsonl` / `rest.jsonl` (strings become placeholders, ids salted hashes; capped) |
@@ -101,6 +102,17 @@ then calls `request_repaint()`. The UI sends `Command`s to the backend. UI code 
   - Send (including multipart file uploads via picker, drag-and-drop, or `Ctrl+V` clipboard image paste), edit (Up arrow), delete, reply.
   - Reactions, typing indicators, unread & mention badges (channels, threads, forums, DMs, server rail,
     window title), right-click "Mark as Read" (channels, forums, threads, servers) and clickable in-app mention toasts.
+- **M1 (built, demo and unit tests only):**
+  - Composer `@user` / `@role` / `@everyone` / `#channel` autocomplete (readable `@name` in the box,
+    `<@id>` on the wire; candidates from recent authors, the member list, cached members and DM
+    recipients, no network) and the reply `@ ON` / `@ OFF` ping toggle.
+  - Right-click message menu (reply, edit, pin/unpin, mark unread, copy text/link/ID, delete) and a
+    "who reacted" panel (right-click a reaction pill).
+  - Polls (vote, remove vote, live results) and forwarded messages (rendering).
+  - Quick switcher (`Ctrl+K`; `#` `@` `*` `!` filters), `Alt+Up/Down` channel and `Ctrl+Alt+Up/Down`
+    server navigation, `Alt+Shift+Up/Down` unread channels, `Esc` / `Shift+Esc` mark read,
+    `Ctrl+/` shortcuts sheet.
+  - Header Threads / notification / Pins buttons, floating user card, server tags, nameplates.
 - **Rendering:**
   - Markdown with syntax-highlighted code, spoilers, color-emoji mention pills and timestamps.
   - Embeds (rich and link) and attachments.
@@ -165,6 +177,11 @@ demo mode only:
 - Everything built for roadmap M0: the role/member/ban/pins/recipient/relationship events,
   `USER_GUILD_SETTINGS_UPDATE` (full vs partial updates unknown), REST rate-limit buckets, and
   `NIXCORD_CAPTURE` output (read a capture before committing any of it as a fixture).
+- Everything in M1: `allowed_mentions` on replies, pin/unpin (`PUT/DELETE /channels/{c}/messages/pins/{m}`),
+  manual unread acks (`{"manual": true, "mention_count"}`) and their MESSAGE_ACK echo,
+  `GET …/reactions/{emoji}`, PIN_MESSAGES (1 << 51), poll votes (string vs integer `answer_ids`),
+  `MESSAGE_POLL_VOTE_*`, forwards, `GET /channels/{id}/pins`, channel mute, tag badge and nameplate URLs.
+  Roles' `mentionable` flag isn't decoded, so every role is offered; sticker replies always ping.
 - Live voice calls against real Discord voice servers (Op 4 signaling, Voice Gateway, UDP/AEAD RTP,
   and live audio capture/playback).
 
@@ -183,6 +200,9 @@ UI polish backlog:
 
 ## Working with agents on this repo
 
+- Parallel agents in git worktrees: see `docs/AGENT_BRIEF.md`. A shared `CARGO_TARGET_DIR` collides
+  between worktrees (same crate paths, so artifacts overwrite each other); give each agent its own
+  `__CARGO_DEFAULT_LIB_METADATA=<name>` to keep them apart.
 - Give each parallel agent its own files. Shared files (`app.rs`, `chat.rs`, `media.rs`,
   `demo.rs`, `model/lib.rs`) get small hunks only, re-read just before each edit.
 - Agents verifying UI should screenshot only their own window (match on process id or exe
