@@ -264,14 +264,16 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
         && !app.composer.attach_dialog_open;
     let show_send_btn = app.composer.editing.is_none() && !app.composer.attachments.is_empty();
 
+    // 52 px tall with a hairline border, like the official client.
     let frame = Frame::new()
         .fill(t.elevated)
+        .stroke(Stroke::new(1.0, t.divider))
         .corner_radius(corner)
         .inner_margin(Margin {
-            left: 12,
+            left: 10,
             right: 12,
-            top: 4,
-            bottom: 4,
+            top: 8,
+            bottom: 8,
         })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -284,8 +286,8 @@ pub fn show(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Acti
                 } else {
                     t.muted
                 };
-                ui.painter().circle_filled(r.center(), 11.0, c);
-                paint_plus(ui, r.center(), 10.0, t.elevated.to_opaque());
+                // A plain plus, no filled circle behind it.
+                paint_plus(ui, r.center(), 16.0, c);
                 let tip = if app.composer.editing.is_some() {
                     "Finish editing to attach files"
                 } else if app.composer.attachments.len() >= MAX_ATTACHMENTS {

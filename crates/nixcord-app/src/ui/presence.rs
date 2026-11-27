@@ -1070,6 +1070,23 @@ fn paint_gamepad(p: &egui::Painter, c: Pos2, color: Color32) {
     p.circle_filled(c + Vec2::new(3.0, 0.0), 1.1, hole);
 }
 
+/// The server tag of `user` as a widget in a horizontal layout (chat message headers).
+/// Draws nothing when the user has no tag.
+pub fn server_tag(ui: &mut Ui, app: &NixApp, user: &User, color: Color32) {
+    let Some((tag, guild, badge)) = user.server_tag() else {
+        return;
+    };
+    let badge = guild.zip(badge);
+    let text_w = ui
+        .painter()
+        .layout_no_wrap(tag.to_owned(), bold(10.5), color)
+        .size()
+        .x;
+    let w = text_w + 8.0 + if badge.is_some() { 14.0 } else { 0.0 };
+    let (r, _) = ui.allocate_exact_size(Vec2::new(w, 16.0), Sense::hover());
+    paint_server_tag(ui, app, r.left_center(), f32::INFINITY, tag, badge, color);
+}
+
 /// The server tag pill after a name: optional badge image and up to four characters.
 /// Skipped when it would not fit before `max_x`.
 fn paint_server_tag(

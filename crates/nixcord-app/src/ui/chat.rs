@@ -875,10 +875,12 @@ pub fn messages(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<
                 Row::Top => top_row(
                     &mut child,
                     app,
+                    ch,
                     &chan_name,
                     older_loading,
                     exhausted,
                     at_cap,
+                    actions,
                 ),
                 Row::Day { ms, .. } => day_divider(&mut child, app, ms),
                 Row::Msg { idx, head } => {
@@ -987,15 +989,83 @@ fn viewport_top(ui: &Ui) -> f32 {
     ui.clip_rect().top()
 }
 
+/// The start of a 1:1 conversation: the other person's avatar, names, the "beginning of
+/// your direct message history" line and friend actions, as in the official client.
+fn dm_intro(ui: &mut Ui, app: &NixApp, other: &nixcord_model::User, actions: &mut Vec<Action>) {
+    let t = app.theme;
+    let (r, _) = ui.allocate_exact_size(Vec2::splat(80.0), Sense::hover());
+    app.media
+        .borrow_mut()
+        .paint_avatar(ui, r.center(), 80.0, other, None);
+    ui.add_space(8.0);
+    emoji_text::label(ui, &app.media, other.display_name(), bold(30.0), t.strong);
+    emoji_text::label(ui, &app.media, &other.username, prop(22.0), t.strong);
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.label(
+            RichText::new("This is the beginning of your direct message history with ")
+                .font(prop(15.0))
+                .color(t.text),
+        );
+        emoji_text::label(ui, &app.media, other.display_name(), bold(15.0), t.strong);
+        ui.label(RichText::new(".").font(prop(15.0)).color(t.text));
+    });
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let kind = app.store.relationship_kind(other.id);
+        if kind == nixcord_model::RelationshipKind::Friend
+            && intro_button(ui, t, "Remove Friend").clicked()
+        {
+            actions.push(Action::RemoveRelationship(other.id));
+        }
+        if kind != nixcord_model::RelationshipKind::Blocked
+            && !other.bot
+            && intro_button(ui, t, "Block").clicked()
+        {
+            actions.push(Action::BlockUser(other.id));
+        }
+    });
+}
+
+/// A small outlined button under the DM intro.
+fn intro_button(ui: &mut Ui, t: &crate::theme::Theme, label: &str) -> egui::Response {
+    let g = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), bold(13.5), t.strong);
+    let (r, resp) = ui.allocate_exact_size(g.size() + Vec2::new(24.0, 14.0), Sense::click());
+    let fill = if resp.hovered() { t.hover } else { t.elevated };
+    ui.painter().rect_filled(r, CornerRadius::same(8), fill);
+    ui.painter().rect_stroke(
+        r,
+        CornerRadius::same(8),
+        Stroke::new(1.0, t.divider),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter()
+        .galley(r.center() - g.size() / 2.0, g, t.strong);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn top_row(
     ui: &mut Ui,
     app: &NixApp,
+    ch: Snowflake,
     chan: &str,
     loading: bool,
     exhausted: bool,
     at_cap: bool,
+    actions: &mut Vec<Action>,
 ) -> f32 {
     let t = app.theme;
+    let channel = app.store.channel(ch);
+    let me = app.store.me().map(|u| u.id);
+    let dm_other = channel
+        .filter(|c| c.kind == ChannelKind::Dm)
+        .and_then(|c| c.recipients.iter().find(|u| Some(u.id) != me));
+    let is_group = channel.is_some_and(|c| c.kind == ChannelKind::GroupDm);
     let start = ui.cursor().top();
     ui.add_space(16.0);
     ui.horizontal(|ui| {
@@ -1005,6 +1075,21 @@ fn top_row(
                 ui.horizontal(|ui| {
                     ui.add(egui::Spinner::new().color(t.muted));
                     ui.label(RichText::new("Loading older messages…").color(t.muted));
+                });
+            } else if let (true, Some(other)) = (exhausted, dm_other) {
+                dm_intro(ui, app, other, actions);
+            } else if exhausted && is_group {
+                emoji_text::label(ui, &app.media, chan, bold(30.0), t.strong);
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.label(
+                        RichText::new("Welcome to the beginning of the ")
+                            .font(prop(15.0))
+                            .color(t.text),
+                    );
+                    emoji_text::label(ui, &app.media, chan, bold(15.0), t.strong);
+                    ui.label(RichText::new(" group.").font(prop(15.0)).color(t.text));
                 });
             } else if exhausted {
                 let (r, _) = ui.allocate_exact_size(Vec2::splat(68.0), Sense::hover());
@@ -1156,6 +1241,8 @@ fn message_row(
                 let (r, _) = ui.allocate_exact_size(Vec2::new(30.0, 16.0), Sense::hover());
                 paint_app_badge(ui, r.left_center());
             }
+            // The author's server tag, as next to names in the member list.
+            super::presence::server_tag(ui, app, &m.author, t.text);
             ui.add_space(2.0);
             ui.label(
                 RichText::new(super::fmt_message_stamp(m.id.timestamp_ms(), h24))

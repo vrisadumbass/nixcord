@@ -71,7 +71,24 @@ pub fn buttons(
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(|ui| pins_panel(ui, app, ch, actions));
 
-    // ---- Notification settings ----
+    // ---- Notification settings (the official client has no bell in DMs) ----
+    if !is_dm {
+        notification_button(ui, app, ch);
+    }
+
+    // ---- Threads (guild text channels only) ----
+    if !is_dm && !is_thread {
+        let threads = icon_button(ui, t, Icon::Threads, 32.0, "Threads");
+        egui::Popup::menu(&threads)
+            .align(egui::RectAlign::BOTTOM_END)
+            .gap(6.0)
+            .width(340.0)
+            .show(|ui| threads_panel(ui, app, ch, can_create_thread, actions));
+    }
+}
+
+fn notification_button(ui: &mut Ui, app: &mut NixApp, ch: Snowflake) {
+    let t = app.theme;
     let muted = app.store.channel_muted(ch, now_unix());
     let bell = icon_button(
         ui,
@@ -98,16 +115,6 @@ pub fn buttons(
             channel: ch,
             muted: !muted,
         });
-    }
-
-    // ---- Threads (guild text channels only) ----
-    if !is_dm && !is_thread {
-        let threads = icon_button(ui, t, Icon::Threads, 32.0, "Threads");
-        egui::Popup::menu(&threads)
-            .align(egui::RectAlign::BOTTOM_END)
-            .gap(6.0)
-            .width(340.0)
-            .show(|ui| threads_panel(ui, app, ch, can_create_thread, actions));
     }
 }
 
