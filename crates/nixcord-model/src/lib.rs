@@ -63,11 +63,75 @@ pub struct User {
     pub avatar: Option<String>,
     #[serde(default)]
     pub bot: bool,
+    /// The server tag shown next to the name. Boxed: most users have none.
+    #[serde(default, deserialize_with = "lenient")]
+    pub primary_guild: Option<Box<PrimaryGuild>>,
+    /// Profile collectibles; only the nameplate is read.
+    #[serde(default, deserialize_with = "lenient")]
+    pub collectibles: Option<Box<Collectibles>>,
+}
+
+/// Decorative data: a shape surprise becomes `None` instead of failing the whole user
+/// (and with it the message or member that carries the user).
+fn lenient<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(v).ok())
+}
+
+/// `user.primary_guild`: the server whose tag the user displays.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PrimaryGuild {
+    #[serde(default)]
+    pub identity_guild_id: Option<Snowflake>,
+    /// `false` when the user turned the tag off.
+    #[serde(default)]
+    pub identity_enabled: Option<bool>,
+    /// Up to four characters.
+    #[serde(default)]
+    pub tag: Option<String>,
+    /// Badge image hash (`cdn::guild_tag_badge`).
+    #[serde(default)]
+    pub badge: Option<String>,
+}
+
+/// `user.collectibles`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Collectibles {
+    #[serde(default)]
+    pub nameplate: Option<Nameplate>,
+}
+
+/// A nameplate: the banner behind a member-list row.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Nameplate {
+    /// Asset path such as `nameplates/<collection>/<name>/` (`cdn::nameplate`).
+    #[serde(default)]
+    pub asset: String,
 }
 
 impl User {
     pub fn display_name(&self) -> &str {
         self.global_name.as_deref().unwrap_or(&self.username)
+    }
+
+    /// The server tag to show next to the name, with its guild id and badge hash.
+    pub fn server_tag(&self) -> Option<(&str, Option<Snowflake>, Option<&str>)> {
+        let p = self.primary_guild.as_deref()?;
+        if p.identity_enabled == Some(false) {
+            return None;
+        }
+        let tag = p.tag.as_deref().map(str::trim).filter(|t| !t.is_empty())?;
+        Some((tag, p.identity_guild_id, p.badge.as_deref()))
+    }
+
+    /// The nameplate asset path, if the user has one.
+    pub fn nameplate_asset(&self) -> Option<&str> {
+        let n = self.collectibles.as_deref()?.nameplate.as_ref()?;
+        (!n.asset.is_empty()).then_some(n.asset.as_str())
     }
 }
 
@@ -1523,6 +1587,27 @@ pub mod cdn {
         format!("{BASE}/guilds/{guild_id}/users/{user_id}/avatars/{hash}.webp?size={size}")
     }
 
+    /// Badge image of a server tag (`user.primary_guild.badge`).
+    pub fn guild_tag_badge(guild_id: Snowflake, hash: &str, size: u32) -> String {
+        format!("{BASE}/guild-tag-badges/{guild_id}/{hash}.png?size={size}")
+    }
+
+    /// Still image of a nameplate. `None` unless `asset` is a plain relative path
+    /// (lowercase letters, digits, `_`, `-`, `/`), so user data can't shape the URL.
+    pub fn nameplate(asset: &str) -> Option<String> {
+        let ok = !asset.is_empty()
+            && asset.len() <= 128
+            && !asset.starts_with('/')
+            && !asset.contains("//")
+            && asset.bytes().all(|b| {
+                b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-' | b'/')
+            });
+        ok.then(|| {
+            let sep = if asset.ends_with('/') { "" } else { "/" };
+            format!("{BASE}/assets/collectibles/{asset}{sep}static.png")
+        })
+    }
+
     pub fn emoji(id: Snowflake, animated: bool, size: u32) -> String {
         let ext = if animated { "gif" } else { "webp" };
         format!("{BASE}/emojis/{id}.{ext}?size={size}")
@@ -1705,5 +1790,53 @@ mod tests {
         .unwrap();
         assert_eq!(g.voice_states.len(), 1);
         assert_eq!(g.voice_states[0].user_id, Snowflake(42));
+    }
+}
+
+#[cfg(test)]
+mod user_decor_tests {
+    use super::*;
+
+    #[test]
+    fn server_tag_and_nameplate_decode_leniently() {
+        let u: User = serde_json::from_str(
+            r#"{"id":"1","username":"a",
+                "primary_guild":{"identity_guild_id":"9","identity_enabled":true,"tag":"NIX","badge":"abc"},
+                "collectibles":{"nameplate":{"asset":"nameplates/demo/plate/","label":"x"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            u.server_tag(),
+            Some(("NIX", Some(Snowflake(9)), Some("abc")))
+        );
+        assert_eq!(u.nameplate_asset(), Some("nameplates/demo/plate/"));
+
+        // Disabled, empty or odd shapes never fail the user.
+        for extra in [
+            r#""primary_guild":{"identity_enabled":false,"tag":"NIX"}"#,
+            r#""primary_guild":{"tag":"  "}"#,
+            r#""primary_guild":null,"collectibles":null"#,
+            r#""primary_guild":"weird","collectibles":[1,2]"#,
+            r#""collectibles":{"nameplate":null}"#,
+        ] {
+            let u: User =
+                serde_json::from_str(&format!(r#"{{"id":"1","username":"a",{extra}}}"#)).unwrap();
+            assert_eq!(u.server_tag(), None, "{extra}");
+            assert_eq!(u.nameplate_asset(), None, "{extra}");
+        }
+    }
+
+    #[test]
+    fn nameplate_url_rejects_odd_assets() {
+        assert_eq!(
+            cdn::nameplate("nameplates/demo/plate/").as_deref(),
+            Some("https://cdn.discordapp.com/assets/collectibles/nameplates/demo/plate/static.png")
+        );
+        assert!(cdn::nameplate("nameplates/demo/plate")
+            .unwrap()
+            .ends_with("plate/static.png"));
+        for bad in ["", "/abs", "a//b", "../x", "a?b=c", "A", "a b", "http://x"] {
+            assert_eq!(cdn::nameplate(bad), None, "{bad}");
+        }
     }
 }

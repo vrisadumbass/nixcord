@@ -12,6 +12,7 @@ fn user(id: u64) -> User {
         global_name: None,
         avatar: None,
         bot: false,
+        ..Default::default()
     }
 }
 
