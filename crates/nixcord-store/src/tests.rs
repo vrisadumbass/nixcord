@@ -2129,3 +2129,56 @@ fn thread_controls_follow_permissions() {
     assert!(s.can_manage_thread(sf(22)));
     assert!(s.can_archive_thread(sf(21), true));
 }
+
+#[test]
+fn category_with_a_visible_child_is_listed_even_when_not_viewable() {
+    let hidden_cat = Channel {
+        kind: ChannelKind::Category,
+        ..pchan(100, None, vec![deny_everyone_view()])
+    };
+    let channels = vec![
+        hidden_cat,
+        pchan(11, Some(100), vec![]),
+        // Types the official client never lists (14: directory, 6: store, unknown).
+        chan(31, ChannelKind::Other(14), Some(G), None, 0),
+        chan(32, ChannelKind::Other(6), Some(G), None, 1),
+        chan(33, ChannelKind::Other(99), Some(G), None, 2),
+        // Stage and media channels stay.
+        chan(34, ChannelKind::Other(13), Some(G), None, 3),
+        chan(35, ChannelKind::Other(16), Some(G), None, 4),
+    ];
+    let s = perm_store(&[], None, channels);
+    assert!(!s.can_view(sf(100)));
+    let ids: Vec<u64> = s
+        .visible_guild_channels(sf(G))
+        .iter()
+        .map(|c| c.id.0)
+        .collect();
+    assert_eq!(ids, vec![34, 35, 100, 11]);
+}
+
+#[test]
+fn forum_new_posts_counts_posts_after_the_forum_was_read() {
+    let mut g = guild(100, vec![chan(20, ChannelKind::Forum, Some(100), None, 1)]);
+    g.threads = vec![
+        thread(50, 100, 20, Some(100)),
+        thread(60, 100, 20, Some(100)),
+        thread(70, 100, 20, Some(100)),
+    ];
+    let mut s = Store::new();
+    s.apply(&GatewayEvent::Ready(Box::new(Ready {
+        user: user(1),
+        guilds: vec![g],
+        ..Default::default()
+    })));
+    // No read state for the forum yet: nothing is counted.
+    assert_eq!(s.forum_new_posts(sf(20)), 0);
+    s.apply(&GatewayEvent::MessageAck {
+        channel_id: sf(20),
+        message_id: sf(55),
+    });
+    assert_eq!(s.forum_new_posts(sf(20)), 2);
+    // Marking the forum read moves its marker past the newest post.
+    s.mark_read(sf(20));
+    assert_eq!(s.forum_new_posts(sf(20)), 0);
+}

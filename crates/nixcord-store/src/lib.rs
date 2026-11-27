@@ -661,6 +661,21 @@ impl Store {
             .map_or(0, |r| r.mention_count)
     }
 
+    /// Posts in a forum that were created after the forum itself was last read: the
+    /// number the official client shows as a grey pill on the forum's row. 0 when the
+    /// forum has no read state yet (every post would count otherwise).
+    pub fn forum_new_posts(&self, forum_id: Snowflake) -> u32 {
+        let Some(last_read) = self.last_read_message_id(forum_id) else {
+            return 0;
+        };
+        let n = self
+            .channel_threads(forum_id)
+            .into_iter()
+            .filter(|t| !t.is_archived() && t.id > last_read)
+            .count();
+        u32::try_from(n).unwrap_or(u32::MAX)
+    }
+
     /// Number of visible textual channels and active visible threads in `guild_id` that
     /// have unread messages.
     pub fn guild_unread_count(&self, guild_id: Snowflake) -> usize {
@@ -741,8 +756,19 @@ impl Store {
                 .filter(|c| c.parent_id == Some(channel_id))
                 .map(|c| c.id)
                 .collect();
+            // The forum's own read marker moves past its newest post, so the "new posts"
+            // count (`forum_new_posts`) clears even when `last_message_id` is stale.
+            let newest = child_ids.iter().copied().max();
             for tid in child_ids {
                 self.mark_single_channel_read(tid);
+            }
+            if let Some(newest) = newest {
+                if self
+                    .last_read_message_id(channel_id)
+                    .is_none_or(|r| r < newest)
+                {
+                    self.mark_read_to(channel_id, newest);
+                }
             }
         }
     }
@@ -1472,11 +1498,16 @@ impl Store {
     }
 
     /// `guild_channels` without what the official client hides: channels I can't view,
-    /// channels named `__hidden__`, and categories left with no visible children.
+    /// channels named `__hidden__`, channel types it never lists (store, directory and
+    /// unknown ones), and categories left with no visible children. A category with a
+    /// visible child is listed even when the category itself is not viewable, as in the
+    /// official client; otherwise its channels would appear under the category above.
     pub fn visible_guild_channels(&self, guild_id: Snowflake) -> Vec<&Channel> {
         let all = self.guild_channels(guild_id);
-        let shown =
-            |c: &Channel| c.name.as_deref() != Some(HIDDEN_CHANNEL_NAME) && self.can_view(c.id);
+        let named = |c: &Channel| c.name.as_deref() != Some(HIDDEN_CHANNEL_NAME);
+        // 13: stage, 16: media. Other unknown types are not channel-list rows.
+        let listed = |c: &Channel| !matches!(c.kind, ChannelKind::Other(n) if n != 13 && n != 16);
+        let shown = |c: &Channel| named(c) && listed(c) && self.can_view(c.id);
         let has_children: HashSet<Snowflake> = all
             .iter()
             .filter(|c| c.kind != ChannelKind::Category && shown(c))
@@ -1485,7 +1516,7 @@ impl Store {
         all.into_iter()
             .filter(|c| {
                 if c.kind == ChannelKind::Category {
-                    shown(c) && has_children.contains(&c.id)
+                    named(c) && has_children.contains(&c.id)
                 } else {
                     shown(c)
                 }
