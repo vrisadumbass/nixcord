@@ -281,7 +281,9 @@ fn allowlisted_enums_survive_only_under_their_key() {
     let r = Redactor::with_salt(13);
     let v = json!({
         "status": "dnd",
-        "client_status": {"desktop": "online"},
+        "client_status": {"desktop": "online", "mobile": "idle", "web": "dnd", "embedded": "x y"},
+        "groups": [{"id": "online", "count": 3}, {"id": "offline"}, {"id": "Online"}, {"id": "everyone"}],
+        "desktop_note": "online",
         "ops": [
             {"op": "SYNC", "range": [0, 99]},
             {"op": "INVALIDATE"},
@@ -306,5 +308,15 @@ fn allowlisted_enums_survive_only_under_their_key() {
     assert_eq!(out["content"], STR);
     assert_eq!(out["name"], STR);
     assert_eq!(out["op_note"], STR);
-    assert_eq!(out["client_status"]["desktop"], STR);
+    assert_eq!(out["desktop_note"], STR);
+    // Per-device statuses and member list group ids.
+    assert_eq!(out["client_status"]["desktop"], "online");
+    assert_eq!(out["client_status"]["mobile"], "idle");
+    assert_eq!(out["client_status"]["web"], "dnd");
+    assert_eq!(out["client_status"]["embedded"], STR);
+    assert_eq!(out["groups"][0]["id"], "online");
+    assert_eq!(out["groups"][1]["id"], "offline");
+    assert_eq!(out["groups"][2]["id"], STR);
+    assert_eq!(out["groups"][3]["id"], STR);
+    assert_eq!(out["groups"][0]["count"], 3);
 }

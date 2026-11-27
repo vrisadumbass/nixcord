@@ -440,6 +440,7 @@ fn redacted_samples_still_decode() {
                         assert_eq!(presence.status, Status::Idle, "{redacted}")
                     }
                     GatewayEvent::MemberListUpdate(u) => {
+                        assert_eq!(u.groups[0].id, "online", "{redacted}");
                         assert!(
                             matches!(u.ops.first(), Some(MemberListOp::Sync { .. })),
                             "{redacted}"

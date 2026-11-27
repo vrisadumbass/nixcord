@@ -5,9 +5,11 @@
 //! What is written (see [`Redactor`]):
 //! - every string value becomes `"<str>"` (or `"<empty>"`), so no token, name, message
 //!   text, URL, emoji or timestamp string survives. The one exception is a closed list
-//!   of enum values under two keys ([`ENUM_VALUES`]): `status` (`online`, `idle`, ...)
-//!   and `op` (member list `SYNC`, `INSERT`, ...). Only those exact values under those
-//!   exact keys are kept; anything else there is still `"<str>"`;
+//!   of enum values under a few keys ([`ENUM_VALUES`]): statuses under `status` and the
+//!   `client_status` platform keys (`desktop`, `mobile`, `web`, `embedded`), member list
+//!   `op`s (`SYNC`, `INSERT`, ...) and member list group `id`s `online` / `offline`.
+//!   Only those exact values under those exact keys are kept; anything else there is
+//!   still `"<str>"`;
 //! - every id is replaced by a salted hash that still looks like a snowflake: strings of
 //!   15-20 digits, integers of at least 10^15, and object keys that are ids (op 37-style
 //!   maps), except permission bitfields (`permissions`, `allow`, `deny`), which become
@@ -48,9 +50,18 @@ pub const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 /// Enum strings kept verbatim, by key. Closed lists of generic protocol words, so they
 /// can carry no personal data. Anything outside a list is still a placeholder.
 pub const ENUM_VALUES: &[(&str, &[&str])] = &[
-    ("status", &["online", "idle", "dnd", "offline", "invisible"]),
+    ("status", STATUSES),
+    // `client_status`: per-device status, keyed by platform.
+    ("desktop", STATUSES),
+    ("mobile", STATUSES),
+    ("web", STATUSES),
+    ("embedded", STATUSES),
     ("op", &["SYNC", "INSERT", "UPDATE", "DELETE", "INVALIDATE"]),
+    // Member list group ids (role groups are snowflakes and get hashed).
+    ("id", &["online", "offline"]),
 ];
+
+const STATUSES: &[&str] = &["online", "idle", "dnd", "offline", "invisible"];
 
 /// Is `value` an allowlisted enum value for `key`?
 fn allowed_enum(key: &str, value: &str) -> bool {
