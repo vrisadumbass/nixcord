@@ -744,6 +744,9 @@ pub struct MessageReference {
     pub channel_id: Option<Snowflake>,
     #[serde(default)]
     pub guild_id: Option<Snowflake>,
+    /// `0` reply / system reference, `1` forward ([`MESSAGE_REFERENCE_FORWARD`]).
+    #[serde(default, rename = "type", deserialize_with = "de_u8_or_zero")]
+    pub kind: u8,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -796,6 +799,20 @@ pub struct Message {
     /// True on matched messages inside Discord message search context groups.
     #[serde(default)]
     pub hit: bool,
+    /// A poll attached to the message. A malformed poll decodes to `None`.
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub poll: Option<Box<Poll>>,
+    /// Forwarded content (`message_reference.type == 1`); usually one snapshot.
+    #[serde(
+        default,
+        deserialize_with = "de_any_list",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub message_snapshots: Vec<MessageSnapshot>,
 }
 
 /// Nonce may come back as a string or a number.
@@ -825,6 +842,13 @@ pub struct MessageUpdate {
     pub mentions: Option<Vec<User>>,
     #[serde(default)]
     pub components: Option<Vec<components::Component>>,
+    /// Sent when a poll's results change wholesale (e.g. finalized at expiry).
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub poll: Option<Box<Poll>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1563,6 +1587,20 @@ pub enum GatewayEvent {
     /// USER_GUILD_SETTINGS_UPDATE: the full notification settings of one server (or of
     /// private channels), replacing the stored ones.
     UserGuildSettingsUpdate(Box<UserGuildSettings>),
+    /// MESSAGE_POLL_VOTE_ADD: `user_id` voted for `answer_id`.
+    PollVoteAdd {
+        channel_id: Snowflake,
+        message_id: Snowflake,
+        user_id: Snowflake,
+        answer_id: u32,
+    },
+    /// MESSAGE_POLL_VOTE_REMOVE: `user_id` took back their vote for `answer_id`.
+    PollVoteRemove {
+        channel_id: Snowflake,
+        message_id: Snowflake,
+        user_id: Snowflake,
+        answer_id: u32,
+    },
 }
 
 /// Discord CDN URL helpers. `size` should be a power of two (16..=4096).
@@ -1838,5 +1876,464 @@ mod user_decor_tests {
         for bad in ["", "/abs", "a//b", "../x", "a?b=c", "A", "a b", "http://x"] {
             assert_eq!(cdn::nameplate(bad), None, "{bad}");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Polls and forwarded messages
+// ---------------------------------------------------------------------------
+
+/// `message_reference.type` of a forward (official docs, "Message Reference Types":
+/// `0` DEFAULT for replies, `1` FORWARD).
+pub const MESSAGE_REFERENCE_FORWARD: u8 = 1;
+
+/// A number that should be a small integer; anything else becomes 0.
+fn de_u8_or_zero<'de, D: Deserializer<'de>>(d: D) -> Result<u8, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(v.as_u64().and_then(|n| u8::try_from(n).ok()).unwrap_or(0))
+}
+
+impl Message {
+    /// A forward: `message_reference.type == 1`. Its content lives in
+    /// `message_snapshots`, and it must not be drawn as a reply.
+    pub fn is_forward(&self) -> bool {
+        self.message_reference
+            .as_ref()
+            .is_some_and(|r| r.kind == MESSAGE_REFERENCE_FORWARD)
+    }
+
+    /// The message this one replies to, if it is a reply (never for a forward).
+    pub fn reply_target(&self) -> Option<&Message> {
+        self.referenced_message
+            .as_deref()
+            .filter(|_| !self.is_forward())
+    }
+}
+
+/// A poll, stored compactly: the results are folded into the answers.
+///
+/// Shape (official docs, "Poll" resource; Userdoccers "Poll Object" agrees):
+/// `{ question: { text }, answers: [{ answer_id, poll_media: { text?, emoji? } }],
+/// expiry: ?ISO8601, allow_multiselect, layout_type, results?: { is_finalized,
+/// answer_counts: [{ id, count, me_voted }] } }`. Absent `results` means "unknown":
+/// counts start at zero and [`Poll::has_results`] is false.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(from = "RawPoll", into = "RawPoll")]
+pub struct Poll {
+    pub question: String,
+    pub answers: Vec<PollAnswer>,
+    /// ISO 8601, as sent. `None`: no expiry.
+    pub expiry: Option<String>,
+    pub allow_multiselect: bool,
+    pub layout_type: u8,
+    /// `results.is_finalized`: votes are final (the poll ended).
+    pub finalized: bool,
+    /// Whether the payload carried `results` at all.
+    pub has_results: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PollAnswer {
+    pub id: u32,
+    pub text: String,
+    pub emoji: Option<Emoji>,
+    pub count: u32,
+    /// I voted for this answer.
+    pub me_voted: bool,
+}
+
+impl Poll {
+    /// Total votes over all answers. With multiselect one person can count more than once.
+    pub fn total_votes(&self) -> u32 {
+        self.answers
+            .iter()
+            .fold(0u32, |a, x| a.saturating_add(x.count))
+    }
+
+    /// I voted for at least one answer.
+    pub fn me_voted(&self) -> bool {
+        self.answers.iter().any(|a| a.me_voted)
+    }
+
+    /// Fold one MESSAGE_POLL_VOTE_ADD (`add`) or _REMOVE. `is_me`: the event is my own
+    /// vote, whose echo is ignored when `me_voted` already says so. Counts clamp at zero;
+    /// an unknown answer id is ignored.
+    pub fn apply_vote(&mut self, answer_id: u32, is_me: bool, add: bool) {
+        let Some(a) = self.answers.iter_mut().find(|a| a.id == answer_id) else {
+            return;
+        };
+        if is_me && a.me_voted == add {
+            return;
+        }
+        a.count = if add {
+            a.count.saturating_add(1)
+        } else {
+            a.count.saturating_sub(1)
+        };
+        if is_me {
+            a.me_voted = add;
+        }
+    }
+
+    /// Take a newer copy of this poll (MESSAGE_UPDATE). Without `results` the update
+    /// says nothing about counts, so they are kept. `me_voted` is kept too, since a
+    /// broadcast update may not be personalised.
+    pub fn merge_update(&mut self, new: &Poll) {
+        let old = std::mem::replace(self, new.clone());
+        if !new.has_results {
+            self.finalized = old.finalized;
+            self.has_results = old.has_results;
+        }
+        for a in &mut self.answers {
+            if let Some(o) = old.answers.iter().find(|o| o.id == a.id) {
+                if !new.has_results {
+                    a.count = o.count;
+                }
+                a.me_voted |= o.me_voted;
+            }
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct RawPollMedia {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    emoji: Option<Emoji>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawPollAnswer {
+    answer_id: u32,
+    #[serde(default)]
+    poll_media: RawPollMedia,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawAnswerCount {
+    id: u32,
+    #[serde(default)]
+    count: u32,
+    #[serde(default)]
+    me_voted: bool,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct RawPollResults {
+    #[serde(default)]
+    is_finalized: bool,
+    #[serde(default, deserialize_with = "de_lenient_vec")]
+    answer_counts: Vec<RawAnswerCount>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawPoll {
+    question: RawPollMedia,
+    answers: Vec<RawPollAnswer>,
+    #[serde(default)]
+    expiry: Option<String>,
+    #[serde(default)]
+    allow_multiselect: bool,
+    #[serde(default, deserialize_with = "de_u8_or_zero")]
+    layout_type: u8,
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    results: Option<RawPollResults>,
+}
+
+impl From<RawPoll> for Poll {
+    fn from(r: RawPoll) -> Self {
+        let counts = r.results.as_ref().map_or(&[][..], |x| &x.answer_counts[..]);
+        let answers =
+            r.answers
+                .into_iter()
+                .map(|a| {
+                    let c = counts.iter().find(|c| c.id == a.answer_id);
+                    let emoji = a.poll_media.emoji.filter(|e| {
+                        e.id.is_some() || e.name.as_deref().is_some_and(|n| !n.is_empty())
+                    });
+                    PollAnswer {
+                        id: a.answer_id,
+                        text: a.poll_media.text.unwrap_or_default(),
+                        emoji,
+                        count: c.map_or(0, |c| c.count),
+                        me_voted: c.is_some_and(|c| c.me_voted),
+                    }
+                })
+                .collect();
+        Poll {
+            question: r.question.text.unwrap_or_default(),
+            answers,
+            expiry: r.expiry,
+            allow_multiselect: r.allow_multiselect,
+            layout_type: r.layout_type,
+            finalized: r.results.as_ref().is_some_and(|x| x.is_finalized),
+            has_results: r.results.is_some(),
+        }
+    }
+}
+
+impl From<Poll> for RawPoll {
+    fn from(p: Poll) -> Self {
+        let results = p.has_results.then(|| RawPollResults {
+            is_finalized: p.finalized,
+            answer_counts: p
+                .answers
+                .iter()
+                .map(|a| RawAnswerCount {
+                    id: a.id,
+                    count: a.count,
+                    me_voted: a.me_voted,
+                })
+                .collect(),
+        });
+        RawPoll {
+            question: RawPollMedia {
+                text: Some(p.question),
+                emoji: None,
+            },
+            answers: p
+                .answers
+                .into_iter()
+                .map(|a| RawPollAnswer {
+                    answer_id: a.id,
+                    poll_media: RawPollMedia {
+                        text: Some(a.text),
+                        emoji: a.emoji,
+                    },
+                })
+                .collect(),
+            expiry: p.expiry,
+            allow_multiselect: p.allow_multiselect,
+            layout_type: p.layout_type,
+            results,
+        }
+    }
+}
+
+/// One `message_snapshots[]` entry (official docs, "Message Snapshot Object":
+/// `{ message: snapshot message }`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MessageSnapshot {
+    pub message: SnapshotMessage,
+}
+
+/// The forwarded message as it was when forwarded (official docs and Userdoccers,
+/// "Snapshot Message": `content, embeds, attachments, timestamp, edited_timestamp, flags,
+/// mentions, mention_roles, type, sticker_items?, components?`). Only what nixcord
+/// renders is kept (`components` are not stored); every list decodes entry by entry.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotMessage {
+    #[serde(default, deserialize_with = "de_string_or_empty")]
+    pub content: String,
+    #[serde(default, deserialize_with = "de_any_list")]
+    pub embeds: Vec<Embed>,
+    #[serde(default, deserialize_with = "de_any_list")]
+    pub attachments: Vec<Attachment>,
+    #[serde(default, deserialize_with = "de_string_or_empty")]
+    pub timestamp: String,
+    #[serde(default, deserialize_with = "lenient")]
+    pub edited_timestamp: Option<String>,
+    #[serde(default, deserialize_with = "de_lenient_u64")]
+    pub flags: u64,
+    #[serde(default, deserialize_with = "de_any_list")]
+    pub mentions: Vec<User>,
+    #[serde(default, deserialize_with = "de_any_list")]
+    pub sticker_items: Vec<StickerItem>,
+}
+
+fn de_string_or_empty<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) => s,
+        _ => String::new(),
+    })
+}
+
+/// Like `de_lenient_vec`, but a non-array (object, string, ...) is an empty list too.
+fn de_any_list<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Array(v) => v
+            .into_iter()
+            .filter_map(|x| serde_json::from_value(x).ok())
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
+fn de_lenient_u64<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    Ok(serde_json::Value::deserialize(d)?.as_u64().unwrap_or(0))
+}
+
+#[cfg(test)]
+mod poll_forward_tests {
+    use super::*;
+
+    const BASE: &str =
+        r#""id":"1","channel_id":"2","author":{"id":"3","username":"u"},"timestamp":"t""#;
+
+    fn msg(extra: &str) -> Message {
+        serde_json::from_str(&format!("{{{BASE},{extra}}}")).unwrap()
+    }
+
+    #[test]
+    fn poll_decodes_with_results() {
+        let m = msg(r#""poll":{"question":{"text":"Lunch?"},
+            "answers":[{"answer_id":1,"poll_media":{"text":"Soup","emoji":{"name":"🍲"}}},
+                       {"answer_id":2,"poll_media":{"text":"Salad","emoji":{"id":"77","name":"leaf"}}},
+                       {"answer_id":3,"poll_media":{"text":"Neither","emoji":{"id":null,"name":null}}}],
+            "expiry":"2030-01-01T00:00:00.000000+00:00","allow_multiselect":true,"layout_type":1,
+            "results":{"is_finalized":false,"answer_counts":[{"id":1,"count":3,"me_voted":true},{"id":2,"count":1,"me_voted":false}]},
+            "future":1}"#);
+        let p = m.poll.as_deref().unwrap();
+        assert_eq!(p.question, "Lunch?");
+        assert_eq!(p.answers.len(), 3);
+        assert_eq!(
+            p.answers[0].emoji.as_ref().unwrap().name.as_deref(),
+            Some("🍲")
+        );
+        assert_eq!(p.answers[1].emoji.as_ref().unwrap().id, Some(Snowflake(77)));
+        assert_eq!(p.answers[2].emoji, None, "empty emoji dropped");
+        assert_eq!((p.answers[0].count, p.answers[0].me_voted), (3, true));
+        assert_eq!((p.answers[2].count, p.answers[2].me_voted), (0, false));
+        assert!(p.allow_multiselect && p.has_results && !p.finalized);
+        assert_eq!(p.layout_type, 1);
+        assert_eq!(p.total_votes(), 4);
+        assert!(p.me_voted());
+        assert_eq!(
+            p.expiry.as_deref(),
+            Some("2030-01-01T00:00:00.000000+00:00")
+        );
+
+        // Serializes back to the Discord shape.
+        let back: Message = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back.poll, m.poll);
+    }
+
+    #[test]
+    fn poll_without_results_is_zero() {
+        let m = msg(
+            r#""poll":{"question":{"text":"Q"},"answers":[{"answer_id":1,"poll_media":{"text":"A"}}],"expiry":null}"#,
+        );
+        let p = m.poll.unwrap();
+        assert!(!p.has_results && !p.finalized && !p.allow_multiselect);
+        assert_eq!(p.total_votes(), 0);
+        assert_eq!(p.expiry, None);
+    }
+
+    #[test]
+    fn malformed_poll_is_none_and_keeps_the_message() {
+        for bad in [
+            r#""poll":"x""#,
+            r#""poll":{"question":5,"answers":[]}"#,
+            r#""poll":{"question":{"text":"Q"},"answers":"no"}"#,
+            r#""poll":{"question":{"text":"Q"},"answers":[{"poll_media":{}}]}"#,
+            r#""poll":[1,2]"#,
+        ] {
+            let m = msg(&format!(r#""content":"still here",{bad}"#));
+            assert!(m.poll.is_none(), "{bad}");
+            assert_eq!(m.content, "still here");
+        }
+        // Odd results or emoji only lose themselves.
+        let m = msg(
+            r#""poll":{"question":{"text":"Q"},"answers":[{"answer_id":1,"poll_media":{"text":"A","emoji":7}}],"results":"?"}"#,
+        );
+        let p = m.poll.unwrap();
+        assert!(!p.has_results);
+        assert_eq!(p.answers[0].emoji, None);
+    }
+
+    #[test]
+    fn votes_fold_and_clamp() {
+        let mut p: Poll = serde_json::from_str(
+            r#"{"question":{"text":"Q"},"answers":[{"answer_id":1,"poll_media":{"text":"A"}},{"answer_id":2,"poll_media":{"text":"B"}}],
+                "results":{"is_finalized":false,"answer_counts":[{"id":1,"count":1,"me_voted":false}]}}"#,
+        )
+        .unwrap();
+        p.apply_vote(1, true, true);
+        assert_eq!((p.answers[0].count, p.answers[0].me_voted), (2, true));
+        p.apply_vote(1, true, true); // echo of my own vote
+        assert_eq!(p.answers[0].count, 2);
+        p.apply_vote(2, false, false); // remove below zero
+        assert_eq!(p.answers[1].count, 0);
+        p.apply_vote(9, false, true); // unknown answer
+        assert_eq!(p.total_votes(), 2);
+        p.apply_vote(1, true, false);
+        assert_eq!((p.answers[0].count, p.answers[0].me_voted), (1, false));
+        p.apply_vote(1, true, false); // echo of my removal
+        assert_eq!(p.answers[0].count, 1);
+    }
+
+    #[test]
+    fn merge_update_keeps_counts_without_results() {
+        let mut p: Poll = serde_json::from_str(
+            r#"{"question":{"text":"Q"},"answers":[{"answer_id":1,"poll_media":{"text":"A"}}],
+                "results":{"answer_counts":[{"id":1,"count":4,"me_voted":true}]}}"#,
+        )
+        .unwrap();
+        let bare: Poll = serde_json::from_str(
+            r#"{"question":{"text":"Q2"},"answers":[{"answer_id":1,"poll_media":{"text":"A"}}]}"#,
+        )
+        .unwrap();
+        p.merge_update(&bare);
+        assert_eq!(p.question, "Q2");
+        assert_eq!((p.answers[0].count, p.answers[0].me_voted), (4, true));
+        let fin: Poll = serde_json::from_str(
+            r#"{"question":{"text":"Q2"},"answers":[{"answer_id":1,"poll_media":{"text":"A"}}],
+                "results":{"is_finalized":true,"answer_counts":[{"id":1,"count":5,"me_voted":false}]}}"#,
+        )
+        .unwrap();
+        p.merge_update(&fin);
+        assert!(p.finalized);
+        assert_eq!((p.answers[0].count, p.answers[0].me_voted), (5, true));
+    }
+
+    #[test]
+    fn snapshots_decode_and_forward_is_not_a_reply() {
+        let m = msg(
+            r#""message_reference":{"type":1,"message_id":"9","channel_id":"8","guild_id":"7"},
+            "referenced_message":{"id":"9","channel_id":"8","author":{"id":"4","username":"o"},"timestamp":"t"},
+            "message_snapshots":[{"message":{"content":"hi **there**","timestamp":"2024-01-01T00:00:00+00:00",
+              "edited_timestamp":null,"flags":0,"mentions":[{"id":"5","username":"m"},{"bad":1}],
+              "attachments":[{"id":"6","filename":"a.png","url":"https://x.invalid/a.png"},{"nope":true}],
+              "embeds":[{"type":"rich","title":"E"}],"sticker_items":[{"id":"11","name":"s","format_type":1}],
+              "components":[{"type":1}],"type":0}},
+              "junk"]"#,
+        );
+        assert!(m.is_forward());
+        assert!(m.reply_target().is_none());
+        assert_eq!(m.message_snapshots.len(), 1);
+        let s = &m.message_snapshots[0].message;
+        assert_eq!(s.content, "hi **there**");
+        assert_eq!(s.mentions.len(), 1);
+        assert_eq!(s.attachments.len(), 1);
+        assert_eq!(s.embeds.len(), 1);
+        assert_eq!(s.sticker_items.len(), 1);
+        let r = m.message_reference.as_ref().unwrap();
+        assert_eq!(
+            (r.message_id, r.channel_id),
+            (Some(Snowflake(9)), Some(Snowflake(8)))
+        );
+
+        let reply = msg(r#""message_reference":{"message_id":"9"},
+            "referenced_message":{"id":"9","channel_id":"8","author":{"id":"4","username":"o"},"timestamp":"t"}"#);
+        assert!(!reply.is_forward());
+        assert!(reply.reply_target().is_some());
+        let odd = msg(
+            r#""message_reference":{"type":"forward","message_id":"9"},"message_snapshots":{"x":1}"#,
+        );
+        assert!(!odd.is_forward());
+        assert!(odd.message_snapshots.is_empty());
     }
 }

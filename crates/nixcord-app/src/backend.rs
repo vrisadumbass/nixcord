@@ -292,6 +292,14 @@ pub enum Command {
     /// Stop the active voice session.
     DisconnectVoice,
     Logout,
+    /// Replace my votes on a poll (empty: remove). Not applied optimistically: the store
+    /// changes when MESSAGE_POLL_VOTE_ADD / _REMOVE arrive; the poll card shows the
+    /// buttons as pending until then.
+    PollVote {
+        channel: Snowflake,
+        message: Snowflake,
+        answer_ids: Vec<u32>,
+    },
 }
 
 /// Cloneable sender that wakes the UI after every event.
@@ -891,6 +899,23 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
                 e.user_message()
             ))),
         },
+        Command::PollVote {
+            channel,
+            message,
+            answer_ids,
+        } => {
+            if let Err(e) = http.poll_vote(channel, message, &answer_ids).await {
+                let what = if answer_ids.is_empty() {
+                    "remove vote"
+                } else {
+                    "vote"
+                };
+                events.send(AppEvent::Error(format!(
+                    "Couldn't {what}: {}",
+                    e.user_message()
+                )));
+            }
+        }
         Command::Login(_)
         | Command::Logout
         | Command::Gateway(_)

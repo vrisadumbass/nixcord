@@ -1190,6 +1190,15 @@ impl NixApp {
                 }
             }
             Action::Toast(msg) => self.toast(msg),
+            Action::PollVote {
+                channel,
+                message,
+                answer_ids,
+            } => self.send(Command::PollVote {
+                channel,
+                message,
+                answer_ids,
+            }),
         }
     }
 

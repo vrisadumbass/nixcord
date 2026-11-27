@@ -637,7 +637,7 @@ fn build_rows(msgs: &[Message], filter: &str) -> Vec<Row> {
         }
         let head = !filter.is_empty()
             || new_day
-            || m.referenced_message.is_some()
+            || m.reply_target().is_some()
             || prev.is_none_or(|p| {
                 p.author.id != m.author.id
                     || ms.saturating_sub(p.id.timestamp_ms()) > GROUP_WINDOW_MS
@@ -663,13 +663,14 @@ fn estimate(row: Row, msgs: &[Message], width: f32) -> f32 {
             }
             h += m.embeds.len() as f32 * 160.0;
             h += super::components::estimate(&m.components, w);
+            h += super::poll::estimate(m) + super::forward::estimate(m);
             if !m.reactions.is_empty() {
                 h += 32.0;
             }
             if head {
                 h += 22.0 + 16.0;
             }
-            if m.referenced_message.is_some() {
+            if m.reply_target().is_some() {
                 h += 22.0;
             }
             h
@@ -1185,7 +1186,7 @@ fn message_row(
     let mut y = outer.top() + top_pad;
 
     // Reply preview above the header.
-    if let Some(r) = m.referenced_message.as_deref() {
+    if let Some(r) = m.reply_target() {
         reply_preview(
             ui,
             app,
@@ -1259,6 +1260,8 @@ fn message_row(
     if !m.content.is_empty() {
         mentions_me = content(&mut child, app, m, actions);
     }
+    super::poll::show(&mut child, app, m, actions);
+    mentions_me |= super::forward::show(&mut child, app, m, actions);
     // Components V2 messages show attachments only where a component references them.
     let v2 = m.flags & nixcord_model::components::IS_COMPONENTS_V2 != 0;
     for a in m.attachments.iter().filter(|_| !v2) {
@@ -1482,7 +1485,7 @@ fn is_image(a: &Attachment) -> bool {
         .any(|ext| name.ends_with(ext))
 }
 
-fn attachment(ui: &mut Ui, app: &NixApp, a: &Attachment) {
+pub(super) fn attachment(ui: &mut Ui, app: &NixApp, a: &Attachment) {
     let t = app.theme;
     if is_image(a) {
         ui.add_space(2.0);
@@ -1553,7 +1556,7 @@ fn embed_media_url(m: &nixcord_model::EmbedMedia) -> &str {
 const STICKER_SIZE: f32 = 160.0;
 
 /// A sticker on a message: the image, or a "Sticker: name" card for Lottie stickers.
-fn sticker(ui: &mut Ui, app: &NixApp, s: &nixcord_model::StickerItem) {
+pub(super) fn sticker(ui: &mut Ui, app: &NixApp, s: &nixcord_model::StickerItem) {
     let t = app.theme;
     ui.add_space(2.0);
     match s.url(STICKER_SIZE as u32) {
@@ -1584,7 +1587,7 @@ fn sticker(ui: &mut Ui, app: &NixApp, s: &nixcord_model::StickerItem) {
 
 /// Discord-style embed card: colored left bar, provider, author, title, description,
 /// fields (inline ones up to three per row), thumbnail on the right, large image, footer.
-fn embed_card(
+pub(super) fn embed_card(
     ui: &mut Ui,
     app: &NixApp,
     m: &Message,

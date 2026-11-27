@@ -656,6 +656,34 @@ pub fn decode_dispatch(t: &str, d: &str) -> Result<Option<GatewayEvent>, JsonErr
                 emoji: e.emoji,
             }
         }
+        // MESSAGE_POLL_VOTE_ADD / _REMOVE: `{ user_id, channel_id, message_id, guild_id?,
+        // answer_id: integer }` (official docs, Gateway Events "Message Poll Vote Add";
+        // Userdoccers agrees). One event per answer, also for my own votes.
+        "MESSAGE_POLL_VOTE_ADD" | "MESSAGE_POLL_VOTE_REMOVE" => {
+            #[derive(Deserialize)]
+            struct Vote {
+                user_id: Snowflake,
+                channel_id: Snowflake,
+                message_id: Snowflake,
+                answer_id: u32,
+            }
+            let v: Vote = serde_json::from_str(d)?;
+            if t == "MESSAGE_POLL_VOTE_ADD" {
+                GatewayEvent::PollVoteAdd {
+                    channel_id: v.channel_id,
+                    message_id: v.message_id,
+                    user_id: v.user_id,
+                    answer_id: v.answer_id,
+                }
+            } else {
+                GatewayEvent::PollVoteRemove {
+                    channel_id: v.channel_id,
+                    message_id: v.message_id,
+                    user_id: v.user_id,
+                    answer_id: v.answer_id,
+                }
+            }
+        }
         // CHANNEL_PINS_UPDATE: `{ guild_id?, channel_id, last_pin_timestamp?: ?ISO8601 }`.
         // Userdoccers: not sent when a pinned message is deleted.
         "CHANNEL_PINS_UPDATE" => {
@@ -1763,6 +1791,51 @@ mod tests {
             })
         );
         assert!(decode_dispatch("MESSAGE_REACTION_ADD", r#"{"user_id":"9"}"#).is_err());
+    }
+
+    #[test]
+    fn decode_poll_votes_and_poll_messages() {
+        let d =
+            r#"{"user_id":"9","channel_id":"200","message_id":"300","guild_id":"1","answer_id":2}"#;
+        assert_eq!(
+            decode_dispatch("MESSAGE_POLL_VOTE_ADD", d).unwrap(),
+            Some(GatewayEvent::PollVoteAdd {
+                channel_id: Snowflake(200),
+                message_id: Snowflake(300),
+                user_id: Snowflake(9),
+                answer_id: 2,
+            })
+        );
+        let dm = r#"{"user_id":"9","channel_id":"200","message_id":"300","answer_id":1}"#;
+        assert_eq!(
+            decode_dispatch("MESSAGE_POLL_VOTE_REMOVE", dm).unwrap(),
+            Some(GatewayEvent::PollVoteRemove {
+                channel_id: Snowflake(200),
+                message_id: Snowflake(300),
+                user_id: Snowflake(9),
+                answer_id: 1,
+            })
+        );
+        assert!(decode_dispatch("MESSAGE_POLL_VOTE_ADD", r#"{"user_id":"9"}"#).is_err());
+
+        // A message with a broken poll still arrives, without the poll.
+        let m = r#"{"id":"300","channel_id":"200","author":{"id":"9","username":"a"},
+            "timestamp":"2024-01-01T00:00:00+00:00","content":"vote!","poll":{"question":7}}"#;
+        match decode_dispatch("MESSAGE_CREATE", m).unwrap() {
+            Some(GatewayEvent::MessageCreate(m)) => {
+                assert_eq!(m.content, "vote!");
+                assert!(m.poll.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+        // MESSAGE_UPDATE carries a poll (results finalized at expiry).
+        let u = r#"{"id":"300","channel_id":"200","poll":{"question":{"text":"Q"},
+            "answers":[{"answer_id":1,"poll_media":{"text":"A"}}],
+            "results":{"is_finalized":true,"answer_counts":[{"id":1,"count":2,"me_voted":false}]}}}"#;
+        match decode_dispatch("MESSAGE_UPDATE", u).unwrap() {
+            Some(GatewayEvent::MessageUpdate(u)) => assert!(u.poll.unwrap().finalized),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
