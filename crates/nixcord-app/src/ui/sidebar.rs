@@ -2419,6 +2419,10 @@ fn user_panel(ui: &mut Ui, app: &mut NixApp, card: Rect, actions: &mut Vec<Actio
         if icon_button(ui, t, Icon::Gear, 32.0, "User Settings").clicked() {
             actions.push(Action::OpenSettings);
         }
+        // Each of mute and deafen is a button plus a caret that picks the device, on a
+        // red backing while active. Right-to-left: caret first, then the button.
+        let deaf_bg = ui.painter().add(egui::Shape::Noop);
+        let deaf_caret = device_caret(ui, app, false, actions);
         let deaf = icon_button(
             ui,
             t,
@@ -2432,10 +2436,21 @@ fn user_panel(ui: &mut Ui, app: &mut NixApp, card: Rect, actions: &mut Vec<Actio
         );
         if app.view.deafened {
             strike(ui, deaf.rect, t.danger);
+            ui.painter().set(
+                deaf_bg,
+                egui::Shape::rect_filled(
+                    deaf.rect.union(deaf_caret),
+                    CornerRadius::same(6),
+                    t.danger.gamma_multiply(0.18),
+                ),
+            );
         }
         if deaf.clicked() {
             actions.push(Action::ToggleDeafen);
         }
+        ui.add_space(4.0);
+        let mic_bg = ui.painter().add(egui::Shape::Noop);
+        let mic_caret = device_caret(ui, app, true, actions);
         let mic = icon_button(
             ui,
             t,
@@ -2445,6 +2460,14 @@ fn user_panel(ui: &mut Ui, app: &mut NixApp, card: Rect, actions: &mut Vec<Actio
         );
         if app.view.mic_muted {
             strike(ui, mic.rect, t.danger);
+            ui.painter().set(
+                mic_bg,
+                egui::Shape::rect_filled(
+                    mic.rect.union(mic_caret),
+                    CornerRadius::same(6),
+                    t.danger.gamma_multiply(0.18),
+                ),
+            );
         }
         if mic.clicked() {
             actions.push(Action::ToggleMute);
@@ -2503,6 +2526,90 @@ fn user_panel_subtitle(custom_status: Option<&str>, status: nixcord_model::Statu
     custom_status
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| status.label())
+}
+
+/// The small caret next to mute (`input`) or deafen: a menu of audio devices. Returns
+/// the caret's rect.
+fn device_caret(ui: &mut Ui, app: &mut NixApp, input: bool, actions: &mut Vec<Action>) -> Rect {
+    let t = app.theme;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(16.0, 32.0), Sense::click());
+    let resp = resp.on_hover_text(if input {
+        "Input Device"
+    } else {
+        "Output Device"
+    });
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(4), t.hover);
+    }
+    let color = if resp.hovered() { t.strong } else { t.muted };
+    paint_chevron(ui, rect.center(), 7.0, true, color);
+    if resp.clicked() {
+        // The lists are cached; refresh them when the menu opens.
+        app.view.voice.refresh_devices();
+    }
+    let (devices, current) = if input {
+        (
+            app.view.voice.cached_input_devices.clone(),
+            app.view.voice.input_device.clone(),
+        )
+    } else {
+        (
+            app.view.voice.cached_output_devices.clone(),
+            app.view.voice.output_device.clone(),
+        )
+    };
+    egui::Popup::menu(&resp)
+        .align(egui::RectAlign::TOP_START)
+        .gap(8.0)
+        .width(280.0)
+        .show(|ui| {
+            ui.set_min_width(260.0);
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.label(
+                egui::RichText::new(if input {
+                    "Input Device"
+                } else {
+                    "Output Device"
+                })
+                .font(bold(12.0))
+                .color(t.muted),
+            );
+            let rows = std::iter::once((None, "Default".to_string()))
+                .chain(devices.iter().map(|d| (Some(d.clone()), d.clone())));
+            for (value, label) in rows {
+                let (r, row) =
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::click());
+                if row.hovered() {
+                    ui.painter().rect_filled(r, CornerRadius::same(4), t.hover);
+                }
+                let selected = value == current;
+                let p = ui.painter().with_clip_rect(r.shrink2(Vec2::new(8.0, 0.0)));
+                p.text(
+                    Pos2::new(r.left() + 8.0, r.center().y),
+                    Align2::LEFT_CENTER,
+                    &label,
+                    prop(13.5),
+                    if selected { t.strong } else { t.text },
+                );
+                if selected {
+                    ui.painter().circle_filled(
+                        Pos2::new(r.right() - 12.0, r.center().y),
+                        3.5,
+                        t.accent,
+                    );
+                }
+                if row.clicked() {
+                    actions.push(if input {
+                        Action::SetVoiceInputDevice(value)
+                    } else {
+                        Action::SetVoiceOutputDevice(value)
+                    });
+                    ui.close();
+                }
+            }
+        });
+    rect
 }
 
 fn strike(ui: &Ui, rect: Rect, color: Color32) {

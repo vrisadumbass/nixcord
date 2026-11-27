@@ -68,6 +68,15 @@ fn user(id: u64, username: &str, global: Option<&str>) -> User {
         global_name: global.map(Into::into),
         avatar: cast_avatar(id),
         bot: id == BOT,
+        // Two cast members wear an invented server tag.
+        primary_guild: matches!(id, 1002 | 1005).then(|| {
+            Box::new(nixcord_model::PrimaryGuild {
+                identity_enabled: Some(true),
+                tag: Some("HRTH".into()),
+                ..Default::default()
+            })
+        }),
+        ..Default::default()
     }
 }
 

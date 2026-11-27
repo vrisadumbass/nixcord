@@ -951,6 +951,32 @@ pub fn member_row(
     }
     let status = app.store.status(u.id);
     let dim = (dim || !status.is_online()) && !hovered;
+    let panel_bg = opaque_bg(t, t.sidebar);
+    // Nameplate: the user's banner across the row, faded out towards the avatar so the
+    // name stays readable. Only for rows drawn at full strength.
+    if !dim {
+        if let Some(url) = u.nameplate_asset().and_then(nixcord_model::cdn::nameplate) {
+            let ppp = ui.ctx().pixels_per_point();
+            let px = (
+                (rect.width() * ppp).ceil().max(1.0) as u32,
+                (rect.height() * ppp).ceil().max(1.0) as u32,
+            );
+            let tex = app.media.borrow_mut().texture(&url, px);
+            if let Some(tex) = tex {
+                crate::media::paint_texture(ui, rect, CornerRadius::same(4), tex, true);
+                let mid = rect.left() + rect.width() * 0.6;
+                let clear = Color32::TRANSPARENT;
+                let mut mesh = egui::Mesh::default();
+                mesh.colored_vertex(rect.left_top(), panel_bg);
+                mesh.colored_vertex(Pos2::new(mid, rect.top()), clear);
+                mesh.colored_vertex(Pos2::new(mid, rect.bottom()), clear);
+                mesh.colored_vertex(rect.left_bottom(), panel_bg);
+                mesh.add_triangle(0, 1, 2);
+                mesh.add_triangle(0, 2, 3);
+                ui.painter().add(egui::Shape::mesh(mesh));
+            }
+        }
+    }
     let c = Pos2::new(rect.left() + 8.0 + 16.0, rect.center().y);
     let member_avatar = guild.map(|g| (g, app.store.member_avatar(g, u.id)));
     app.media
@@ -982,10 +1008,18 @@ pub fn member_row(
         f32::INFINITY,
         0,
     );
-    let sub = app
-        .store
-        .status_text(u.id)
-        .map(|s| super::emoji_text::layout(&p, &s, prop(12.5), fade(t.muted), f32::INFINITY, 0));
+    // A game being played shows as a small controller and the game's name, like the
+    // official client, instead of "Playing <name>".
+    let status_text = app.store.status_text(u.id);
+    let (playing, sub_text) = match status_text.as_deref() {
+        Some(s) => match s.strip_prefix("Playing ") {
+            Some(game) if !game.is_empty() => (true, Some(game)),
+            _ => (false, Some(s)),
+        },
+        None => (false, None),
+    };
+    let sub = sub_text
+        .map(|s| super::emoji_text::layout(&p, s, prop(12.5), fade(t.muted), f32::INFINITY, 0));
     let name_w = name.size().x;
     let name_h = name.size().y;
     let top = match &sub {
@@ -994,10 +1028,28 @@ pub fn member_row(
     };
     name.paint(&p, Pos2::new(left, top), &app.media);
     if let Some(s) = sub {
-        s.paint(&p, Pos2::new(left, top + name_h), &app.media);
+        let mut x = left;
+        if playing {
+            let cy = top + name_h + s.size().y / 2.0;
+            paint_gamepad(&p, Pos2::new(left + 6.0, cy), fade(t.online));
+            x += 16.0;
+        }
+        s.paint(&p, Pos2::new(x, top + name_h), &app.media);
     }
+    let mut after_name = left + name_w + 5.0;
     if u.bot && left + name_w + 40.0 < rect.right() {
-        super::paint_app_badge(ui, Pos2::new(left + name_w + 5.0, top + name_h / 2.0));
+        after_name += super::paint_app_badge(ui, Pos2::new(after_name, top + name_h / 2.0)) + 4.0;
+    }
+    if let Some((tag, tag_guild, badge)) = u.server_tag() {
+        paint_server_tag(
+            ui,
+            app,
+            Pos2::new(after_name, top + name_h / 2.0),
+            rect.right() - 4.0,
+            tag,
+            tag_guild.zip(badge),
+            fade(t.text),
+        );
     }
     if resp.clicked() {
         actions.push(Action::OpenProfile {
@@ -1007,6 +1059,64 @@ pub fn member_row(
         });
     }
     resp.on_hover_cursor(CursorIcon::PointingHand);
+}
+
+/// A tiny game controller, 12 x 8 points, centered at `c`.
+fn paint_gamepad(p: &egui::Painter, c: Pos2, color: Color32) {
+    let body = Rect::from_center_size(c, Vec2::new(12.0, 7.0));
+    p.rect_filled(body, CornerRadius::same(3), color);
+    let hole = Color32::from_black_alpha(140);
+    p.circle_filled(c + Vec2::new(-3.0, 0.0), 1.1, hole);
+    p.circle_filled(c + Vec2::new(3.0, 0.0), 1.1, hole);
+}
+
+/// The server tag pill after a name: optional badge image and up to four characters.
+/// Skipped when it would not fit before `max_x`.
+fn paint_server_tag(
+    ui: &Ui,
+    app: &NixApp,
+    left_center: Pos2,
+    max_x: f32,
+    tag: &str,
+    badge: Option<(Snowflake, &str)>,
+    color: Color32,
+) {
+    let t = app.theme;
+    let g = ui
+        .painter()
+        .layout_no_wrap(tag.to_owned(), bold(10.5), color);
+    let badge_w = if badge.is_some() { 14.0 } else { 0.0 };
+    let w = g.size().x + 8.0 + badge_w;
+    if left_center.x + w > max_x {
+        return;
+    }
+    let pill = Rect::from_min_size(
+        Pos2::new(left_center.x, left_center.y - 8.0),
+        Vec2::new(w, 16.0),
+    );
+    ui.painter().rect_filled(
+        pill,
+        CornerRadius::same(4),
+        Color32::from_white_alpha(if t.dark { 22 } else { 0 }),
+    );
+    ui.painter().rect_stroke(
+        pill,
+        CornerRadius::same(4),
+        Stroke::new(1.0, t.divider),
+        egui::StrokeKind::Inside,
+    );
+    let mut x = pill.left() + 4.0;
+    if let Some((guild, hash)) = badge {
+        let r = Rect::from_min_size(Pos2::new(x, pill.center().y - 6.0), Vec2::splat(12.0));
+        let url = nixcord_model::cdn::guild_tag_badge(guild, hash, 32);
+        let tex = app.media.borrow_mut().texture(&url, (24, 24));
+        if let Some(tex) = tex {
+            crate::media::paint_texture(ui, r, CornerRadius::same(2), tex, true);
+        }
+        x += badge_w;
+    }
+    ui.painter()
+        .galley(Pos2::new(x, pill.center().y - g.size().y / 2.0), g, color);
 }
 
 #[cfg(test)]

@@ -567,6 +567,26 @@ impl Media {
         }
     }
 
+    /// A small decorative image (embed author icon, nameplate, tag badge) decoded into a
+    /// `px` box, for the caller to paint. `None` while loading or if it failed. In demo
+    /// mode it comes from `assets/demo` when the URL is mapped there, else it is generated.
+    pub fn texture(&mut self, url: &str, px: (u32, u32)) -> Option<Tex> {
+        self.begin_pass();
+        let got = if self.demo {
+            let seed = murl::fnv1a64(url.as_bytes());
+            let file = self.demo_url_file(url);
+            self.local_file(local_id(4, seed, px.0, px.1), file, px, move || {
+                demo::screenshot(seed, px.0, px.1)
+            })
+        } else {
+            self.net(Key::new(url, px.0, px.1))
+        };
+        match got {
+            Got::Ready(t) => Some(t),
+            _ => None,
+        }
+    }
+
     fn image_with(
         &mut self,
         ui: &mut Ui,

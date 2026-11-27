@@ -1678,12 +1678,12 @@ fn embed_text(
             if let Some(icon) = &a.icon_url {
                 // Round, like the official client.
                 let (r, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
-                let tex = app.media.borrow_mut().still(icon, (48, 48));
+                let tex = app.media.borrow_mut().texture(icon, (48, 48));
                 match tex {
-                    Ok(Some(tex)) => {
+                    Some(tex) => {
                         crate::media::paint_texture(ui, r, CornerRadius::same(12), tex, true);
                     }
-                    _ => {
+                    None => {
                         ui.painter().circle_filled(r.center(), 12.0, t.elevated);
                     }
                 }
