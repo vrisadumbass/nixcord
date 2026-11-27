@@ -191,24 +191,75 @@ fn role_delete_strips_permissions_color_and_member_roles() {
     });
 }
 
-#[test]
-fn member_add_caches_member_and_user() {
-    let mut s = store();
+fn join(s: &mut Store, guild: u64, id: u64) {
     s.apply(&GatewayEvent::GuildMemberAdd {
-        guild_id: sf(G),
+        guild_id: sf(guild),
         member: Box::new(GuildMember {
             nick: Some("newbie".into()),
-            ..member(30, &[6])
+            ..member(id, &[6])
         }),
     });
+}
+
+#[test]
+fn member_add_caches_member_and_user_in_the_focused_guild() {
+    let mut s = store();
+    s.set_member_list_focus(Some(sf(G)));
+    join(&mut s, G, 30);
     assert_eq!(s.member_nick(sf(G), sf(30)), Some("newbie"));
     assert_eq!(s.member_color(sf(G), sf(30)), Some(0x00FF00));
     assert!(s.user(sf(30)).is_some());
 }
 
 #[test]
+fn member_add_of_a_stranger_is_not_cached() {
+    let mut s = store();
+    // No member list is focused, then another guild's is: either way nothing would
+    // draw this joiner, so neither the member nor the user is kept.
+    for focus in [None, Some(sf(999))] {
+        s.set_member_list_focus(focus);
+        for id in 30..60 {
+            join(&mut s, G, id);
+            assert_eq!(s.member_nick(sf(G), sf(id)), None);
+            assert_eq!(s.member_color(sf(G), sf(id)), None);
+            assert!(s.user(sf(id)).is_none());
+        }
+    }
+    assert_eq!(s.members.len(), 2, "only the READY members (me and 9)");
+    // A member without a user id is ignored, not a panic.
+    s.set_member_list_focus(Some(sf(G)));
+    s.apply(&GatewayEvent::GuildMemberAdd {
+        guild_id: sf(G),
+        member: Box::new(GuildMember::default()),
+    });
+    assert_eq!(s.members.len(), 2);
+}
+
+#[test]
+fn member_add_of_a_known_user_is_cached_without_focus() {
+    let mut s = store();
+    // 40: a friend whose relationship came without a user object. 41: seen in chat.
+    s.apply(&GatewayEvent::RelationshipAdd(Box::new(Relationship {
+        id: sf(40),
+        kind: RelationshipKind::Friend,
+        ..Default::default()
+    })));
+    s.apply(&GatewayEvent::MessageCreate(Box::new(Message {
+        author: user(41),
+        ..msg(103, TEXT)
+    })));
+    // 9: a group DM recipient. ME: joining guild 2 ourselves.
+    for (guild, id) in [(G, 40), (G, 41), (2, 9), (2, ME)] {
+        join(&mut s, guild, id);
+        assert_eq!(s.member_nick(sf(guild), sf(id)), Some("newbie"), "{id}");
+        assert!(s.user(sf(id)).is_some());
+    }
+}
+
+#[test]
 fn member_remove_and_ban_drop_member_and_guild_presence() {
     let mut s = store();
+    s.set_member_list_focus(Some(sf(G)));
     for id in [30, 31] {
         s.apply(&GatewayEvent::GuildMemberAdd {
             guild_id: sf(G),
@@ -224,6 +275,7 @@ fn member_remove_and_ban_drop_member_and_guild_presence() {
             user: None,
         });
         assert_eq!(s.status(sf(id)), Status::Online);
+        assert_eq!(s.member_color(sf(G), sf(id)), Some(0x00FF00));
     }
     s.apply(&GatewayEvent::GuildMemberRemove {
         guild_id: sf(G),

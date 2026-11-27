@@ -1259,6 +1259,75 @@ pub struct Ready {
     /// `user_settings.custom_status.expires_at` (ISO 8601), when the custom status expires.
     #[serde(default)]
     pub custom_status_expires_at: Option<String>,
+    /// Per-server (and private-channel) notification settings, `user_guild_settings`.
+    #[serde(default)]
+    pub user_guild_settings: Vec<UserGuildSettings>,
+}
+
+/// Message notification level of a server or a channel override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(from = "u8", into = "u8")]
+pub enum NotificationLevel {
+    AllMessages,
+    OnlyMentions,
+    Nothing,
+    /// A channel override defers to the server setting; a server setting defers to the
+    /// server's own default. Also used for absent or unknown values.
+    #[default]
+    Inherit,
+}
+
+impl From<u8> for NotificationLevel {
+    fn from(n: u8) -> Self {
+        match n {
+            0 => Self::AllMessages,
+            1 => Self::OnlyMentions,
+            2 => Self::Nothing,
+            _ => Self::Inherit,
+        }
+    }
+}
+impl From<NotificationLevel> for u8 {
+    fn from(l: NotificationLevel) -> u8 {
+        l as u8
+    }
+}
+
+/// The kept part of a user guild settings object (READY `user_guild_settings`,
+/// USER_GUILD_SETTINGS_UPDATE). This is nixcord's compact form, built by the gateway
+/// decoder; it is not Discord's wire shape.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserGuildSettings {
+    /// `None`: the settings for private channels (DMs and group DMs).
+    #[serde(default)]
+    pub guild_id: Option<Snowflake>,
+    #[serde(default)]
+    pub muted: bool,
+    /// `mute_config.end_time` in Unix seconds. `None` while `muted`: until unmuted.
+    #[serde(default)]
+    pub mute_end: Option<i64>,
+    #[serde(default)]
+    pub message_notifications: NotificationLevel,
+    #[serde(default)]
+    pub suppress_everyone: bool,
+    #[serde(default)]
+    pub suppress_roles: bool,
+    /// Only overrides that mute or set a level; others are dropped when decoding.
+    #[serde(default)]
+    pub channel_overrides: Vec<ChannelOverride>,
+}
+
+/// One entry of `channel_overrides` in [`UserGuildSettings`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelOverride {
+    pub channel_id: Snowflake,
+    #[serde(default)]
+    pub muted: bool,
+    /// As [`UserGuildSettings::mute_end`].
+    #[serde(default)]
+    pub mute_end: Option<i64>,
+    #[serde(default)]
+    pub message_notifications: NotificationLevel,
 }
 
 /// High-level events the gateway crate hands to the app.
@@ -1374,6 +1443,8 @@ pub enum GatewayEvent {
         guild_id: Snowflake,
         role_id: Snowflake,
     },
+    /// GUILD_MEMBER_ADD. The store caches the member only when it is useful (the focused
+    /// member-list guild, or a user it already knows); other joiners are ignored.
     GuildMemberAdd {
         guild_id: Snowflake,
         member: Box<GuildMember>,
@@ -1425,6 +1496,9 @@ pub enum GatewayEvent {
         kind: Option<RelationshipKind>,
         nickname: Option<Option<String>>,
     },
+    /// USER_GUILD_SETTINGS_UPDATE: the full notification settings of one server (or of
+    /// private channels), replacing the stored ones.
+    UserGuildSettingsUpdate(Box<UserGuildSettings>),
 }
 
 /// Discord CDN URL helpers. `size` should be a power of two (16..=4096).

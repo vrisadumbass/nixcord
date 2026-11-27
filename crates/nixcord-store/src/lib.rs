@@ -15,9 +15,10 @@
 //! [`Store::guild_channels`] instead.
 
 use nixcord_model::{
-    permissions as perm, Channel, ChannelKind, CustomStatus, Emoji, GatewayEvent, Guild,
-    GuildFolder, GuildMember, Message, MessageUpdate, OverwriteKind, PartialMember, Presence,
-    Reaction, Relationship, RelationshipKind, Role, Snowflake, Status, User, VoiceState,
+    permissions as perm, Channel, ChannelKind, ChannelOverride, CustomStatus, Emoji, GatewayEvent,
+    Guild, GuildFolder, GuildMember, Message, MessageUpdate, NotificationLevel, OverwriteKind,
+    PartialMember, Presence, Reaction, Relationship, RelationshipKind, Role, Snowflake, Status,
+    User, UserGuildSettings, VoiceState,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -159,6 +160,9 @@ pub struct Store {
     /// Member list of the focused guild only (see `set_member_list_focus`).
     member_list: Option<(Snowflake, MemberList)>,
     list_focus: Option<Snowflake>,
+    /// Notification settings by server (`None`: private channels). Settings that say
+    /// nothing (not muted, inherit, no overrides) are not stored.
+    guild_settings: HashMap<Option<Snowflake>, UserGuildSettings>,
     /// Incremented on every READY (new session). Lets the app re-subscribe.
     epoch: u64,
 }
@@ -214,6 +218,9 @@ impl Store {
                 }
                 for r in &ready.relationships {
                     self.relationship_add(r);
+                }
+                for settings in &ready.user_guild_settings {
+                    self.set_guild_settings(settings);
                 }
                 self.apply_presence_batch("READY", &ready.presences);
                 self.my_status = ready.status.unwrap_or(Status::Online);
@@ -403,8 +410,20 @@ impl Store {
                     }
                 }
             }
+            // Joins arrive for every member of a subscribed guild, most of whom are never
+            // drawn, and the member and user caches have no cap. Keep a joiner only when
+            // something can show them: the focused member list's guild, or a user the
+            // store already holds (cached user, relationship, DM recipient, me). Anyone
+            // else comes with their member data again in messages and member-list ops.
             GatewayEvent::GuildMemberAdd { guild_id, member } => {
-                self.cache_guild_member(*guild_id, member);
+                let wanted = member.id().is_some_and(|id| {
+                    self.list_focus == Some(*guild_id)
+                        || self.users.contains_key(&id)
+                        || self.presence_pinned(id)
+                });
+                if wanted {
+                    self.cache_guild_member(*guild_id, member);
+                }
             }
             GatewayEvent::GuildMemberRemove {
                 guild_id, user_id, ..
@@ -486,6 +505,21 @@ impl Store {
                     r.nickname.clone_from(n);
                 }
             }
+            GatewayEvent::UserGuildSettingsUpdate(settings) => self.set_guild_settings(settings),
+        }
+    }
+
+    /// Replace the notification settings of one scope; blank ones are dropped.
+    fn set_guild_settings(&mut self, settings: &UserGuildSettings) {
+        let blank = UserGuildSettings {
+            guild_id: settings.guild_id,
+            ..Default::default()
+        };
+        if *settings == blank {
+            self.guild_settings.remove(&settings.guild_id);
+        } else {
+            self.guild_settings
+                .insert(settings.guild_id, settings.clone());
         }
     }
 
@@ -1162,6 +1196,90 @@ impl Store {
             .collect();
         out.sort_by_cached_key(|u| (u.display_name().to_lowercase(), u.id));
         out
+    }
+
+    // ---- notification settings ----
+    //
+    // `guild: None` is the private-channel (DM / group DM) scope. Times are Unix seconds,
+    // passed in so nothing here reads a clock. Unread and mention counts do not consult
+    // these yet.
+
+    /// Is the server (or the private-channel scope) muted at `now_unix`? A mute whose
+    /// end time has passed no longer counts.
+    pub fn guild_muted(&self, guild: Option<Snowflake>, now_unix: i64) -> bool {
+        self.guild_settings
+            .get(&guild)
+            .is_some_and(|s| mute_active(s.muted, s.mute_end, now_unix))
+    }
+
+    /// Is the channel muted at `now_unix`, by its own override or by one on a parent (a
+    /// thread's channel, a channel's category)? The server-wide mute is separate: see
+    /// [`Store::guild_muted`].
+    pub fn channel_muted(&self, channel: Snowflake, now_unix: i64) -> bool {
+        self.find_override(channel, |o| {
+            mute_active(o.muted, o.mute_end, now_unix).then_some(())
+        })
+        .is_some()
+    }
+
+    /// Are @everyone / @here mentions suppressed in this scope?
+    pub fn suppress_everyone(&self, guild: Option<Snowflake>) -> bool {
+        self.guild_settings
+            .get(&guild)
+            .is_some_and(|s| s.suppress_everyone)
+    }
+
+    /// Are role mentions suppressed in this scope?
+    pub fn suppress_roles(&self, guild: Option<Snowflake>) -> bool {
+        self.guild_settings
+            .get(&guild)
+            .is_some_and(|s| s.suppress_roles)
+    }
+
+    /// The notification level in force for a channel: the first override that sets one
+    /// (the channel's own, then its parents'), else the server's setting. `Inherit` is
+    /// returned only when the server's setting defers too, meaning the server's own
+    /// default applies (not carried by `Guild` yet), or when the channel is unknown.
+    /// Private channels without a setting notify for all messages.
+    pub fn notification_level(&self, channel: Snowflake) -> NotificationLevel {
+        let Some(ch) = self.channels.get(&channel) else {
+            return NotificationLevel::Inherit;
+        };
+        let set = |l: NotificationLevel| (l != NotificationLevel::Inherit).then_some(l);
+        self.find_override(channel, |o| set(o.message_notifications))
+            .or_else(|| {
+                let settings = self.guild_settings.get(&ch.guild_id)?;
+                set(settings.message_notifications)
+            })
+            .unwrap_or(if ch.guild_id.is_none() {
+                NotificationLevel::AllMessages
+            } else {
+                NotificationLevel::Inherit
+            })
+    }
+
+    /// First hit of `pick` over the channel's own override, then its parent's and its
+    /// parent's parent's (thread -> channel -> category).
+    fn find_override<T>(
+        &self,
+        channel: Snowflake,
+        pick: impl Fn(&ChannelOverride) -> Option<T>,
+    ) -> Option<T> {
+        let guild = self.channels.get(&channel)?.guild_id;
+        let overrides = &self.guild_settings.get(&guild)?.channel_overrides;
+        let mut next = Some(channel);
+        for _ in 0..3 {
+            let id = next?;
+            let hit = overrides
+                .iter()
+                .find(|o| o.channel_id == id)
+                .and_then(&pick);
+            if hit.is_some() {
+                return hit;
+            }
+            next = self.channels.get(&id).and_then(|c| c.parent_id);
+        }
+        None
     }
 
     // ---- member list ----
@@ -1889,6 +2007,7 @@ impl Store {
         self.guilds.remove(&id);
         self.guild_order.retain(|g| *g != id);
         self.members.retain(|&(g, _), _| g != id);
+        self.guild_settings.remove(&Some(id));
         self.voice_states.retain(|_, vs| vs.guild_id != Some(id));
         // Per-guild presence copies of a guild we left would never be updated again.
         // Overall (friend) presences and other guilds' copies stay.
@@ -2186,6 +2305,11 @@ fn cap(list: &mut Vec<Message>) {
     }
 }
 
+/// A mute counts while set and not past its end time (`None`: until unmuted).
+fn mute_active(muted: bool, end: Option<i64>, now_unix: i64) -> bool {
+    muted && end.is_none_or(|end| now_unix < end)
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -2194,6 +2318,9 @@ mod presence_tests;
 
 #[cfg(test)]
 mod event_tests;
+
+#[cfg(test)]
+mod settings_tests;
 
 #[cfg(test)]
 mod voice_tests {

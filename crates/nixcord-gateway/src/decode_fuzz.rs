@@ -52,7 +52,12 @@ fn samples() -> Vec<(&'static str, String)> {
             "users":[{{"id":"11","username":"other"}}],"relationships":[{{"id":"11","type":1}}],
             "read_state":{{"entries":[{{"id":"20","last_message_id":"100","mention_count":1}}]}},
             "merged_members":[[{{"user_id":"10","roles":[]}}]],
-            "user_settings":{{"status":"online"}}}}"#
+            "user_settings":{{"status":"online"}},
+            "user_guild_settings":{{"entries":[{{"guild_id":"1","muted":true,
+              "mute_config":{{"end_time":"2026-01-02T03:04:05+00:00","selected_time_window":3600}},
+              "message_notifications":1,"suppress_everyone":true,
+              "channel_overrides":{{"20":{{"muted":true,"message_notifications":2}}}}}}],
+              "partial":false,"version":1}}}}"#
     );
     let member_list = format!(
         r#"{{"id":"everyone","guild_id":"1","member_count":1,"online_count":1,
@@ -208,6 +213,12 @@ fn samples() -> Vec<(&'static str, String)> {
         (
             "RELATIONSHIP_UPDATE",
             o(r#"{"id":"11","type":1,"nickname":null}"#),
+        ),
+        (
+            "USER_GUILD_SETTINGS_UPDATE",
+            o(
+                r#"{"guild_id":"1","muted":true,"mute_config":{"end_time":"2026-01-02T03:04:05+00:00","selected_time_window":3600},"message_notifications":1,"suppress_roles":true,"version":2,"channel_overrides":[{"channel_id":"20","muted":true,"mute_config":null,"message_notifications":3,"collapsed":false}]}"#,
+            ),
         ),
     ]
 }

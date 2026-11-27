@@ -4,10 +4,11 @@
 use std::collections::HashMap;
 
 use nixcord_model::{
-    Activity, Channel, ClientStatus, CustomStatus, Emoji, GatewayEvent, Guild, GuildFolder,
-    GuildMember, ListMember, MemberListGroup, MemberListItem, MemberListOp, MemberListUpdate,
-    Message, MessageUpdate, Presence, ReadState, Ready, ReadySupplemental, Relationship, Role,
-    Snowflake, Status, User, VoiceServerUpdate, VoiceState,
+    Activity, Channel, ChannelOverride, ClientStatus, CustomStatus, Emoji, GatewayEvent, Guild,
+    GuildFolder, GuildMember, ListMember, MemberListGroup, MemberListItem, MemberListOp,
+    MemberListUpdate, Message, MessageUpdate, NotificationLevel, Presence, ReadState, Ready,
+    ReadySupplemental, Relationship, Role, Snowflake, Status, User, UserGuildSettings,
+    VoiceServerUpdate, VoiceState,
 };
 use serde::de::{DeserializeOwned, Error as _};
 use serde::Deserialize;
@@ -574,6 +575,8 @@ pub fn decode_dispatch(t: &str, d: &str) -> Result<Option<GatewayEvent>, JsonErr
             }
         }
         // GUILD_MEMBER_ADD: a guild member object (with `user`) plus `guild_id`.
+        // Every joiner of a guild we receive member events for is decoded; the store
+        // caches only the ones it has a use for (see `Store::apply`).
         "GUILD_MEMBER_ADD" => {
             #[derive(Deserialize)]
             struct Gid {
@@ -716,9 +719,175 @@ pub fn decode_dispatch(t: &str, d: &str) -> Result<Option<GatewayEvent>, JsonErr
                 nickname,
             }
         }
+        // USER_GUILD_SETTINGS_UPDATE (user accounts, Userdoccers topics/gateway-events:
+        // "Sent when a guild's user settings are updated"): one user guild settings
+        // object, see `guild_settings_of` for the shape. The docs give no field table for
+        // the event itself, so it is read as the full object and replaces what is stored.
+        "USER_GUILD_SETTINGS_UPDATE" => {
+            let v: Value = serde_json::from_str(d)?;
+            let Some(settings) = guild_settings_of(&v) else {
+                return Err(JsonError::custom(
+                    "user guild settings without a usable guild",
+                ));
+            };
+            GatewayEvent::UserGuildSettingsUpdate(Box::new(settings))
+        }
         _ => return Ok(None),
     };
     Ok(Some(ev))
+}
+
+/// READY `user_guild_settings` (Userdoccers topics/gateway-events): with the
+/// VERSIONED_USER_GUILD_SETTINGS capability a versioned structure
+/// `{ entries: [user guild settings], partial: bool, version: int }`, otherwise a bare
+/// array; "may be empty, omitted, or null". Both shapes are read, and anything else
+/// (including entries that are not usable) yields nothing, so this never fails READY.
+fn decode_user_guild_settings(v: &Value) -> Vec<UserGuildSettings> {
+    v.as_array()
+        .or_else(|| v.get("entries").and_then(Value::as_array))
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .filter_map(guild_settings_of)
+        .collect()
+}
+
+/// One user guild settings object (Userdoccers resources/user-settings):
+/// `{ guild_id: ?snowflake (null: private channels), muted: bool,
+/// mute_config: ?{ end_time?: ?ISO8601, selected_time_window?: int (-1: indefinite) },
+/// message_notifications: int (0 all, 1 only mentions, 2 nothing, 3 inherit),
+/// suppress_everyone: bool, suppress_roles: bool, channel_overrides: [channel override],
+/// flags, version, mobile_push, hide_muted_channels, mute_scheduled_events,
+/// notify_highlights }`. Only the first seven are kept. Every field is optional here and
+/// a wrong type reads as the default. `None`: not an object, or a `guild_id` that is
+/// present but not an id (reading that as "private channels" would misfile it).
+fn guild_settings_of(v: &Value) -> Option<UserGuildSettings> {
+    let obj = v.as_object()?;
+    let guild_id = match obj.get("guild_id") {
+        None | Some(Value::Null) => None,
+        Some(id) => Some(snowflake_of(id)?),
+    };
+    let (muted, mute_end) = mute_of(v);
+    let flag = |key: &str| obj.get(key).and_then(Value::as_bool).unwrap_or(false);
+    Some(UserGuildSettings {
+        guild_id,
+        muted,
+        mute_end,
+        message_notifications: notification_level_of(v),
+        suppress_everyone: flag("suppress_everyone"),
+        suppress_roles: flag("suppress_roles"),
+        channel_overrides: obj
+            .get("channel_overrides")
+            .map(channel_overrides_of)
+            .unwrap_or_default(),
+    })
+}
+
+/// `channel_overrides`: an array of `{ channel_id, muted, mute_config,
+/// message_notifications, collapsed, flags? }` in the settings object, or a map keyed by
+/// channel id in the partial (PATCH-style) form; both are read. Overrides that neither
+/// mute nor set a level (e.g. only `collapsed`) are dropped.
+fn channel_overrides_of(v: &Value) -> Vec<ChannelOverride> {
+    let one = |key_id: Option<Snowflake>, o: &Value| {
+        o.as_object()?;
+        let channel_id = o.get("channel_id").and_then(snowflake_of).or(key_id)?;
+        let (muted, mute_end) = mute_of(o);
+        let message_notifications = notification_level_of(o);
+        (muted || message_notifications != NotificationLevel::Inherit).then_some(ChannelOverride {
+            channel_id,
+            muted,
+            mute_end,
+            message_notifications,
+        })
+    };
+    match v {
+        Value::Array(a) => a.iter().filter_map(|o| one(None, o)).collect(),
+        Value::Object(m) => m
+            .iter()
+            .filter_map(|(k, o)| one(k.parse().ok().map(Snowflake), o))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `(muted, mute_config.end_time as Unix seconds)` of a settings object or override.
+/// A missing, null or unreadable end time means "until unmuted".
+fn mute_of(v: &Value) -> (bool, Option<i64>) {
+    let muted = v.get("muted").and_then(Value::as_bool).unwrap_or(false);
+    let end = v
+        .get("mute_config")
+        .and_then(|c| c.get("end_time"))
+        .and_then(Value::as_str)
+        .and_then(iso8601_unix);
+    (muted, end.filter(|_| muted))
+}
+
+fn notification_level_of(v: &Value) -> NotificationLevel {
+    v.get("message_notifications")
+        .and_then(Value::as_u64)
+        .and_then(|n| u8::try_from(n).ok())
+        .map_or(NotificationLevel::Inherit, NotificationLevel::from)
+}
+
+/// Unix seconds of an ISO 8601 / RFC 3339 timestamp such as
+/// `2026-01-02T03:04:05.678000+00:00` (fraction optional and dropped; `Z`, `+HH:MM`,
+/// `+HHMM` or no offset, which is read as UTC). The non-UI crates have no time crate,
+/// so this is the usual days-from-civil arithmetic.
+fn iso8601_unix(s: &str) -> Option<i64> {
+    fn num(b: &[u8]) -> Option<i64> {
+        if b.is_empty() || !b.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(b.iter().fold(0, |n, d| n * 10 + i64::from(d - b'0')))
+    }
+    let b = s.trim().as_bytes();
+    if b.len() < 19
+        || b.len() > 40
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || !matches!(b[10], b'T' | b't' | b' ')
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let (year, month, day) = (num(&b[..4])?, num(&b[5..7])?, num(&b[8..10])?);
+    let (hour, min, sec) = (num(&b[11..13])?, num(&b[14..16])?, num(&b[17..19])?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+    let mut rest = &b[19..];
+    if let [b'.', tail @ ..] = rest {
+        let digits = tail.iter().take_while(|c| c.is_ascii_digit()).count();
+        if digits == 0 {
+            return None;
+        }
+        rest = &tail[digits..];
+    }
+    let offset = match rest {
+        [] | [b'Z' | b'z'] => 0,
+        [sign @ (b'+' | b'-'), r @ ..] => {
+            let (h, m) = match r.len() {
+                5 if r[2] == b':' => (num(&r[..2])?, num(&r[3..])?),
+                4 => (num(&r[..2])?, num(&r[2..])?),
+                2 => (num(r)?, 0),
+                _ => return None,
+            };
+            let secs = h * 3600 + m * 60;
+            if *sign == b'-' {
+                -secs
+            } else {
+                secs
+            }
+        }
+        _ => return None,
+    };
+    // Days since 1970-01-01 of a proleptic Gregorian date, counting the year from March
+    // so the leap day comes last.
+    let y = if month <= 2 { year - 1 } else { year };
+    let (era, yoe) = (y.div_euclid(400), y.rem_euclid(400));
+    let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+    Some(days * 86_400 + hour * 3600 + min * 60 + sec - offset)
 }
 
 /// An object of which only `id` is read (partial users).
@@ -810,6 +979,8 @@ pub fn decode_ready(d: &str) -> Result<Ready, JsonError> {
         sessions: Option<Value>,
         #[serde(default)]
         read_state: Value,
+        #[serde(default)]
+        user_guild_settings: Value,
     }
     fn array(v: &Value) -> &[Value] {
         v.as_array().map_or(&[], Vec::as_slice)
@@ -931,6 +1102,7 @@ pub fn decode_ready(d: &str) -> Result<Ready, JsonError> {
         guild_folders,
         custom_status,
         custom_status_expires_at,
+        user_guild_settings: decode_user_guild_settings(&extras.user_guild_settings),
     })
 }
 
@@ -2776,5 +2948,200 @@ mod m0_event_tests {
             }
         );
         assert!(decode_dispatch("RELATIONSHIP_UPDATE", r#"{"type":1}"#).is_err());
+    }
+}
+
+/// Per-server notification settings: READY `user_guild_settings` in both shapes and
+/// USER_GUILD_SETTINGS_UPDATE. Invented payloads shaped like the Userdoccers tables.
+#[cfg(test)]
+mod guild_settings_tests {
+    use super::*;
+
+    const READY_HEAD: &str = r#""user":{"id":"10","username":"tester"},"session_id":"s""#;
+
+    /// 2026-01-02T03:04:05Z.
+    const T: i64 = 1_767_323_045;
+
+    const ENTRIES: &str = r#"[
+        {"guild_id":"1","muted":true,
+         "mute_config":{"end_time":"2026-01-02T03:04:05.000000+00:00","selected_time_window":3600},
+         "suppress_everyone":true,"suppress_roles":false,"message_notifications":1,
+         "mobile_push":true,"hide_muted_channels":false,"flags":0,"version":7,
+         "channel_overrides":[
+           {"channel_id":"20","muted":true,"mute_config":null,"message_notifications":3,
+            "collapsed":false,"flags":4096},
+           {"channel_id":"21","muted":false,"message_notifications":2,"collapsed":false},
+           {"channel_id":"22","muted":false,"message_notifications":3,"collapsed":true}]},
+        {"guild_id":null,"muted":false,"message_notifications":0,
+         "channel_overrides":{"50":{"muted":true,
+           "mute_config":{"end_time":"2026-01-02T04:04:05+01:00","selected_time_window":-1}}}}
+    ]"#;
+
+    fn check(r: &Ready) {
+        let [g, dm] = &r.user_guild_settings[..] else {
+            panic!("{:?}", r.user_guild_settings)
+        };
+        assert_eq!(g.guild_id, Some(Snowflake(1)));
+        assert!(g.muted && g.suppress_everyone && !g.suppress_roles);
+        assert_eq!(g.mute_end, Some(T));
+        assert_eq!(g.message_notifications, NotificationLevel::OnlyMentions);
+        // The collapsed-only override (22) is dropped.
+        assert_eq!(
+            g.channel_overrides,
+            vec![
+                ChannelOverride {
+                    channel_id: Snowflake(20),
+                    muted: true,
+                    mute_end: None,
+                    message_notifications: NotificationLevel::Inherit,
+                },
+                ChannelOverride {
+                    channel_id: Snowflake(21),
+                    muted: false,
+                    mute_end: None,
+                    message_notifications: NotificationLevel::Nothing,
+                },
+            ]
+        );
+        assert_eq!(dm.guild_id, None);
+        assert_eq!(dm.message_notifications, NotificationLevel::AllMessages);
+        // Map-keyed overrides take the channel id from the key.
+        assert_eq!(dm.channel_overrides.len(), 1);
+        assert_eq!(dm.channel_overrides[0].channel_id, Snowflake(50));
+        assert_eq!(dm.channel_overrides[0].mute_end, Some(T));
+    }
+
+    #[test]
+    fn ready_bare_array() {
+        let d = format!(r#"{{{READY_HEAD},"user_guild_settings":{ENTRIES}}}"#);
+        check(&decode_ready(&d).unwrap());
+    }
+
+    #[test]
+    fn ready_versioned_entries() {
+        let d = format!(
+            r#"{{{READY_HEAD},"user_guild_settings":{{"entries":{ENTRIES},"partial":false,"version":3}}}}"#
+        );
+        check(&decode_ready(&d).unwrap());
+    }
+
+    #[test]
+    fn ready_survives_missing_null_and_odd_settings() {
+        for section in [
+            "",
+            r#","user_guild_settings":null"#,
+            r#","user_guild_settings":[]"#,
+            r#","user_guild_settings":"nope""#,
+            r#","user_guild_settings":7"#,
+            r#","user_guild_settings":{"entries":{"a":1},"partial":true}"#,
+            r#","user_guild_settings":{"version":2}"#,
+        ] {
+            let r = decode_ready(&format!("{{{READY_HEAD}{section}}}")).unwrap();
+            assert!(r.user_guild_settings.is_empty(), "{section}");
+            assert_eq!(r.session_id, "s");
+        }
+        // Unusable entries are skipped; the usable one is kept, wrong types as defaults.
+        let odd = r#"[null,3,"x",[],{"guild_id":"abc","muted":true},{"guild_id":{},"muted":true},
+            {"guild_id":"2","muted":"yes","mute_config":[],"message_notifications":"1",
+             "suppress_roles":1,"channel_overrides":[null,{},{"channel_id":"x","muted":true},
+             {"channel_id":30,"muted":true}]}]"#;
+        let r = decode_ready(&format!(r#"{{{READY_HEAD},"user_guild_settings":{odd}}}"#)).unwrap();
+        assert_eq!(
+            r.user_guild_settings,
+            vec![UserGuildSettings {
+                guild_id: Some(Snowflake(2)),
+                channel_overrides: vec![ChannelOverride {
+                    channel_id: Snowflake(30),
+                    muted: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn update_event_full_and_partial() {
+        let full = r#"{"guild_id":"1","muted":true,"mute_config":{"end_time":"2026-01-02T03:04:05Z",
+            "selected_time_window":900},"suppress_everyone":false,"suppress_roles":true,
+            "message_notifications":2,"mobile_push":true,"mute_scheduled_events":false,
+            "notify_highlights":0,"hide_muted_channels":true,"flags":0,"version":9,
+            "channel_overrides":[{"channel_id":"20","muted":false,"message_notifications":0,
+            "collapsed":false}]}"#;
+        match decode_dispatch("USER_GUILD_SETTINGS_UPDATE", full).unwrap() {
+            Some(GatewayEvent::UserGuildSettingsUpdate(s)) => {
+                assert_eq!(s.guild_id, Some(Snowflake(1)));
+                assert!(s.muted && s.suppress_roles && !s.suppress_everyone);
+                assert_eq!(s.mute_end, Some(T));
+                assert_eq!(s.message_notifications, NotificationLevel::Nothing);
+                assert_eq!(s.channel_overrides.len(), 1);
+                assert_eq!(
+                    s.channel_overrides[0].message_notifications,
+                    NotificationLevel::AllMessages
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // Only an id: everything else defaults. No guild_id at all: private channels.
+        for (d, guild) in [
+            (r#"{"guild_id":"1"}"#, Some(Snowflake(1))),
+            (r#"{"guild_id":null}"#, None),
+            ("{}", None),
+        ] {
+            assert_eq!(
+                decode_dispatch("USER_GUILD_SETTINGS_UPDATE", d).unwrap(),
+                Some(GatewayEvent::UserGuildSettingsUpdate(Box::new(
+                    UserGuildSettings {
+                        guild_id: guild,
+                        ..Default::default()
+                    }
+                )))
+            );
+        }
+        // An end time without `muted` is not kept; an unreadable one means "until unmuted".
+        for d in [
+            r#"{"guild_id":"1","muted":false,"mute_config":{"end_time":"2026-01-02T03:04:05Z"}}"#,
+            r#"{"guild_id":"1","muted":true,"mute_config":{"end_time":"soon"}}"#,
+            r#"{"guild_id":"1","muted":true,"mute_config":{"end_time":null}}"#,
+        ] {
+            match decode_dispatch("USER_GUILD_SETTINGS_UPDATE", d).unwrap() {
+                Some(GatewayEvent::UserGuildSettingsUpdate(s)) => assert_eq!(s.mute_end, None),
+                other => panic!("{other:?}"),
+            }
+        }
+        // A guild id that is not an id, or a non-object, is an error rather than a
+        // silent write to the private-channel settings.
+        for d in [r#"{"guild_id":"abc","muted":true}"#, "[]", "null", "3"] {
+            assert!(
+                decode_dispatch("USER_GUILD_SETTINGS_UPDATE", d).is_err(),
+                "{d}"
+            );
+        }
+    }
+
+    #[test]
+    fn iso8601_to_unix_seconds() {
+        for (s, want) in [
+            ("1970-01-01T00:00:00Z", Some(0)),
+            ("2026-01-02T03:04:05Z", Some(T)),
+            ("2026-01-02T03:04:05", Some(T)),
+            ("2026-01-02T03:04:05.123456+00:00", Some(T)),
+            ("2026-01-02T05:34:05+02:30", Some(T)),
+            ("2026-01-01T22:04:05-0500", Some(T)),
+            ("2024-02-29T00:00:00Z", Some(1_709_164_800)),
+            ("2000-03-01T00:00:00+00:00", Some(951_868_800)),
+            ("1969-12-31T23:59:59Z", Some(-1)),
+            ("", None),
+            ("soon", None),
+            ("2026-13-02T03:04:05Z", None),
+            ("2026-01-02T24:04:05Z", None),
+            ("2026-01-02T03:04:05.Z", None),
+            ("2026-01-02T03:04:05+1", None),
+            ("2026-01-02T03:04:05ZZ", None),
+            ("2026\u{e9}01-02T03:04:05Z", None),
+            ("\u{1F600}\u{1F600}\u{1F600}\u{1F600}\u{1F600}", None),
+        ] {
+            assert_eq!(iso8601_unix(s), want, "{s:?}");
+        }
     }
 }

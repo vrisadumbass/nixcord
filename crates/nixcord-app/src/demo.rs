@@ -650,6 +650,7 @@ fn ready() -> Ready {
         ],
         session_id: "demo".into(),
         resume_gateway_url: None,
+        user_guild_settings: Vec::new(),
         presences: people_presences(),
         relationships: {
             let mut rels: Vec<Relationship> = [1002u64, 1003, 1005, 1008]
