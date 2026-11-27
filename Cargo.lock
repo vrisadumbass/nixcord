@@ -3119,6 +3119,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nixcord-capture"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "nixcord-emoji"
 version = "0.1.0"
 dependencies = [
@@ -3131,6 +3139,7 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "futures-util",
+ "nixcord-capture",
  "nixcord-model",
  "rustls",
  "serde",
@@ -3146,6 +3155,7 @@ name = "nixcord-http"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "nixcord-capture",
  "nixcord-model",
  "reqwest",
  "serde",

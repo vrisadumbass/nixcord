@@ -398,3 +398,45 @@ fn fuzz_truncated_and_garbled_text_never_panics() {
         let _ = Frame::parse(&text);
     }
 }
+
+/// Turn short digit-string ids (`"10"`) into snowflake-length ones, except bitfields.
+fn lengthen_ids(v: &mut Value) {
+    match v {
+        Value::Object(m) => {
+            for (k, x) in m.iter_mut() {
+                if k != "permissions" {
+                    lengthen_ids(x);
+                }
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(lengthen_ids),
+        Value::String(s) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => {
+            *s = format!("1000000000000{:0>5}", s);
+        }
+        _ => {}
+    }
+}
+
+/// NIXCORD_CAPTURE fixtures: a redacted payload must still be readable by the decoders
+/// that only need ids and structure. Reports which events lose meaning when every string
+/// becomes a placeholder (enum-like strings such as statuses and member list ops).
+#[test]
+fn redacted_samples_still_decode() {
+    let r = nixcord_capture::Redactor::with_salt(1);
+    let mut failed = Vec::new();
+    for (t, d) in samples() {
+        // The samples use short ids for readability; real ones are snowflake-length.
+        let mut v: Value = serde_json::from_str(&d).unwrap();
+        lengthen_ids(&mut v);
+        let rec = r.gateway_record(t, &v.to_string());
+        let redacted = rec["d"].to_string();
+        match decode_dispatch(t, &redacted) {
+            Ok(Some(_)) => {}
+            other => failed.push(format!("{t}: {other:?}")),
+        }
+        feed(t, &redacted);
+    }
+    // Decoding errors here would make captured fixtures useless as-is; keep this list
+    // empty or explain each entry.
+    assert!(failed.is_empty(), "{failed:#?}");
+}

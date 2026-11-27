@@ -186,6 +186,8 @@ impl Session {
             return Vec::new();
         };
         let d = frame.data();
+        // Redacted shapes only, and only with NIXCORD_CAPTURE set.
+        nixcord_capture::gateway_dispatch(t, d);
         if t == "READY" {
             match serde_json::from_str::<ReadySession>(d) {
                 Ok(rs) => {

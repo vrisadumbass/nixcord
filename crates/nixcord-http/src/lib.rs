@@ -622,6 +622,8 @@ impl Http {
                 .bytes()
                 .await
                 .map_err(|e| HttpError::Transport(e.without_url().to_string()))?;
+            // Redacted response shape only (never the request), with NIXCORD_CAPTURE set.
+            nixcord_capture::rest_response(method.to_reqwest().as_str(), path, status, &bytes);
 
             if (200..300).contains(&status) {
                 limiter.update(&key, &limits, None);

@@ -52,6 +52,7 @@ Environment variables:
 | `NIXCORD_DEMO_VIDEO=<path>` | Adds a local video file to the demo |
 | `NIXCORD_LOG=nixcord_gateway=debug,...` | Log filter; transport crates are always capped at `warn` |
 | `NIXCORD_LOG_FILE=<path>` | Write the log to a file (release builds have no console) |
+| `NIXCORD_CAPTURE=<dir>` | Append redacted gateway dispatches and REST response bodies to `<dir>/gateway.jsonl` / `rest.jsonl` (strings become placeholders, ids salted hashes; capped) |
 | `NIXCORD_RENDERER=glow` | Force OpenGL instead of Direct3D 12 on Windows |
 
 ## Layout
@@ -68,6 +69,7 @@ crates/
   nixcord-store     pure state: messages (sliding window, cap 250/channel), read state &
                     mention counts, threads, presences (per-scope), member lists, permissions,
                     reactions, typing, emoji, profile helpers
+  nixcord-capture   NIXCORD_CAPTURE: redacts payloads (no strings, hashed ids) for fixtures
   nixcord-markdown  Discord-flavored markdown -> AST (no egui), fuzz-tested
   nixcord-emoji     emoji table (emojibase), shortcodes, search, Twemoji filenames
   nixcord-media     fetch/decode/downscale, byte-capped LRU, disk cache, animations
