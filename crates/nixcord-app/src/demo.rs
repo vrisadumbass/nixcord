@@ -18,9 +18,9 @@ use nixcord_model::{
     Activity, ActivityKind, Attachment, Channel, ChannelKind, Embed, EmbedAuthor, EmbedField,
     EmbedFooter, EmbedMedia, Emoji, ForumTag, GatewayEvent, Guild, GuildMember, ListMember,
     MemberListGroup, MemberListItem, MemberListOp, MemberListUpdate, Message, MessageReference,
-    MessageUpdate, Overwrite, OverwriteKind, PartialMember, Presence, Reaction, ReadState, Ready,
-    Relationship, RelationshipKind, Role, Snowflake, Status, ThreadMetadata, User,
-    VoiceServerUpdate, VoiceState,
+    MessageSnapshot, MessageUpdate, Overwrite, OverwriteKind, PartialMember, Poll, PollAnswer,
+    Presence, Reaction, ReadState, Ready, Relationship, RelationshipKind, Role, SnapshotMessage,
+    Snowflake, Status, ThreadMetadata, User, VoiceServerUpdate, VoiceState,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -773,6 +773,7 @@ fn reference_to(m: &Message) -> MessageReference {
         message_id: Some(m.id),
         channel_id: Some(m.channel_id),
         guild_id: m.guild_id,
+        kind: 0,
     }
 }
 
@@ -1106,6 +1107,16 @@ fn showcase_messages(
     out.push(rules_post(id, channel, bot, t, dev));
     let (id, t) = at(2);
     out.push(vote_buttons(id, channel, bot, t));
+
+    // Polls (one open, one closed) and a forward of the announcement above.
+    let (id, t) = at(2);
+    out.push(demo_open_poll(id, channel, juan, t));
+    let (id, t) = at(2);
+    out.push(demo_closed_poll(id, channel, mira, t));
+    if let Some(original) = out.first().cloned() {
+        let (id, t) = at(1);
+        out.push(demo_forward(id, channel, ferris, t, &original));
+    }
 
     // GIFs: two attachments and a Tenor gifv embed (files from `assets/demo/gifs`).
     let (id, t) = at(1);
@@ -2186,8 +2197,166 @@ pub async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx
                     reason: None,
                 }));
             }
+            // Like the real gateway: one MESSAGE_POLL_VOTE_REMOVE / _ADD per changed answer.
+            Command::PollVote {
+                channel,
+                message,
+                answer_ids,
+            } => {
+                let poll = histories
+                    .get_mut(&channel)
+                    .and_then(|h| h.iter_mut().find(|m| m.id == message))
+                    .and_then(|m| m.poll.as_deref_mut());
+                let Some(poll) = poll else {
+                    events.send(AppEvent::Error("Couldn't vote: unknown poll".into()));
+                    continue;
+                };
+                let evs = poll_vote_events(poll, channel, message, &answer_ids);
+                let events = events.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    for ev in evs {
+                        events.send(AppEvent::Gateway(ev));
+                    }
+                });
+            }
         }
     }
+}
+
+/// The vote events for replacing my votes on `poll` with `answer_ids`; also applies them
+/// to the demo's own copy so later history loads agree.
+fn poll_vote_events(
+    poll: &mut Poll,
+    channel: Snowflake,
+    message: Snowflake,
+    answer_ids: &[u32],
+) -> Vec<GatewayEvent> {
+    let mut out = Vec::new();
+    let (channel_id, message_id, user_id) = (channel, message, Snowflake(ME));
+    let mine: Vec<u32> = poll
+        .answers
+        .iter()
+        .filter(|a| a.me_voted)
+        .map(|a| a.id)
+        .collect();
+    for &answer_id in mine.iter().filter(|id| !answer_ids.contains(id)) {
+        out.push(GatewayEvent::PollVoteRemove {
+            channel_id,
+            message_id,
+            user_id,
+            answer_id,
+        });
+    }
+    let known = |id: &u32| poll.answers.iter().any(|a| a.id == *id);
+    for &answer_id in answer_ids
+        .iter()
+        .filter(|id| !mine.contains(id) && known(id))
+    {
+        out.push(GatewayEvent::PollVoteAdd {
+            channel_id,
+            message_id,
+            user_id,
+            answer_id,
+        });
+    }
+    for ev in &out {
+        match *ev {
+            GatewayEvent::PollVoteAdd { answer_id, .. } => poll.apply_vote(answer_id, true, true),
+            GatewayEvent::PollVoteRemove { answer_id, .. } => {
+                poll.apply_vote(answer_id, true, false)
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn poll_answer(
+    id: u32,
+    text: &str,
+    emoji: Option<Emoji>,
+    count: u32,
+    me_voted: bool,
+) -> PollAnswer {
+    PollAnswer {
+        id,
+        text: text.into(),
+        emoji,
+        count,
+        me_voted,
+    }
+}
+
+/// An open poll (single choice, ends in about a day) I haven't voted on.
+fn demo_open_poll(id: Snowflake, channel: Snowflake, author: &User, t: u64) -> Message {
+    let mut m = base_msg(id, channel, author, String::new(), t);
+    m.poll = Some(Box::new(Poll {
+        question: "What should the next demo night be about?".into(),
+        answers: vec![
+            poll_answer(1, "Shader golf", Some(unicode("\u{1F3A8}")), 4, false),
+            poll_answer(
+                2,
+                "Tiny parsers",
+                Some(custom_emoji(EMOJI_FERRIS, "ferris", false)),
+                6,
+                false,
+            ),
+            poll_answer(3, "Retro synths", Some(unicode("\u{1F3B9}")), 2, false),
+            poll_answer(4, "Surprise me", None, 1, false),
+        ],
+        expiry: Some(iso(t + 23 * 3_600_000)),
+        allow_multiselect: false,
+        layout_type: 1,
+        finalized: false,
+        has_results: true,
+    }));
+    m
+}
+
+/// A finished multi-choice poll with final results, where I voted.
+fn demo_closed_poll(id: Snowflake, channel: Snowflake, author: &User, t: u64) -> Message {
+    let mut m = base_msg(id, channel, author, String::new(), t);
+    m.poll = Some(Box::new(Poll {
+        question: "Which snacks for the meetup?".into(),
+        answers: vec![
+            poll_answer(1, "Pretzels", Some(unicode("\u{1F968}")), 9, true),
+            poll_answer(2, "Fruit plate", Some(unicode("\u{1F347}")), 7, false),
+            poll_answer(3, "Mochi", Some(unicode("\u{1F361}")), 5, true),
+        ],
+        expiry: Some(iso(t.saturating_sub(2 * 3_600_000))),
+        allow_multiselect: true,
+        layout_type: 1,
+        finalized: true,
+        has_results: true,
+    }));
+    m
+}
+
+/// A forward of `original` (same channel, so the source line can jump to it).
+fn demo_forward(
+    id: Snowflake,
+    channel: Snowflake,
+    author: &User,
+    t: u64,
+    original: &Message,
+) -> Message {
+    let mut m = base_msg(id, channel, author, String::new(), t);
+    m.message_reference = Some(MessageReference {
+        kind: nixcord_model::MESSAGE_REFERENCE_FORWARD,
+        ..reference_to(original)
+    });
+    m.message_snapshots = vec![MessageSnapshot {
+        message: SnapshotMessage {
+            content: original.content.clone(),
+            timestamp: original.timestamp.clone(),
+            mentions: original.mentions.clone(),
+            attachments: original.attachments.clone(),
+            embeds: original.embeds.clone(),
+            ..Default::default()
+        },
+    }];
+    m
 }
 
 #[cfg(test)]
@@ -2273,5 +2442,75 @@ mod tests {
     fn dm_history_has_no_members() {
         let h = history_for(Snowflake(1), &people());
         assert!(h.iter().all(|m| m.member.is_none() && m.guild_id.is_none()));
+    }
+}
+
+#[cfg(test)]
+mod poll_forward_demo_tests {
+    use super::*;
+
+    #[test]
+    fn showcase_has_polls_and_a_forward() {
+        let ch = Snowflake(SHOWCASE_CHANNEL);
+        let h = history_for(ch, &people());
+        assert!(h.windows(2).all(|w| w[0].id < w[1].id));
+        let now = chrono::Utc::now().timestamp();
+        let polls: Vec<&Poll> = h.iter().filter_map(|m| m.poll.as_deref()).collect();
+        assert!(polls
+            .iter()
+            .any(|p| !crate::ui::poll::is_closed(p, now) && !p.me_voted()));
+        assert!(polls
+            .iter()
+            .any(|p| crate::ui::poll::is_closed(p, now) && p.total_votes() > 0));
+        let fwd = h.iter().find(|m| m.is_forward()).expect("a forward");
+        assert!(fwd.reply_target().is_none());
+        let src = fwd.message_reference.as_ref().unwrap();
+        assert!(h.iter().any(|m| Some(m.id) == src.message_id));
+        assert!(!fwd.message_snapshots[0].message.content.is_empty());
+    }
+
+    #[test]
+    fn vote_command_emits_gateway_vote_events() {
+        let mut m = demo_open_poll(Snowflake(5), Snowflake(102), &people()[2], now_ms());
+        let p = m.poll.as_deref_mut().unwrap();
+        let (c, id) = (Snowflake(102), Snowflake(5));
+        let evs = poll_vote_events(p, c, id, &[2]);
+        assert_eq!(
+            evs,
+            vec![GatewayEvent::PollVoteAdd {
+                channel_id: c,
+                message_id: id,
+                user_id: Snowflake(ME),
+                answer_id: 2,
+            }]
+        );
+        assert!(p.answers[1].me_voted);
+        // Changing the vote removes the old answer, adds the new one; unknown ids skip.
+        let evs = poll_vote_events(p, c, id, &[3, 99]);
+        assert!(matches!(
+            evs.as_slice(),
+            [
+                GatewayEvent::PollVoteRemove { answer_id: 2, .. },
+                GatewayEvent::PollVoteAdd { answer_id: 3, .. }
+            ]
+        ));
+        // Removing the vote.
+        let evs = poll_vote_events(p, c, id, &[]);
+        assert!(matches!(
+            evs.as_slice(),
+            [GatewayEvent::PollVoteRemove { answer_id: 3, .. }]
+        ));
+        assert!(!p.me_voted());
+
+        // Folded by the real store, the events give the same counts.
+        let mut store = nixcord_store::Store::new();
+        store.apply(&GatewayEvent::Ready(Box::new(ready())));
+        let fresh = demo_open_poll(Snowflake(5), Snowflake(102), &people()[2], now_ms());
+        store.insert_history(c, vec![fresh.clone()]);
+        let mut copy = fresh;
+        for ev in poll_vote_events(copy.poll.as_deref_mut().unwrap(), c, id, &[1]) {
+            store.apply(&ev);
+        }
+        assert_eq!(store.messages(c)[0].poll, copy.poll);
     }
 }

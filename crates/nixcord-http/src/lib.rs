@@ -642,6 +642,23 @@ impl Route {
         r
     }
 
+    /// PUT /channels/{c}/polls/{m}/answers/@me with `{ "answer_ids": [...] }`: replace my
+    /// votes on a poll; an empty list removes them. Returns 204, and the change arrives as
+    /// MESSAGE_POLL_VOTE_ADD / _REMOVE. Source: Userdoccers ("Create Poll Vote", checked
+    /// online), which types `answer_ids` as `array[integer]` and says "empty to clear
+    /// votes". The ids are sent as strings because that is what the official client sends
+    /// (from memory, not verified); Discord accepts numeric strings for integer fields.
+    /// Confidence: high for the route and method, medium for the string ids.
+    pub fn poll_vote(channel_id: Snowflake, message_id: Snowflake, answer_ids: &[u32]) -> Self {
+        let mut r = Self::new(
+            Method::Put,
+            format!("/channels/{channel_id}/polls/{message_id}/answers/@me"),
+        );
+        let ids: Vec<String> = answer_ids.iter().map(u32::to_string).collect();
+        r.body = Some(serde_json::json!({ "answer_ids": ids }));
+        r
+    }
+
     /// Full URL including the query string.
     pub fn url(&self, base: &str) -> std::result::Result<reqwest::Url, String> {
         let mut url = reqwest::Url::parse(&format!("{}{}", base.trim_end_matches('/'), self.path))
@@ -1122,6 +1139,17 @@ impl Http {
         locked: Option<bool>,
     ) -> Result<Channel> {
         self.json(Route::update_thread(thread_id, archived, locked))
+            .await
+    }
+
+    /// Replace my votes on a poll (empty `answer_ids`: remove them). See [`Route::poll_vote`].
+    pub async fn poll_vote(
+        &self,
+        channel_id: Snowflake,
+        message_id: Snowflake,
+        answer_ids: &[u32],
+    ) -> Result<()> {
+        self.empty(Route::poll_vote(channel_id, message_id, answer_ids))
             .await
     }
 
@@ -1880,6 +1908,19 @@ mod tests {
         let o = &u.body.as_ref().unwrap()["channel_overrides"][C.to_string()];
         assert_eq!(o["muted"], false);
         assert!(o["mute_config"].is_null());
+    }
+
+    #[test]
+    fn poll_vote_route() {
+        let r = Route::poll_vote(C, Snowflake(300), &[1, 2]);
+        assert_eq!(r.method, Method::Put);
+        assert_eq!(r.path, format!("/channels/{C}/polls/300/answers/@me"));
+        assert_eq!(
+            r.body,
+            Some(serde_json::json!({ "answer_ids": ["1", "2"] }))
+        );
+        let clear = Route::poll_vote(C, Snowflake(300), &[]);
+        assert_eq!(clear.body, Some(serde_json::json!({ "answer_ids": [] })));
     }
 
     #[tokio::test]

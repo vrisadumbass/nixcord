@@ -10,11 +10,13 @@ pub mod composer;
 pub mod emoji_picker;
 pub mod emoji_text;
 pub mod forum;
+pub mod forward;
 pub mod friends;
 pub mod gif_picker;
 pub mod header_menus;
 pub mod login;
 pub mod markdown;
+pub mod poll;
 pub mod presence;
 pub mod profile;
 pub mod search;
@@ -176,6 +178,12 @@ pub enum Action {
     SetVoiceVadThreshold(f32),
     /// Short notice at the bottom of the window.
     Toast(String),
+    /// Replace my votes on a poll (`answer_ids` empty: remove my vote).
+    PollVote {
+        channel: Snowflake,
+        message: Snowflake,
+        answer_ids: Vec<u32>,
+    },
 }
 
 /// Bold-ish family (Segoe UI Semibold on Windows when available, else the default font).

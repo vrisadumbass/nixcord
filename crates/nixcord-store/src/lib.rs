@@ -506,6 +506,37 @@ impl Store {
                 }
             }
             GatewayEvent::UserGuildSettingsUpdate(settings) => self.set_guild_settings(settings),
+            GatewayEvent::PollVoteAdd {
+                channel_id,
+                message_id,
+                user_id,
+                answer_id,
+            } => self.poll_vote(*channel_id, *message_id, *user_id, *answer_id, true),
+            GatewayEvent::PollVoteRemove {
+                channel_id,
+                message_id,
+                user_id,
+                answer_id,
+            } => self.poll_vote(*channel_id, *message_id, *user_id, *answer_id, false),
+        }
+    }
+
+    /// Fold one poll vote into a message in memory; others are ignored (their counts
+    /// come with the message when it is loaded).
+    fn poll_vote(
+        &mut self,
+        channel_id: Snowflake,
+        message_id: Snowflake,
+        user_id: Snowflake,
+        answer_id: u32,
+        add: bool,
+    ) {
+        let is_me = self.me.as_ref().is_some_and(|u| u.id == user_id);
+        if let Some(p) = self
+            .message_mut(channel_id, message_id)
+            .and_then(|m| m.poll.as_deref_mut())
+        {
+            p.apply_vote(answer_id, is_me, add);
         }
     }
 
@@ -1866,6 +1897,12 @@ impl Store {
         if let Some(mentions) = &u.mentions {
             m.mentions.clone_from(mentions);
         }
+        if let Some(p) = &u.poll {
+            match m.poll.as_deref_mut() {
+                Some(old) => old.merge_update(p),
+                None => m.poll = Some(p.clone()),
+            }
+        }
     }
 
     fn reaction_add(
@@ -2352,6 +2389,9 @@ mod event_tests;
 
 #[cfg(test)]
 mod settings_tests;
+
+#[cfg(test)]
+mod poll_tests;
 
 #[cfg(test)]
 mod voice_tests {

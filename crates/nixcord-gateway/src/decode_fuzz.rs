@@ -203,6 +203,39 @@ fn samples() -> Vec<(&'static str, String)> {
             o(r#"{"channel_id":"20","last_pin_timestamp":null}"#),
         ),
         (
+            "MESSAGE_POLL_VOTE_ADD",
+            o(
+                r#"{"user_id":"10","channel_id":"20","message_id":"100","guild_id":"1","answer_id":1}"#,
+            ),
+        ),
+        (
+            "MESSAGE_POLL_VOTE_REMOVE",
+            o(
+                r#"{"user_id":"10","channel_id":"20","message_id":"100","guild_id":"1","answer_id":1}"#,
+            ),
+        ),
+        // A message with a poll, and a forward with a snapshot.
+        (
+            "MESSAGE_CREATE",
+            format!(
+                r#"{{"id":"101","channel_id":"20","author":{USER},"content":"",
+                "timestamp":"2024-01-01T00:00:00+00:00",
+                "poll":{{"question":{{"text":"q"}},"answers":[{{"answer_id":1,"poll_media":{{"text":"a","emoji":{{"name":"x"}}}}}}],
+                  "expiry":"2024-01-02T00:00:00+00:00","allow_multiselect":false,"layout_type":1,
+                  "results":{{"is_finalized":false,"answer_counts":[{{"id":1,"count":1,"me_voted":true}}]}}}}}}"#
+            ),
+        ),
+        (
+            "MESSAGE_CREATE",
+            format!(
+                r#"{{"id":"102","channel_id":"20","author":{USER},"content":"",
+                "timestamp":"2024-01-01T00:00:00+00:00",
+                "message_reference":{{"type":1,"message_id":"100","channel_id":"20","guild_id":"1"}},
+                "message_snapshots":[{{"message":{{"content":"fwd","timestamp":"2024-01-01T00:00:00+00:00",
+                  "edited_timestamp":null,"flags":0,"mentions":[],"attachments":[],"embeds":[],"type":0}}}}]}}"#
+            ),
+        ),
+        (
             "CHANNEL_RECIPIENT_ADD",
             format!(r#"{{"channel_id":"50","user":{USER}}}"#),
         ),
