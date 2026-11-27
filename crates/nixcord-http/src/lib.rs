@@ -8,6 +8,7 @@
 //! into a reqwest request, sends it, and maps the response with [`map_error_status`].
 
 pub mod multipart;
+pub mod ratelimit;
 pub use multipart::{
     EncodedMultipart, MultipartError, UploadFile, MAX_ATTACHMENTS, MAX_FILE_BYTES, MAX_TOTAL_BYTES,
 };
@@ -27,7 +28,8 @@ pub const API_BASE: &str = "https://discord.com/api/v10";
 /// Plain user agent. No browser fingerprinting, no super-properties.
 pub const USER_AGENT_VALUE: &str = concat!("nixcord/", env!("CARGO_PKG_VERSION"));
 
-/// 429s asking us to wait at most this long are retried once automatically.
+/// 429s asking us to wait at most this long are retried once automatically (after the
+/// rate limiter has waited them out).
 pub const AUTO_RETRY_MAX: Duration = Duration::from_secs(5);
 
 /// Error bodies are truncated to this many characters in [`HttpError::Status`].
@@ -515,6 +517,8 @@ struct Inner {
     /// `None` if the token contains characters that are not valid in a header.
     auth: Option<HeaderValue>,
     base: String,
+    /// Shared by every clone, so all requests see the same buckets and global limit.
+    limiter: ratelimit::RateLimiter,
 }
 
 #[derive(Clone)]
@@ -551,14 +555,12 @@ impl Http {
                 client,
                 auth: auth_header_value(&token),
                 base: base.into(),
+                limiter: ratelimit::RateLimiter::default(),
             }),
         }
     }
 
-    /// Send a route and return the raw 2xx body. Handles one automatic retry on short 429s.
-    ///
-    /// v0.1 rate limiting: we only react to 429s. Per-route bucket tracking
-    /// (X-RateLimit-Bucket / Remaining / Reset-After) is out of scope for now.
+    /// Send a route and return the raw 2xx body. See [`Http::send_limited`].
     async fn execute(&self, route: &Route) -> Result<Vec<u8>> {
         let client = self
             .inner
@@ -573,21 +575,44 @@ impl Http {
             .map(serde_json::to_vec)
             .transpose()
             .map_err(|e| HttpError::Transport(e.to_string()))?;
-
-        let mut retried = false;
-        loop {
-            tracing::debug!(method = ?route.method, path = %route.path, "http request");
+        self.send_limited(route.method, &route.path, || {
             let mut req = client
                 .request(route.method.to_reqwest(), url.clone())
                 .header(AUTHORIZATION, auth.clone());
             if let Some(b) = &body {
                 req = req.header(CONTENT_TYPE, "application/json").body(b.clone());
             }
-            let resp = req
+            req
+        })
+        .await
+    }
+
+    /// Send through the rate limiter and return the raw 2xx body.
+    ///
+    /// The request first waits its turn in its route's FIFO queue, then for the global
+    /// limit and its bucket ([`ratelimit::RateLimiter`]). Every response's rate limit
+    /// headers are recorded. A 429 asking to wait at most [`AUTO_RETRY_MAX`] is retried
+    /// once (after the limiter has waited it out); a longer or repeated one is returned as
+    /// [`HttpError::RateLimited`].
+    async fn send_limited(
+        &self,
+        method: Method,
+        path: &str,
+        mut make: impl FnMut() -> reqwest::RequestBuilder,
+    ) -> Result<Vec<u8>> {
+        let limiter = &self.inner.limiter;
+        let key = ratelimit::route_key(method, path);
+        let _turn = limiter.queue(&key).await;
+        let mut retried = false;
+        loop {
+            limiter.acquire(&key).await;
+            tracing::debug!(?method, path, "http request");
+            let resp = make()
                 .send()
                 .await
                 .map_err(|e| HttpError::Transport(e.without_url().to_string()))?;
             let status = resp.status().as_u16();
+            let limits = ratelimit::RateLimitHeaders::from_headers(resp.headers());
             let retry_header = resp
                 .headers()
                 .get(RETRY_AFTER)
@@ -599,18 +624,24 @@ impl Http {
                 .map_err(|e| HttpError::Transport(e.without_url().to_string()))?;
 
             if (200..300).contains(&status) {
+                limiter.update(&key, &limits, None);
                 return Ok(bytes.to_vec());
             }
             let text = String::from_utf8_lossy(&bytes);
             let err = map_error_status(status, retry_header.as_deref(), &text);
+            if let HttpError::RateLimited(wait) = err {
+                let global = limits.global || ratelimit::body_is_global(&text);
+                limiter.update(&key, &limits, Some((wait, global)));
+            } else {
+                limiter.update(&key, &limits, None);
+            }
             match err {
                 HttpError::RateLimited(wait) if !retried && wait <= AUTO_RETRY_MAX => {
-                    tracing::warn!(path = %route.path, ?wait, "rate limited, retrying once");
+                    tracing::warn!(path, ?wait, "rate limited, retrying once");
                     retried = true;
-                    tokio::time::sleep(wait).await;
                 }
                 err => {
-                    tracing::debug!(path = %route.path, status, "http error");
+                    tracing::debug!(path, status, "http error");
                     return Err(err);
                 }
             }
@@ -866,47 +897,16 @@ impl Http {
         let url = route.url(&self.inner.base).map_err(HttpError::Transport)?;
         // Shared buffer: a 429 retry re-sends it without copying up to 25 MiB again.
         let body = bytes::Bytes::from(body);
-
-        let mut retried = false;
-        loop {
-            tracing::debug!(method = ?method, path, bytes = body.len(), "http multipart request");
-            let resp = client
+        tracing::debug!(?method, path, bytes = body.len(), "http multipart request");
+        self.send_limited(method, path, || {
+            client
                 .request(method.to_reqwest(), url.clone())
                 .header(AUTHORIZATION, auth.clone())
                 .header(CONTENT_TYPE, content_type)
                 .timeout(timeout)
                 .body(body.clone())
-                .send()
-                .await
-                .map_err(|e| HttpError::Transport(e.without_url().to_string()))?;
-            let status = resp.status().as_u16();
-            let retry_header = resp
-                .headers()
-                .get(RETRY_AFTER)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned);
-            let bytes = resp
-                .bytes()
-                .await
-                .map_err(|e| HttpError::Transport(e.without_url().to_string()))?;
-
-            if (200..300).contains(&status) {
-                return Ok(bytes.to_vec());
-            }
-            let text = String::from_utf8_lossy(&bytes);
-            let err = map_error_status(status, retry_header.as_deref(), &text);
-            match err {
-                HttpError::RateLimited(wait) if !retried && wait <= AUTO_RETRY_MAX => {
-                    tracing::warn!(path, ?wait, "rate limited, retrying once");
-                    retried = true;
-                    tokio::time::sleep(wait).await;
-                }
-                err => {
-                    tracing::debug!(path, status, "http error");
-                    return Err(err);
-                }
-            }
-        }
+        })
+        .await
     }
 }
 
@@ -1279,6 +1279,45 @@ mod tests {
             Err(HttpError::RateLimited(d)) => assert_eq!(d, Duration::from_secs(30)),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn exhausted_bucket_delays_next_request() {
+        let limited = "X-RateLimit-Bucket: abc\r\nX-RateLimit-Limit: 5\r\n\
+                       X-RateLimit-Remaining: 0\r\nX-RateLimit-Reset-After: 0.3\r\n";
+        let (base, h) = mock(vec![
+            resp("200 OK", limited, "[]"),
+            resp("200 OK", "", USER_JSON),
+            resp("200 OK", "", "[]"),
+        ])
+        .await;
+        let http = Http::with_base_url("t".into(), base);
+        let start = std::time::Instant::now();
+        http.messages(C, None, 10).await.unwrap();
+        // Another route is not held by that bucket.
+        http.current_user().await.unwrap();
+        assert!(start.elapsed() < Duration::from_millis(250));
+        http.messages(C, None, 10).await.unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(250));
+        assert_eq!(h.await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn global_429_is_waited_out_and_retried() {
+        let (base, h) = mock(vec![
+            resp(
+                "429 Too Many Requests",
+                "X-RateLimit-Global: true\r\nX-RateLimit-Scope: global\r\n",
+                r#"{"message":"You are being rate limited.","retry_after":0.2,"global":true}"#,
+            ),
+            resp("200 OK", "", USER_JSON),
+        ])
+        .await;
+        let http = Http::with_base_url("t".into(), base);
+        let start = std::time::Instant::now();
+        assert!(http.current_user().await.is_ok());
+        assert!(start.elapsed() >= Duration::from_millis(150));
+        assert_eq!(h.await.unwrap().len(), 2);
     }
 
     #[tokio::test]
