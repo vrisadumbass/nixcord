@@ -151,6 +151,11 @@ pub enum AppEvent {
         request_id: u64,
         result: Result<Vec<nixcord_model::GifResult>, String>,
     },
+    /// Pinned messages of a channel, or why loading them failed.
+    Pins {
+        channel: Snowflake,
+        result: Result<Vec<Message>, String>,
+    },
     /// Messages fetched `around` a jumped-to message id.
     HistoryAround {
         channel: Snowflake,
@@ -254,6 +259,17 @@ pub enum Command {
     LoadHistoryAround {
         channel: Snowflake,
         around: Snowflake,
+    },
+    /// Load a channel's pinned messages (answered with `AppEvent::Pins`).
+    LoadPins {
+        channel: Snowflake,
+    },
+    /// Mute or unmute a channel in my notification settings. The store updates when
+    /// USER_GUILD_SETTINGS_UPDATE arrives.
+    SetChannelMuted {
+        guild: Option<Snowflake>,
+        channel: Snowflake,
+        muted: bool,
     },
     CreateThread {
         parent_id: Snowflake,
@@ -794,6 +810,25 @@ async fn rest(http: Http, cmd: Command, events: EventTx) {
                 e.user_message()
             ))),
         },
+        Command::LoadPins { channel } => {
+            let result = http
+                .pins(channel)
+                .await
+                .map_err(|e| format!("Couldn't load pins: {}", e.user_message()));
+            events.send(AppEvent::Pins { channel, result });
+        }
+        Command::SetChannelMuted {
+            guild,
+            channel,
+            muted,
+        } => {
+            if let Err(e) = http.set_channel_muted(guild, channel, muted).await {
+                events.send(AppEvent::Error(format!(
+                    "Couldn't change notification settings: {}",
+                    e.user_message()
+                )));
+            }
+        }
         Command::LoadHistoryAround { channel, around } => {
             match http.messages_around(channel, around, HISTORY_PAGE).await {
                 Ok(messages) => events.send(AppEvent::HistoryAround {

@@ -870,6 +870,12 @@ pub fn rail(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
         reconcile_guild_layout(&mut app.prefs.guild_layout, &remote_folders, &known_guilds);
     }
 
+    egui::Panel::bottom("rail_user_card")
+        .exact_size(USER_CARD_RESERVE)
+        .show_separator_line(false)
+        .frame(Frame::new())
+        .show(ui, |_| {});
+
     egui::Panel::bottom("rail_add")
         .exact_size(64.0)
         .show_separator_line(false)
@@ -1733,11 +1739,13 @@ pub fn column(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
         ui.max_rect().y_range(),
         egui::Stroke::new(1.0, t.divider),
     );
+    // Room for the floating user card, which spans the rail and this column and is
+    // drawn by `user_card` once both panels are laid out.
     egui::Panel::bottom("user_panel")
-        .exact_size(56.0)
+        .exact_size(USER_CARD_RESERVE)
         .show_separator_line(false)
-        .frame(Frame::new().inner_margin(Margin::same(6)))
-        .show(ui, |ui| user_panel(ui, app, actions));
+        .frame(Frame::new())
+        .show(ui, |_| {});
 
     if app.view.voice.is_active() {
         egui::Panel::bottom("voice_connected_bar")
@@ -2344,13 +2352,53 @@ fn dm_list(ui: &mut Ui, app: &NixApp, actions: &mut Vec<Action>) {
 
 // ---- user panel ---------------------------------------------------------------------
 
-fn user_panel(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
+/// Height of the user card and the space kept free for it under the rail and the column.
+const USER_CARD_H: f32 = 56.0;
+const USER_CARD_MARGIN: f32 = 8.0;
+const USER_CARD_RESERVE: f32 = USER_CARD_H + 2.0 * USER_CARD_MARGIN;
+
+/// The user card: one floating rounded panel across the bottom of the server rail and
+/// the channel column, as in the official client. `left_bottom` is the window's
+/// bottom-left corner and `width` the rail plus the channel column.
+pub fn user_card(
+    ui: &mut Ui,
+    app: &mut NixApp,
+    left_bottom: Pos2,
+    width: f32,
+    actions: &mut Vec<Action>,
+) {
+    let rect = Rect::from_min_max(
+        Pos2::new(
+            left_bottom.x + USER_CARD_MARGIN,
+            left_bottom.y - USER_CARD_MARGIN - USER_CARD_H,
+        ),
+        Pos2::new(
+            left_bottom.x + width - USER_CARD_MARGIN,
+            left_bottom.y - USER_CARD_MARGIN,
+        ),
+    );
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect.shrink(6.0))
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    child.set_clip_rect(rect);
+    user_panel(&mut child, app, rect, actions);
+}
+
+fn user_card_fill(t: &Theme) -> Color32 {
+    super::presence::opaque_bg(t, t.elevated)
+}
+
+fn user_panel(ui: &mut Ui, app: &mut NixApp, card: Rect, actions: &mut Vec<Action>) {
     let t = app.theme;
-    let panel = ui.max_rect();
-    ui.painter().rect_filled(
-        panel,
+    ui.painter()
+        .rect_filled(card, CornerRadius::same(8), user_card_fill(t));
+    ui.painter().rect_stroke(
+        card,
         CornerRadius::same(8),
-        Color32::from_black_alpha(if t.dark { 70 } else { 20 }),
+        egui::Stroke::new(1.0, t.divider),
+        egui::StrokeKind::Inside,
     );
     let Some(me) = app.store.me().cloned() else {
         ui.centered_and_justified(|ui| ui.add(egui::Spinner::new().color(t.muted)));
@@ -2422,10 +2470,7 @@ fn user_panel(ui: &mut Ui, app: &mut NixApp, actions: &mut Vec<Action>) {
             }
             let c = Pos2::new(area.left() + 4.0 + 16.0, area.center().y);
             app.media.borrow_mut().paint_avatar(ui, c, 32.0, &me, None);
-            let ring = super::presence::over(
-                Color32::from_black_alpha(if t.dark { 70 } else { 20 }),
-                super::presence::opaque_bg(t, t.sidebar),
-            );
+            let ring = user_card_fill(t);
             match dot {
                 Some(s) => super::presence::paint_status(ui, t, c, 32.0, ring, s, false),
                 None => paint_status_dot(ui, c, 32.0, ring, t.idle),

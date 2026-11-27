@@ -12,6 +12,7 @@ pub mod emoji_text;
 pub mod forum;
 pub mod friends;
 pub mod gif_picker;
+pub mod header_menus;
 pub mod login;
 pub mod markdown;
 pub mod presence;
@@ -396,6 +397,10 @@ pub enum Icon {
     Gift,
     Gif,
     Sticker,
+    /// Chat header: threads, notification bell, pinned messages.
+    Threads,
+    Bell,
+    Pin,
     Glyph(&'static str),
 }
 
@@ -551,6 +556,76 @@ pub fn paint_icon(ui: &Ui, icon: Icon, rect: Rect, color: Color32) {
                     Stroke::new(1.2, color),
                 );
             }
+        }
+        Icon::Threads => {
+            // A speech bubble with two lines: the thread list.
+            let b =
+                Rect::from_center_size(c - Vec2::new(0.0, s * 0.06), Vec2::new(s * 0.9, s * 0.66));
+            p.rect_stroke(b, CornerRadius::same(3), stroke, egui::StrokeKind::Middle);
+            p.add(egui::Shape::convex_polygon(
+                vec![
+                    Pos2::new(b.left() + s * 0.16, b.bottom()),
+                    Pos2::new(b.left() + s * 0.4, b.bottom()),
+                    Pos2::new(b.left() + s * 0.16, b.bottom() + s * 0.2),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+            for dy in [-0.14, 0.08] {
+                p.line_segment(
+                    [
+                        Pos2::new(b.left() + s * 0.2, c.y + s * dy),
+                        Pos2::new(b.right() - s * 0.2, c.y + s * dy),
+                    ],
+                    Stroke::new(1.5, color),
+                );
+            }
+        }
+        Icon::Bell => {
+            // Dome, flared rim and clapper.
+            let dome: Vec<Pos2> = (0..=12)
+                .map(|i| {
+                    let a = std::f32::consts::PI * i as f32 / 12.0;
+                    c + Vec2::new(-a.cos() * s * 0.3, -a.sin() * s * 0.34 - s * 0.04)
+                })
+                .chain([
+                    c + Vec2::new(s * 0.3, s * 0.2),
+                    c + Vec2::new(s * 0.44, s * 0.32),
+                    c + Vec2::new(-s * 0.44, s * 0.32),
+                    c + Vec2::new(-s * 0.3, s * 0.2),
+                ])
+                .collect();
+            p.add(egui::Shape::convex_polygon(dome, color, Stroke::NONE));
+            p.circle_filled(c + Vec2::new(0.0, s * 0.44), s * 0.1, color);
+        }
+        Icon::Pin => {
+            // A pushpin, tilted: head, body and needle.
+            let rot = |v: Vec2| {
+                let (sn, cs) = (0.6_f32).sin_cos();
+                Vec2::new(v.x * cs - v.y * sn, v.x * sn + v.y * cs)
+            };
+            let at = |x: f32, y: f32| c + rot(Vec2::new(x * s, y * s));
+            p.add(egui::Shape::convex_polygon(
+                vec![
+                    at(-0.3, -0.46),
+                    at(0.3, -0.46),
+                    at(0.3, -0.34),
+                    at(-0.3, -0.34),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+            p.add(egui::Shape::convex_polygon(
+                vec![
+                    at(-0.17, -0.34),
+                    at(0.17, -0.34),
+                    at(0.36, 0.08),
+                    at(-0.36, 0.08),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+            p.line_segment([at(0.0, 0.08), at(0.0, 0.5)], stroke);
         }
         Icon::Members => {
             for (dx, r, col) in [

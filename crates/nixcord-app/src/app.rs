@@ -222,6 +222,8 @@ pub struct ViewState {
     pub pending_interactions: HashMap<(Snowflake, String), Instant>,
     pub friends: ui::friends::FriendsState,
     pub search: ui::search::SearchState,
+    /// The channel whose pins were last requested, and their state.
+    pub pins: Option<(Snowflake, ui::header_menus::PinsState)>,
     pub forum: ui::forum::ForumState,
     pub create_thread: Option<ui::forum::CreateThreadModal>,
     pub custom_status_modal: Option<ui::presence::CustomStatusModal>,
@@ -593,6 +595,16 @@ impl NixApp {
                 if request_id == self.view.search.request_id {
                     self.view.search.loading = false;
                     self.view.search.error = Some(error);
+                }
+            }
+            AppEvent::Pins { channel, result } => {
+                // Ignore answers for a channel the panel has since moved away from.
+                if self.view.pins.as_ref().is_some_and(|(c, _)| *c == channel) {
+                    let state = match result {
+                        Ok(m) => ui::header_menus::PinsState::Loaded(m),
+                        Err(e) => ui::header_menus::PinsState::Failed(e),
+                    };
+                    self.view.pins = Some((channel, state));
                 }
             }
             AppEvent::HistoryAround {
@@ -1470,6 +1482,7 @@ impl NixApp {
 
     fn main_ui(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         let t = self.theme;
+        let window = ui.max_rect();
 
         egui::Panel::left("rail")
             .exact_size(72.0)
@@ -1484,6 +1497,13 @@ impl NixApp {
             .show_separator_line(false)
             .frame(Frame::new().fill(t.sidebar))
             .show(ui, |ui| ui::sidebar::column(ui, self, actions));
+        ui::sidebar::user_card(
+            ui,
+            self,
+            window.left_bottom(),
+            72.0 + ui::CHANNELS_W,
+            actions,
+        );
 
         if self.store.connection() != ConnectionState::Connected {
             let (label, color) = match self.store.connection() {

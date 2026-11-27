@@ -197,29 +197,8 @@ pub fn header(ui: &mut Ui, app: &mut NixApp, ch: Snowflake, actions: &mut Vec<Ac
         if members.clicked() {
             app.prefs.show_members = Some(!shown);
         }
-        if can_create_thread {
-            ui.add_space(4.0);
-            let (tr, tresp) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
-            if tresp.hovered() {
-                ui.painter().rect_filled(tr, CornerRadius::same(4), t.hover);
-            }
-            paint_plus(
-                ui,
-                tr.center(),
-                12.0,
-                if tresp.hovered() { t.strong } else { t.muted },
-            );
-            if tresp
-                .on_hover_text("Create Thread")
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .clicked()
-            {
-                actions.push(Action::OpenCreateThread {
-                    parent_id: ch,
-                    is_forum: false,
-                });
-            }
-        }
+        // Pins, notification bell and Threads ("Create Thread" lives in the Threads panel).
+        super::header_menus::buttons(ui, app, ch, is_dm, is_thread, can_create_thread, actions);
         if is_thread {
             ui.add_space(4.0);
             let lock_label = if is_locked { "Unlock" } else { "Lock" };
@@ -1697,9 +1676,17 @@ fn embed_text(
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             if let Some(icon) = &a.icon_url {
-                app.media
-                    .borrow_mut()
-                    .image(ui, icon, Vec2::splat(24.0), Some((24, 24)));
+                // Round, like the official client.
+                let (r, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
+                let tex = app.media.borrow_mut().still(icon, (48, 48));
+                match tex {
+                    Ok(Some(tex)) => {
+                        crate::media::paint_texture(ui, r, CornerRadius::same(12), tex, true);
+                    }
+                    _ => {
+                        ui.painter().circle_filled(r.center(), 12.0, t.elevated);
+                    }
+                }
             }
             link_label(
                 ui,

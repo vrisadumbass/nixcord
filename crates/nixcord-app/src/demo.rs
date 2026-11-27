@@ -1941,6 +1941,43 @@ pub async fn run(mut commands: mpsc::UnboundedReceiver<Command>, events: EventTx
                     events.send(AppEvent::SearchResults { request_id, result });
                 });
             }
+            Command::LoadPins { channel } => {
+                // Invented: the demo "pins" every fifth message of the channel.
+                let all = histories
+                    .entry(channel)
+                    .or_insert_with(|| history_for(channel, &people));
+                let mut pins: Vec<Message> = all.iter().rev().step_by(5).take(4).cloned().collect();
+                for m in &mut pins {
+                    m.channel_id = channel;
+                }
+                let events = events.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                    events.send(AppEvent::Pins {
+                        channel,
+                        result: Ok(pins),
+                    });
+                });
+            }
+            Command::SetChannelMuted {
+                guild,
+                channel,
+                muted,
+            } => {
+                // What Discord answers with: the updated settings object for that scope.
+                let settings = nixcord_model::UserGuildSettings {
+                    guild_id: guild,
+                    channel_overrides: vec![nixcord_model::ChannelOverride {
+                        channel_id: channel,
+                        muted,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                events.send(AppEvent::Gateway(GatewayEvent::UserGuildSettingsUpdate(
+                    Box::new(settings),
+                )));
+            }
             Command::LoadHistoryAround { channel, around } => {
                 let all = histories
                     .entry(channel)
