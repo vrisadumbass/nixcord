@@ -1669,12 +1669,8 @@ fn rail_item_with_sense(
     let t = app.theme;
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(48.0), sense);
     let hovered = resp.hovered();
-    let active = selected || hovered;
-    // Circle -> squircle morph, animated (egui only repaints while it runs).
-    let k = ui
-        .ctx()
-        .animate_bool_with_time(resp.id.with("morph"), active, 0.12);
-    let rounding = CornerRadius::same((24.0 - 8.0 * k).round() as u8);
+    // Always a rounded square, like the current official client (no circle morph).
+    let rounding = CornerRadius::same(RAIL_ICON_RADIUS);
     let has_icon = guild.is_some_and(|g| {
         app.media
             .borrow_mut()
@@ -1837,9 +1833,56 @@ fn channel_glyph(kind: ChannelKind) -> &'static str {
     match kind {
         ChannelKind::Voice | ChannelKind::Other(13) => "🔊",
         ChannelKind::Announcement => "📢",
-        ChannelKind::Forum => "💬",
         _ => "#",
     }
+}
+
+/// Corner radius of the 48 px server icons in the rail.
+const RAIL_ICON_RADIUS: u8 = 14;
+
+/// The forum channel icon: two overlapping filled speech bubbles.
+fn paint_forum_icon(ui: &Ui, center: Pos2, color: Color32, bg: Color32) {
+    let p = ui.painter();
+    let bubble = |c: Pos2, w: f32, h: f32, fill: Color32, tail_left: bool| {
+        let r = Rect::from_center_size(c, Vec2::new(w, h));
+        p.rect_filled(r, CornerRadius::same(3), fill);
+        let x = if tail_left {
+            r.left() + 2.0
+        } else {
+            r.right() - 2.0
+        };
+        let dx = if tail_left { 4.0 } else { -4.0 };
+        p.add(egui::Shape::convex_polygon(
+            vec![
+                Pos2::new(x, r.bottom() - 1.0),
+                Pos2::new(x + dx, r.bottom() - 1.0),
+                Pos2::new(x, r.bottom() + 3.0),
+            ],
+            fill,
+            egui::Stroke::NONE,
+        ));
+    };
+    // Back bubble, then a cut-out gap, then the front bubble.
+    bubble(center + Vec2::new(3.0, -3.0), 12.0, 9.0, color, false);
+    bubble(center + Vec2::new(-2.0, 1.5), 13.0, 10.0, bg, true);
+    bubble(center + Vec2::new(-2.5, 2.0), 12.0, 9.0, color, true);
+}
+
+/// Grey count pill on a forum row (new posts since it was last read), right-aligned at
+/// `right_center`. Sized like the mention badge so `badge_reserve` fits both.
+fn paint_count_badge(ui: &Ui, right_center: Pos2, count: u32, t: &Theme) {
+    let g = ui
+        .painter()
+        .layout_no_wrap(badge_text(count), bold(11.0), t.text);
+    let w = (g.size().x + 8.0).max(16.0);
+    let rect = Rect::from_min_size(
+        Pos2::new(right_center.x - w, right_center.y - 8.0),
+        Vec2::new(w, 16.0),
+    );
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(8), t.elevated);
+    ui.painter()
+        .galley(rect.center() - g.size() / 2.0, g, t.text);
 }
 
 fn guild_channels(ui: &mut Ui, app: &NixApp, gid: Snowflake, actions: &mut Vec<Action>) {
@@ -1945,6 +1988,12 @@ fn channel_row(ui: &mut Ui, app: &NixApp, ch: &Channel, actions: &mut Vec<Action
     } else {
         (raw_mentions, raw_unread)
     };
+    // Forums also show how many posts are new since the forum was last read.
+    let new_posts = if is_forum && !selected && mentions == 0 {
+        app.store.forum_new_posts(ch.id)
+    } else {
+        0
+    };
     if unread {
         // Small white pill on the column's left edge.
         let dot = Rect::from_center_size(
@@ -1962,18 +2011,29 @@ fn channel_row(ui: &mut Ui, app: &NixApp, ch: &Channel, actions: &mut Vec<Action
         t.muted
     };
     let name_font = if unread { bold(15.5) } else { prop(15.5) };
-    let glyph = channel_glyph(ch.kind);
-    let glyph_font = if glyph == "#" { prop(21.0) } else { prop(15.0) };
-    ui.painter().text(
-        Pos2::new(rect.left() + 18.0, rect.center().y),
-        Align2::CENTER_CENTER,
-        glyph,
-        glyph_font,
-        color,
-    );
+    let icon_center = Pos2::new(rect.left() + 18.0, rect.center().y);
+    if is_forum {
+        let row_bg = if selected {
+            t.selected
+        } else if hovered {
+            t.hover
+        } else {
+            t.sidebar
+        };
+        let bg = super::presence::opaque_bg(t, row_bg);
+        paint_forum_icon(ui, icon_center, color, bg);
+    } else {
+        let glyph = channel_glyph(ch.kind);
+        let glyph_font = if glyph == "#" { prop(21.0) } else { prop(15.0) };
+        ui.painter()
+            .text(icon_center, Align2::CENTER_CENTER, glyph, glyph_font, color);
+    }
     let text_rect = Rect::from_min_max(
         Pos2::new(rect.left() + 34.0, rect.top()),
-        Pos2::new(rect.right() - 8.0 - badge_reserve(mentions), rect.bottom()),
+        Pos2::new(
+            rect.right() - 8.0 - badge_reserve(mentions.max(new_posts)),
+            rect.bottom(),
+        ),
     );
     let p = ui
         .painter()
@@ -1993,6 +2053,13 @@ fn channel_row(ui: &mut Ui, app: &NixApp, ch: &Channel, actions: &mut Vec<Action
             Pos2::new(rect.right() - 6.0, rect.center().y),
             mentions,
             None,
+            t,
+        );
+    } else if new_posts > 0 {
+        paint_count_badge(
+            ui,
+            Pos2::new(rect.right() - 6.0, rect.center().y),
+            new_posts,
             t,
         );
     }

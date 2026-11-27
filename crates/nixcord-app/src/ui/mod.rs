@@ -188,6 +188,10 @@ pub fn prop(size: f32) -> FontId {
 
 // ---- colors -----------------------------------------------------------------------
 
+/// Width of the channel column and of the member list, measured from the official client.
+pub const CHANNELS_W: f32 = 300.0;
+pub const MEMBERS_W: f32 = 264.0;
+
 const AVATAR_COLORS: [u32; 8] = [
     0x5865f2, 0x3ba55c, 0xed4245, 0xfaa61a, 0xeb459e, 0x747f8d, 0x1abc9c, 0x9b59b6,
 ];

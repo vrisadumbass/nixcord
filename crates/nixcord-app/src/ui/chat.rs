@@ -31,7 +31,8 @@ const DIVIDER_H: f32 = 32.0;
 const TOOLBAR_BTN: f32 = 30.0;
 /// Attachment previews and embed images fit in this box (Discord's size).
 const PREVIEW_MAX: Vec2 = Vec2::new(400.0, 300.0);
-const EMBED_MAX_W: f32 = 432.0;
+// Card width 520 (EMBED_MAX_W + 32), as in the official client.
+const EMBED_MAX_W: f32 = 488.0;
 
 fn picker_id() -> Id {
     Id::unique("nixcord-react-picker")

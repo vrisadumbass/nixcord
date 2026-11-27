@@ -1479,7 +1479,7 @@ impl NixApp {
             .show(ui, |ui| ui::sidebar::rail(ui, self, actions));
 
         egui::Panel::left("channels")
-            .exact_size(240.0)
+            .exact_size(ui::CHANNELS_W)
             .resizable(false)
             .show_separator_line(false)
             .frame(Frame::new().fill(t.sidebar))
@@ -1535,7 +1535,7 @@ impl NixApp {
                     .show(ui, |ui| ui::search::panel(ui, self, actions));
             } else if self.members_visible(ui.ctx()) {
                 egui::Panel::right("members")
-                    .exact_size(240.0)
+                    .exact_size(ui::MEMBERS_W)
                     .resizable(false)
                     .show_separator_line(false)
                     .frame(
@@ -1568,7 +1568,7 @@ impl NixApp {
                 .show(ui, |ui| ui::search::panel(ui, self, actions));
         } else if self.members_visible(ui.ctx()) {
             egui::Panel::right("members")
-                .exact_size(240.0)
+                .exact_size(ui::MEMBERS_W)
                 .resizable(false)
                 .show_separator_line(false)
                 .frame(

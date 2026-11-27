@@ -25,7 +25,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 /// Emoji size in labels, relative to the font size (about the line height).
-pub const LABEL_SCALE: f32 = 1.25;
+pub const LABEL_SCALE: f32 = 1.1;
 
 /// Glyph of each of the two invisible sections that reserve an emoji's square.
 pub(crate) const PLACEHOLDER: &str = "i";
@@ -325,9 +325,9 @@ mod tests {
             let mut out = out;
             out.textures_delta.clear();
         }
-        // The crab takes about LABEL_SCALE * 16 = 20 points.
+        // The emoji takes about LABEL_SCALE x the font size, plus its spacing.
         let extra = widths.1 - widths.0;
-        assert!((18.0..26.0).contains(&extra), "{widths:?}");
+        assert!((14.0..26.0).contains(&extra), "{widths:?}");
     }
 
     #[test]
